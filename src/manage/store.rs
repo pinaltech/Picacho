@@ -4,13 +4,71 @@ use rusqlite::{Connection, params};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
+    time::Duration,
 };
 
+/// Connections that only read. In WAL mode they read while a write is in
+/// progress, so listing mail, counting unread mail or opening a message
+/// never waits for a long synchronization to commit.
+const READERS: usize = 3;
+/// How long a connection waits for SQLite's own write lock, held by
+/// another connection, before giving up.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The local cache.
+///
+/// Writes go through one connection, one at a time; reads use a small pool
+/// of their own. Preferences changed by the interface are written by a
+/// background thread (`set_preference_soon`), so a click never waits for
+/// the cache.
 pub struct Store {
     db: Mutex<Connection>,
+    readers: Vec<Mutex<Connection>>,
+    next_reader: std::sync::atomic::AtomicUsize,
+    prefs: Arc<PrefQueue>,
+    pref_tx: Mutex<Option<mpsc::Sender<()>>>,
+    pref_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub path: PathBuf,
 }
+
+/// Preferences waiting to be written, newest value per key. Reads see them
+/// before they reach the database.
+#[derive(Default)]
+struct PrefQueue {
+    state: Mutex<PrefState>,
+    idle: Condvar,
+}
+#[derive(Default)]
+struct PrefState {
+    /// Set but not yet taken by the writer.
+    pending: HashMap<String, String>,
+    /// Being written now.
+    writing: HashMap<String, String>,
+    /// Each key's latest `set_preference_soon` ticket.
+    latest: HashMap<String, u64>,
+    next_ticket: u64,
+    /// Why the last write of a key failed, until one succeeds.
+    failed: HashMap<String, String>,
+}
+impl PrefState {
+    fn get(&self, key: &str) -> Option<&String> {
+        self.pending.get(key).or_else(|| self.writing.get(key))
+    }
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.writing.is_empty()
+    }
+    fn busy(&self, key: &str) -> bool {
+        self.pending.contains_key(key) || self.writing.contains_key(key)
+    }
+}
+
+fn connect(file: &Path) -> Result<Connection> {
+    let db = Connection::open(file)?;
+    db.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(db)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
@@ -19,7 +77,8 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
         }
-        let db = Connection::open(path.join("mail.sqlite3"))?;
+        let file = path.join("mail.sqlite3");
+        let mut db = connect(&file)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, account TEXT NOT NULL, folder TEXT NOT NULL, date INTEGER NOT NULL, data TEXT NOT NULL, raw BLOB);
@@ -27,13 +86,65 @@ impl Store {
             CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, account TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS mailbox_state (account TEXT NOT NULL, remote TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, remote));")?;
+        // Other connections write too (preferences); taking the write lock
+        // when a transaction begins means one that reads first can't find
+        // the database changed under it when it comes to write.
+        db.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
+        let readers = (0..READERS)
+            .map(|_| {
+                let r = connect(&file)?;
+                r.execute_batch("PRAGMA query_only=ON;")?;
+                Ok(Mutex::new(r))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let prefs = Arc::new(PrefQueue::default());
+        let (tx, rx) = mpsc::channel::<()>();
+        let writer = connect(&file)?;
+        let queue = prefs.clone();
+        let thread = std::thread::Builder::new()
+            .name("preferences".into())
+            .spawn(move || write_preferences(writer, &queue, rx))?;
         Ok(Self {
             db: Mutex::new(db),
+            readers,
+            next_reader: Default::default(),
+            prefs,
+            pref_tx: Mutex::new(Some(tx)),
+            pref_thread: Mutex::new(Some(thread)),
             path: path.into(),
         })
     }
+    /// A connection for reading: a free one if any, otherwise the next in turn.
+    fn read(&self) -> MutexGuard<'_, Connection> {
+        for r in &self.readers {
+            if let Ok(db) = r.try_lock() {
+                return db;
+            }
+        }
+        let i = self
+            .next_reader
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.readers.len();
+        self.readers[i].lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Waits until preferences set with `set_preference_soon` are written.
+    pub fn flush(&self) {
+        let mut state = self.prefs.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.is_idle() {
+            // The writer may have stopped; don't wait for it forever.
+            let (next, timeout) = self
+                .prefs
+                .idle
+                .wait_timeout(state, BUSY_TIMEOUT)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+    }
     pub fn accounts(&self) -> Result<Vec<Account>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare("SELECT data FROM accounts ORDER BY rowid")?;
         q.query_map([], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
@@ -50,6 +161,7 @@ impl Store {
         Ok(())
     }
     pub fn remove_account(&self, id: &str) -> Result<()> {
+        self.flush();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute(
@@ -90,7 +202,7 @@ impl Store {
         account: &str,
         prefix: &str,
     ) -> Result<std::collections::HashSet<String>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q =
             db.prepare("SELECT id FROM messages WHERE account=?1 AND substr(id,1,?2)=?3")?;
         let ids = q
@@ -108,7 +220,7 @@ impl Store {
         summaries: bool,
     ) -> Result<Vec<Mail>> {
         let folder = mailbox.folder();
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let data = if summaries {
             "json_remove(data,'$.body','$.html')"
         } else {
@@ -153,6 +265,33 @@ impl Store {
         write_messages(&tx, messages)?;
         tx.commit()?;
         Ok(())
+    }
+    /// Saves what reading a message found, keeping its flags and place as
+    /// cached now: they may have changed since it was read. Returns the
+    /// message as saved, or `None` when it is no longer cached (moved or
+    /// deleted meanwhile), in which case nothing is saved.
+    pub fn refresh_message(&self, read: &Mail) -> Result<Option<Mail>> {
+        use rusqlite::OptionalExtension;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let current: Option<String> = tx
+            .query_row("SELECT data FROM messages WHERE id=?1", [&read.id], |r| r.get(0))
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        let current: Mail = serde_json::from_str(&current)?;
+        let next = Mail {
+            unread: current.unread,
+            starred: current.starred,
+            folder: current.folder,
+            remote_folder: current.remote_folder,
+            labels: current.labels,
+            ..read.clone()
+        };
+        write_messages(&tx, std::slice::from_ref(&next))?;
+        tx.commit()?;
+        Ok(Some(next))
     }
     /// Commit a completed download and its stable identity together. A failed
     /// write must never leave POP3 thinking a missing body was downloaded.
@@ -230,7 +369,7 @@ impl Store {
         &self,
         accounts: &[String],
     ) -> Result<Vec<crate::manage::subscriptions::Subscription>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare(
             "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL",
         )?;
@@ -244,10 +383,28 @@ impl Store {
         }
         Ok(crate::manage::subscriptions::group(mails))
     }
+    /// Every copy of the mail from `address` in `account` that offers to
+    /// unsubscribe, outside Junk and Trash, newest first. Copies of one
+    /// message are all listed; `subscriptions::one_copy_each` picks one.
+    pub fn subscription_mail(&self, account: &str, address: &str) -> Result<Vec<Mail>> {
+        let db = self.read();
+        let mut q = db.prepare(
+            "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND lower(trim(json_extract(data,'$.from')))=?2 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL ORDER BY json_extract(data,'$.date') DESC",
+        )?;
+        let mut out = Vec::new();
+        for row in q.query_map(params![account, address.trim().to_lowercase()], |r| r.get::<_, String>(0))? {
+            if let Ok(mail) = serde_json::from_str::<Mail>(&row?)
+                && crate::manage::subscriptions::Subscription::of(&mail).is_some()
+            {
+                out.push(mail);
+            }
+        }
+        Ok(out)
+    }
     /// The newest `limit` messages from `address` in `account` that offer
     /// to unsubscribe, newest first, each once, outside Junk and Trash.
     pub fn subscription_messages(&self, account: &str, address: &str, limit: usize) -> Result<Vec<Mail>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare(
             "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND lower(trim(json_extract(data,'$.from')))=?2 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL ORDER BY json_extract(data,'$.date') DESC",
         )?;
@@ -278,7 +435,7 @@ impl Store {
     /// Returns how many changed.
     pub fn refresh_previews(&self) -> Result<usize> {
         let ids: Vec<String> = {
-            let db = self.db.lock().unwrap();
+            let db = self.read();
             let mut q = db.prepare(
                 "SELECT id FROM messages WHERE raw IS NOT NULL OR json_type(data,'$.body')='text' OR json_extract(data,'$.snippet')<>''",
             )?;
@@ -289,7 +446,7 @@ impl Store {
         // In batches, so other work gets the cache in between.
         for chunk in ids.chunks(100) {
             let rows: Vec<(String, String, Option<Vec<u8>>)> = {
-                let db = self.db.lock().unwrap();
+                let db = self.read();
                 let mut q = db.prepare("SELECT data, raw FROM messages WHERE id=?1")?;
                 let mut rows = Vec::new();
                 for id in chunk {
@@ -369,7 +526,7 @@ impl Store {
     /// before it was kept. Returns how many were found.
     pub fn backfill_subscriptions(&self) -> Result<usize> {
         let ids: Vec<String> = {
-            let db = self.db.lock().unwrap();
+            let db = self.read();
             let mut q = db.prepare(
                 "SELECT id FROM messages WHERE raw IS NOT NULL AND json_extract(data,'$.list_unsubscribe') IS NULL",
             )?;
@@ -381,7 +538,7 @@ impl Store {
         // get the cache in between.
         for chunk in ids.chunks(100) {
             let rows: Vec<(String, Vec<u8>)> = {
-                let db = self.db.lock().unwrap();
+                let db = self.read();
                 // Only the headers are needed, which come first.
                 let mut q = db.prepare(
                     "SELECT substr(raw,1,65536) FROM messages WHERE id=?1 AND json_extract(data,'$.list_unsubscribe') IS NULL",
@@ -434,9 +591,7 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Mail>> {
         use rusqlite::OptionalExtension;
         let json: Option<String> = self
-            .db
-            .lock()
-            .unwrap()
+            .read()
             .query_row("SELECT data FROM messages WHERE id=?1", [id], |r| r.get(0))
             .optional()?;
         json.map(|s| serde_json::from_str(&s).map_err(Into::into))
@@ -469,9 +624,7 @@ impl Store {
     pub fn raw(&self, id: &str) -> Result<Option<Vec<u8>>> {
         use rusqlite::OptionalExtension;
         Ok(self
-            .db
-            .lock()
-            .unwrap()
+            .read()
             .query_row("SELECT raw FROM messages WHERE id=?1", [id], |r| r.get(0))
             .optional()?
             .flatten())
@@ -510,7 +663,7 @@ impl Store {
         limit: usize,
         since: i64,
     ) -> Result<Vec<Mail>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare(
             "SELECT data FROM messages WHERE account=?1 AND raw IS NULL AND date >= ?4
              AND json_extract(data,'$.size') <= ?2 ORDER BY date DESC, id DESC LIMIT ?3",
@@ -529,7 +682,7 @@ impl Store {
         max_size: usize,
         since: &[(String, i64)],
     ) -> Result<(usize, usize)> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare(
             "SELECT COUNT(*), COALESCE(SUM(raw IS NULL),0) FROM messages
              WHERE account=?1 AND date >= ?3 AND json_extract(data,'$.size') <= ?2",
@@ -597,9 +750,7 @@ impl Store {
             return Ok(None);
         }
         Ok(self
-            .db
-            .lock()
-            .unwrap()
+            .read()
             .query_row(
                 "SELECT raw FROM messages WHERE account=?1 AND raw IS NOT NULL
                  AND json_extract(data,'$.gmail_id')=?2 LIMIT 1",
@@ -612,9 +763,7 @@ impl Store {
     pub fn mailbox_state(&self, account: &str, remote: &str) -> Result<Option<MailboxState>> {
         use rusqlite::OptionalExtension;
         let data: Option<String> = self
-            .db
-            .lock()
-            .unwrap()
+            .read()
             .query_row(
                 "SELECT data FROM mailbox_state WHERE account=?1 AND remote=?2",
                 params![account, remote],
@@ -652,7 +801,7 @@ impl Store {
         account: &str,
         prefix: &str,
         fresh: &[Mail],
-        flags: &[(u32, bool, bool)],
+        flags: &[FlagUpdate],
         before: Option<i64>,
     ) -> Result<()> {
         ensure!(
@@ -664,7 +813,13 @@ impl Store {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         write_messages(&tx, fresh)?;
-        for (uid, unread, starred) in flags {
+        for FlagUpdate {
+            uid,
+            unread,
+            starred,
+            labels,
+        } in flags
+        {
             let id = format!("{prefix}{uid}");
             let data: Option<String> = {
                 use rusqlite::OptionalExtension;
@@ -673,9 +828,13 @@ impl Store {
             };
             if let Some(data) = data {
                 let mut mail: Mail = serde_json::from_str(&data)?;
-                if (mail.unread, mail.starred) != (*unread, *starred) {
+                let labels_changed = labels.as_ref().is_some_and(|l| *l != mail.labels);
+                if (mail.unread, mail.starred) != (*unread, *starred) || labels_changed {
                     mail.unread = *unread;
                     mail.starred = *starred;
+                    if let Some(labels) = labels {
+                        mail.labels = labels.clone();
+                    }
                     write_messages(&tx, &[mail])?;
                 }
             }
@@ -689,9 +848,20 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// The labels on an account's cached mail, sorted.
+    pub fn labels(&self, account: &str) -> Result<Vec<String>> {
+        let db = self.read();
+        let mut q = db.prepare(
+            "SELECT DISTINCT l.value FROM messages, json_each(json_extract(messages.data,'$.labels')) AS l
+             WHERE messages.account=?1 ORDER BY l.value",
+        )?;
+        q.query_map([account], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(r?))
+            .collect()
+    }
     /// Unread counts keyed by (account, mailbox key).
     pub fn unread_counts(&self) -> Result<HashMap<(String, String), usize>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare(
             "SELECT account, folder, COUNT(*) FROM messages
              WHERE json_extract(data,'$.unread') GROUP BY account, folder",
@@ -707,7 +877,7 @@ impl Store {
     }
     /// Each unread message's account, mailbox key and recipients.
     pub fn unread_recipients(&self) -> Result<Vec<crate::manage::forwarding::UnreadRow>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare(
             "SELECT account, folder, coalesce(json_extract(data,'$.to'),''), coalesce(json_extract(data,'$.cc'),'')
              FROM messages WHERE json_extract(data,'$.unread')",
@@ -720,6 +890,21 @@ impl Store {
         self.preference(&format!("folders:{account}"))
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+    /// Forgets a deleted server folder: its cached mail and sync state.
+    pub fn forget_mailbox(&self, account: &str, remote: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE account=?1 AND json_extract(data,'$.remote_folder')=?2",
+            params![account, remote],
+        )?;
+        tx.execute(
+            "DELETE FROM mailbox_state WHERE account=?1 AND remote=?2",
+            params![account, remote],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn save_folders(&self, account: &str, folders: &[RemoteFolder]) -> Result<()> {
         self.set_preference(
@@ -735,11 +920,22 @@ impl Store {
         Ok(())
     }
     pub fn drafts(&self, account: &str) -> Result<Vec<Draft>> {
-        let db = self.db.lock().unwrap();
+        let db = self.read();
         let mut q = db.prepare("SELECT data FROM drafts WHERE account=?1 ORDER BY rowid DESC")?;
         q.query_map([account], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect()
+    }
+    pub fn draft(&self, id: &str) -> Result<Option<Draft>> {
+        use rusqlite::OptionalExtension;
+        let data: Option<String> = self
+            .read()
+            .query_row("SELECT data FROM drafts WHERE id=?1", [id], |r| r.get(0))
+            .optional()?;
+        Ok(match data {
+            Some(data) => Some(serde_json::from_str(&data)?),
+            None => None,
+        })
     }
     pub fn delete_draft(&self, id: &str) -> Result<()> {
         self.db
@@ -749,20 +945,164 @@ impl Store {
         Ok(())
     }
     pub fn preference(&self, key: &str) -> Option<String> {
-        self.db
+        if let Some(value) = self
+            .prefs
+            .state
             .lock()
-            .ok()?
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+        {
+            return Some(value.clone());
+        }
+        self.read()
             .query_row("SELECT value FROM preferences WHERE key=?1", [key], |r| {
                 r.get(0)
             })
             .ok()
     }
+    /// Writes a preference now, after any set to be written soon.
     pub fn set_preference(&self, key: &str, value: &str) -> Result<()> {
+        self.flush();
         self.db.lock().unwrap().execute(
             "INSERT OR REPLACE INTO preferences VALUES (?1,?2)",
             params![key, value],
         )?;
         Ok(())
+    }
+    /// Sets a preference without waiting for the cache, which a long
+    /// synchronization can hold for a while: for the interface, which must
+    /// not stall. It reads back at once and is written in the background;
+    /// `preference_saved` with the returned ticket says how that went.
+    pub fn set_preference_soon(&self, key: &str, value: &str) -> u64 {
+        let ticket = {
+            let mut state = self.prefs.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.next_ticket += 1;
+            let ticket = state.next_ticket;
+            state.latest.insert(key.to_owned(), ticket);
+            state.pending.insert(key.to_owned(), value.to_owned());
+            ticket
+        };
+        let sent = self
+            .pref_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|tx| tx.send(()).is_ok());
+        if !sent {
+            // No writer: write it here instead.
+            let value = self.prefs.state.lock().unwrap().pending.remove(key);
+            if let Some(value) = value {
+                let result = self.set_preference(key, &value);
+                let mut state = self.prefs.state.lock().unwrap_or_else(|e| e.into_inner());
+                match result {
+                    Ok(()) => state.failed.remove(key),
+                    Err(e) => state.failed.insert(key.to_owned(), format!("{e:#}")),
+                };
+                self.prefs.idle.notify_all();
+            }
+        }
+        ticket
+    }
+    /// Waits until the preference set with `ticket` is written, and says
+    /// whether it could be. A ticket since replaced by a newer value of the
+    /// key answers `Ok` at once: the newer one's outcome is what counts.
+    pub fn preference_saved(&self, key: &str, ticket: u64) -> Result<()> {
+        let mut state = self.prefs.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if state.latest.get(key) != Some(&ticket) {
+                return Ok(());
+            }
+            if !state.busy(key) {
+                return match state.failed.get(key) {
+                    Some(why) => Err(anyhow::anyhow!("Couldn't save this setting: {why}")),
+                    None => Ok(()),
+                };
+            }
+            let (next, timeout) = self
+                .prefs
+                .idle
+                .wait_timeout(state, BUSY_TIMEOUT)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if timeout.timed_out() && state.busy(key) {
+                anyhow::bail!("Couldn't save this setting: the cache stayed busy");
+            }
+        }
+    }
+}
+#[cfg(test)]
+impl Store {
+    /// Makes every later preference write fail, as a full disk would.
+    pub fn fail_preference_writes_for_test(&self) {
+        self.db
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TRIGGER fail_pref BEFORE INSERT ON preferences BEGIN SELECT RAISE(ABORT,'disk full'); END;")
+            .unwrap();
+    }
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Closing the channel ends the writer once the queue is written.
+        self.pref_tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(thread) = self
+            .pref_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+/// The preference writer: writes whatever is pending each time it is told
+/// there is something, until the store closes.
+fn write_preferences(db: Connection, queue: &PrefQueue, rx: mpsc::Receiver<()>) {
+    let write = |batch: &HashMap<String, String>| -> Result<()> {
+        let db = db.unchecked_transaction()?;
+        for (key, value) in batch {
+            db.execute(
+                "INSERT OR REPLACE INTO preferences VALUES (?1,?2)",
+                params![key, value],
+            )?;
+        }
+        db.commit()?;
+        Ok(())
+    };
+    let mut open = true;
+    while open {
+        open = rx.recv().is_ok();
+        // Anything queued meanwhile goes in the same transaction.
+        while rx.try_recv().is_ok() {}
+        let batch = {
+            let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
+            let batch = std::mem::take(&mut state.pending);
+            state.writing = batch.clone();
+            batch
+        };
+        let mut result = Ok(());
+        if !batch.is_empty() {
+            // Retried, as an older value must not come back on the next launch.
+            for attempt in 0..3 {
+                result = write(&batch);
+                if result.is_ok() {
+                    break;
+                }
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+        let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
+        for key in batch.keys() {
+            match &result {
+                Ok(()) => state.failed.remove(key),
+                Err(e) => state.failed.insert(key.clone(), format!("{e:#}")),
+            };
+        }
+        state.writing.clear();
+        // Waiters for a single key as well as for the whole queue.
+        queue.idle.notify_all();
     }
 }
 pub fn secret_entry(id: &str) -> Result<keyring::Entry> {
@@ -811,6 +1151,48 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn preferences_set_soon_read_back_at_once_and_reach_the_cache() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let s = Store::open(&p)?;
+        // The writer is held, as a long synchronization would.
+        let held = s.db.lock().unwrap();
+        held.execute_batch("BEGIN IMMEDIATE;")?;
+        s.set_preference_soon("sort", "oldest");
+        s.set_preference_soon("sort", "newest");
+        assert_eq!(s.preference("sort").as_deref(), Some("newest"));
+        // Reading mail doesn't wait for the writer either.
+        assert!(s.messages("demo", Folder::Inbox, 10)?.is_empty());
+        held.execute_batch("COMMIT;")?;
+        drop(held);
+        s.flush();
+        drop(s);
+        let s = Store::open(&p)?;
+        assert_eq!(s.preference("sort").as_deref(), Some("newest"));
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    #[test]
+    fn preferences_that_cannot_be_saved_say_why() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let s = Store::open(&p)?;
+        s.set_preference("sort", "newest")?;
+        let ok = s.set_preference_soon("theme", "dark");
+        assert!(s.preference_saved("theme", ok).is_ok());
+        s.fail_preference_writes_for_test();
+        let older = s.set_preference_soon("sort", "oldest");
+        let newer = s.set_preference_soon("sort", "oldest");
+        let e = s.preference_saved("sort", newer).unwrap_err();
+        assert!(format!("{e:#}").contains("Couldn't save this setting"), "{e:#}");
+        // Only the latest change of a key reports, so a failure shows once.
+        assert!(s.preference_saved("sort", older).is_ok());
+        // The value saved before is what reads back.
+        assert_eq!(s.preference("sort").as_deref(), Some("newest"));
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    #[test]
     fn cache_roundtrip_and_account_isolation() -> Result<()> {
         let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
         let s = Store::open(&p)?;
@@ -845,6 +1227,7 @@ mod tests {
             name: "Projects/2026".into(),
             label: "2026".into(),
             depth: 1,
+            nestable: true,
         }];
         s.save_folders("demo", &folders)?;
         assert_eq!(s.folders("demo"), folders);
@@ -875,6 +1258,15 @@ mod tests {
 }
 
 /// Inputs validated before a mailbox snapshot is committed.
+/// A cached message's state as the server reports it now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlagUpdate {
+    pub uid: u32,
+    pub unread: bool,
+    pub starred: bool,
+    /// Its labels, when the server said (`None` leaves them as they were).
+    pub labels: Option<Vec<String>>,
+}
 /// A server mailbox as of its last synchronization: enough to ask only for
 /// what changed since (new UIDs, CONDSTORE flag changes, removals).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

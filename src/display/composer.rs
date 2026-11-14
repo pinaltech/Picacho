@@ -103,6 +103,8 @@ fn service_badge(service: fwd::ForwardingService, c: Colors) -> Div {
 const TO: usize = 0;
 const CC: usize = 1;
 const BCC: usize = 2;
+/// Where replies go, for this message.
+const REPLY_TO: usize = 3;
 
 pub(super) struct Composer {
     pub(super) draft: Draft,
@@ -120,11 +122,12 @@ pub(super) struct Composer {
     /// Sending is running or waiting out its undo delay.
     pub(super) sending: bool,
     pub(super) error: Option<String>,
-    recipients: [Entity<InputState>; 3],
+    recipients: [Entity<InputState>; 4],
     subject: Entity<InputState>,
     pub(super) body: Entity<InputState>,
     show_cc: bool,
     show_bcc: bool,
+    show_reply_to: bool,
     preview: bool,
     from_open: bool,
     /// When a press outside closed the From menu: the same press on its
@@ -138,6 +141,8 @@ pub(super) struct Composer {
     /// Services that can make aliases to send as: (service, the mailbox it
     /// forwards to, or `None` for any).
     alias_services: Vec<(String, fwd::ForwardingService, Option<String>)>,
+    /// Accounts that send only as an alias (Forwarding settings).
+    alias_only: HashSet<String>,
     /// Known people (name, address) offered while typing a recipient.
     contacts: Rc<Vec<(String, String)>>,
     suggestions: Vec<(String, String)>,
@@ -172,6 +177,7 @@ impl Composer {
             field("Recipients", window, cx),
             field("Cc", window, cx),
             field("Bcc", window, cx),
+            field("Where replies go", window, cx),
         ];
         let subject = field("Subject", window, cx);
         let from_filter = field("Find an address", window, cx);
@@ -180,7 +186,7 @@ impl Composer {
                 .multi_line(true)
                 .placeholder("Write your message…")
         });
-        let values = [&draft.to, &draft.cc, &draft.bcc];
+        let values = [&draft.to, &draft.cc, &draft.bcc, &draft.reply_to];
         for (state, value) in recipients.iter().zip(values) {
             let value = value.clone();
             state.update(cx, |s, cx| s.set_value(value, window, cx));
@@ -227,6 +233,7 @@ impl Composer {
         }
         let show_cc = !draft.cc.is_empty();
         let show_bcc = !draft.bcc.is_empty();
+        let show_reply_to = !draft.reply_to.is_empty();
         Self {
             draft,
             placement,
@@ -242,6 +249,7 @@ impl Composer {
             body,
             show_cc,
             show_bcc,
+            show_reply_to,
             preview: false,
             from_open: false,
             from_closed: None,
@@ -249,6 +257,7 @@ impl Composer {
             accounts,
             aliases,
             alias_services: vec![],
+            alias_only: HashSet::new(),
             contacts,
             suggestions: vec![],
             suggest_field: TO,
@@ -290,6 +299,7 @@ impl Composer {
         self.draft.to = value(&self.recipients[TO]);
         self.draft.cc = value(&self.recipients[CC]);
         self.draft.bcc = value(&self.recipients[BCC]);
+        self.draft.reply_to = value(&self.recipients[REPLY_TO]).trim().to_owned();
         self.draft.subject = value(&self.subject);
         self.draft.body = value(&self.body);
         self.draft.clone()
@@ -587,11 +597,29 @@ impl Composer {
         if self.sending {
             return;
         }
+        if self.needs_alias() {
+            let email = self
+                .accounts
+                .iter()
+                .find(|a| a.id == self.draft.account)
+                .map_or(String::new(), |a| a.email.clone());
+            self.error = Some(format!(
+                "{email} sends only as its aliases. Choose an alias in From."
+            ));
+            self.from_open = true;
+            cx.notify();
+            return;
+        }
         let d = self.snapshot(cx);
         let any = [&d.to, &d.cc, &d.bcc].iter().any(|f| !f.trim().is_empty());
         if !any {
             self.error = Some("Add at least one recipient.".into());
             self.recipients[TO].update(cx, |s, cx| s.focus(window, cx));
+            cx.notify();
+            return;
+        }
+        if let Err(e) = crate::sync::smtp::recipients(&d.reply_to) {
+            self.error = Some(format!("Reply-To: {e:#}"));
             cx.notify();
             return;
         }
@@ -962,9 +990,16 @@ impl Composer {
         &mut self,
         aliases: Vec<fwd::SendAlias>,
         services: Vec<(String, fwd::ForwardingService, Option<String>)>,
+        alias_only: HashSet<String>,
     ) {
         self.aliases = aliases;
         self.alias_services = services;
+        self.alias_only = alias_only;
+    }
+
+    /// The draft would go out as an account that sends only as an alias.
+    fn needs_alias(&self) -> bool {
+        self.draft.send_as.trim().is_empty() && self.alias_only.contains(&self.draft.account)
     }
 
     /// Sends as the mailbox again, after the alias in From went away.
@@ -1052,8 +1087,16 @@ impl Composer {
         let alias = self.send_alias();
         // Sending as an alias that is no longer listed; sending says so.
         let missing = alias.is_none() && !self.draft.send_as.is_empty();
-        let several = self.accounts.len() + self.aliases.len() > 1 || missing;
+        let several = self.accounts.len() + self.aliases.len() > 1 || missing || self.needs_alias();
+        let blocked = alias.is_none() && !missing && self.needs_alias();
         let (label, tip) = match alias {
+            None if blocked => (
+                "Choose an alias".to_owned(),
+                format!(
+                    "{} sends only as its aliases (Settings → Forwarding).",
+                    current.email
+                ),
+            ),
             None if missing => (
                 self.draft.send_as.clone(),
                 format!(
@@ -1092,9 +1135,10 @@ impl Composer {
                     .min_w_0()
                     .truncate()
                     .when(missing, |d| d.text_color(rgb(c.danger)).line_through())
+                    .when(blocked, |d| d.text_color(rgb(c.danger)))
                     .child(label),
             )
-            .when(missing, |d| d.child(icon_el("warning", 13., c.danger)))
+            .when(missing || blocked, |d| d.child(icon_el("warning", 13., c.danger)))
             .when_some(alias, |d, a| d.child(service_badge(a.service, c)))
             .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx));
         if several {
@@ -1185,9 +1229,11 @@ impl Composer {
         };
         let mut list = div().flex().flex_col();
         let mut shown = 0;
+        // Accounts kept to their aliases can't be chosen to write as.
         let accounts: Vec<&Account> = self
             .accounts
             .iter()
+            .filter(|a| !self.alias_only.contains(&a.id))
             .filter(|a| matches(&[&a.email, &a.name]))
             .collect();
         if !accounts.is_empty() && !self.aliases.is_empty() {
@@ -1292,7 +1338,7 @@ impl Composer {
 
     fn recipient_row(&self, field: usize, cx: &Context<Self>) -> Div {
         let c = self.colors;
-        let label = ["To", "Cc", "Bcc"][field];
+        let label = ["To", "Cc", "Bcc", "Reply-To"][field];
         let mut input = self.input(&self.recipients[field]);
         if field == TO {
             let toggle = |id: &'static str, label: &'static str, on: bool, which: usize| {
@@ -1306,10 +1352,10 @@ impl Composer {
                     .hover(move |s| s.text_color(rgb(c.text)))
                     .when(!on, |d| d.child(label))
                     .on_click(cx.listener(move |this, _, w, cx| {
-                        if which == CC {
-                            this.show_cc = true;
-                        } else {
-                            this.show_bcc = true;
+                        match which {
+                            CC => this.show_cc = true,
+                            BCC => this.show_bcc = true,
+                            _ => this.show_reply_to = true,
                         }
                         this.recipients[which].update(cx, |s, cx| s.focus(w, cx));
                         cx.notify();
@@ -1320,7 +1366,13 @@ impl Composer {
                     .flex()
                     .gap_1()
                     .child(toggle("compose-show-cc", "Cc", self.show_cc, CC))
-                    .child(toggle("compose-show-bcc", "Bcc", self.show_bcc, BCC)),
+                    .child(toggle("compose-show-bcc", "Bcc", self.show_bcc, BCC))
+                    .child(toggle(
+                        "compose-show-reply-to",
+                        "Reply-To",
+                        self.show_reply_to,
+                        REPLY_TO,
+                    )),
             );
         }
         let mut row = self.row(label, input).relative();
@@ -1731,6 +1783,9 @@ impl Render for Composer {
         }
         if self.show_bcc {
             root = root.child(self.recipient_row(BCC, cx));
+        }
+        if self.show_reply_to {
+            root = root.child(self.recipient_row(REPLY_TO, cx));
         }
         if !inline {
             root = root.child(self.row("Subject", self.input(&self.subject)));

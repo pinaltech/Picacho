@@ -24,20 +24,29 @@ pub(super) const GMAIL_DAILY_BUDGET: u64 = 1024 * 1024 * 1024;
 /// First pause after the server reports a limit; doubles while it persists.
 const FIRST_PAUSE: Duration = Duration::from_secs(10 * 60);
 const LONGEST_PAUSE: Duration = Duration::from_secs(4 * 60 * 60);
+/// How long a mailbox's rights (MYRIGHTS) are trusted before asking again.
+/// They rarely change, and the server still refuses what isn't allowed.
+const RIGHTS_FOR: Duration = Duration::from_secs(5 * 60);
 
 pub(super) struct Connection {
     pub(super) session: ImapSession,
     extensions: Option<Extensions>,
     names: Option<Vec<Name>>,
+    /// The personal namespace's prefix, once asked (NAMESPACE).
+    namespace: Option<Option<String>>,
+    /// Rights by mailbox, as MYRIGHTS gave them and when.
+    rights: std::collections::HashMap<String, (Option<String>, Instant)>,
     selected: Option<Selected>,
     used: Instant,
 }
 impl Connection {
-    fn new(session: ImapSession) -> Self {
+    pub(super) fn new(session: ImapSession) -> Self {
         Self {
             session,
             extensions: None,
             names: None,
+            namespace: None,
+            rights: std::collections::HashMap::new(),
             selected: None,
             used: Instant::now(),
         }
@@ -53,9 +62,87 @@ impl Connection {
     /// The server's mailboxes, listed once per connection unless `fresh`.
     pub(super) fn names(&mut self, fresh: bool) -> Result<&[Name]> {
         if fresh || self.names.is_none() {
-            self.names = Some(crate::sync::transport::list(&mut self.session)?);
+            let special_use = self.extensions()?.special_use;
+            self.names = Some(crate::sync::transport::list(
+                &mut self.session,
+                special_use,
+            )?);
         }
         Ok(self.names.as_deref().unwrap_or_default())
+    }
+    /// Where the server keeps personal folders, if it says (NAMESPACE).
+    pub(super) fn namespace(&mut self) -> Result<Option<String>> {
+        if let Some(n) = &self.namespace {
+            return Ok(n.clone());
+        }
+        let n = if self.extensions()?.namespace {
+            crate::sync::transport::namespace(&mut self.session)?
+        } else {
+            None
+        };
+        self.namespace = Some(n.clone());
+        Ok(n)
+    }
+    /// Refuses, before trying, what this sign-in has no right to do in
+    /// `mailbox` on servers that say (ACL's MYRIGHTS). Elsewhere the server
+    /// has its say when the command is sent.
+    pub(super) fn require_rights(&mut self, mailbox: &str, needed: &str, what: &str) -> Result<()> {
+        if !self.extensions()?.acl {
+            return Ok(());
+        }
+        let rights = match self.rights.get(mailbox) {
+            Some((rights, at)) if at.elapsed() < RIGHTS_FOR => rights.clone(),
+            _ => {
+                let rights = crate::sync::transport::my_rights(&mut self.session, mailbox)?;
+                self.rights
+                    .insert(mailbox.to_owned(), (rights.clone(), Instant::now()));
+                rights
+            }
+        };
+        let Some(rights) = rights else {
+            return Ok(());
+        };
+        if let Some(missing) = crate::sync::transport::lacks_rights(&rights, needed) {
+            let label = crate::sync::transport::decode_name(mailbox);
+            bail!(
+                "This account doesn't have permission to {what} in “{label}” (the server gives it “{rights}”, without “{missing}”). Ask the mailbox's owner or administrator."
+            );
+        }
+        Ok(())
+    }
+    /// Whether `erase` can remove just `uids` from the selected mailbox: with
+    /// UIDPLUS always; without, only if no other message there is already
+    /// marked deleted (EXPUNGE would take those too). Checked before any
+    /// change, so a refusal changes nothing.
+    pub(super) fn can_erase(&mut self, uids: &[u32]) -> Result<()> {
+        if self.extensions()?.uidplus {
+            return Ok(());
+        }
+        let marked = self.session.uid_search("DELETED")?;
+        ensure!(
+            marked.iter().all(|uid| uids.contains(uid)),
+            "Other messages in this folder are already marked for deletion, and this server can't remove only some (no UIDPLUS). Remove or unmark them in another mail app first."
+        );
+        Ok(())
+    }
+    /// Removes the selected mailbox's messages `uids` for good: marks them
+    /// \Deleted and expunges just them (UID EXPUNGE). Without UIDPLUS, a
+    /// plain EXPUNGE would also remove others already marked, possibly by
+    /// another mail app; then nothing is changed and why is said.
+    pub(super) fn erase(&mut self, uids: &[u32]) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let set = crate::sync::transport::uid_ranges(uids);
+        let uidplus = self.extensions()?.uidplus;
+        self.can_erase(uids)?;
+        self.session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
+        if uidplus {
+            self.session.uid_expunge(&set)?;
+        } else {
+            self.session.expunge()?;
+        }
+        Ok(())
     }
     /// SELECT, always asking the server again: for when the counts matter.
     pub(super) fn select(&mut self, name: &str) -> Result<Selected> {
@@ -72,6 +159,15 @@ impl Connection {
             Some(s) if s.name == name => Ok(s.clone()),
             _ => self.select(name),
         }
+    }
+    /// Leaves `name` if it is the selected mailbox, so it can be deleted:
+    /// some servers refuse to delete the mailbox a session has open.
+    pub(super) fn leave(&mut self, name: &str) -> Result<()> {
+        if self.selected.as_ref().is_some_and(|s| s.name == name) {
+            self.selected = None;
+            self.session.close()?;
+        }
+        Ok(())
     }
     /// Selects a cached message's mailbox and checks its generation.
     pub(super) fn select_for(&mut self, mail: &Mail) -> Result<Selected> {

@@ -48,6 +48,11 @@ impl MessageWindow {
         }
     }
 
+    /// Whether links lose their tracking, as set in the app's Settings.
+    fn clean_links(&self, cx: &App) -> bool {
+        self.app.upgrade().is_none_or(|app| app.read(cx).clean_links)
+    }
+
     fn reply(&self, mode: u8, cx: &mut Context<Self>) {
         let (app, mail) = (self.app.clone(), self.mail.clone());
         let _ = self.main.update(cx, move |_, w, cx| {
@@ -91,6 +96,15 @@ impl Render for MessageWindow {
         let c = self.colors;
         let m = &self.mail;
         window.set_window_title(&m.subject);
+        // A mailbox kept to its aliases shows the alias used in its place.
+        let mask = self.app.upgrade().and_then(|app| app.read(cx).mask_for(m));
+        let (sender, from) = match &mask {
+            Some(k) => (
+                if k.sent { k.sender() } else { m.sender.clone() },
+                k.apply(&m.from).into_owned(),
+            ),
+            None => (m.sender.clone(), m.from.clone()),
+        };
         let dark = self.options.theme.is_dark(self.app_dark);
         let to = super::thread::short_names(&m.to, &self.own);
         let cc = super::thread::short_names(&m.cc, &self.own);
@@ -114,9 +128,13 @@ impl Render for MessageWindow {
                 Some(h) if !self.quotes_open => h.as_str(),
                 _ => html.as_str(),
             };
+            let masked = mask.as_ref().map(|k| k.apply(shown));
+            let shown = masked.as_deref().unwrap_or(shown);
             let blocked = self.options.block_remote;
-            self.html
-                .update(cx, |view, cx| view.set_content(shown, blocked, dark, cx));
+            let clean = self.clean_links(cx);
+            self.html.update(cx, |view, cx| {
+                view.set_content(shown, &m.inline, blocked, dark, clean, cx)
+            });
             body = body.child(self.html.clone());
         } else {
             let text = m.body.clone().unwrap_or_default();
@@ -127,10 +145,16 @@ impl Render for MessageWindow {
             } else {
                 written
             };
+            let masked = mask.as_ref().map(|k| k.apply(shown));
+            let shown = masked.as_deref().unwrap_or(shown);
             body = body.child(
                 gpui_component::text::TextView::markdown(
                     SharedString::from(format!("window-body-{}-{}", m.id, self.quotes_open)),
-                    plain_markdown(shown),
+                    if self.clean_links(cx) {
+                        plain_markdown(&crate::manage::tracking::clean_text(shown))
+                    } else {
+                        plain_markdown(shown)
+                    },
                     window,
                     cx,
                 )
@@ -284,13 +308,13 @@ impl Render for MessageWindow {
                                                 div()
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_size(px(13.))
-                                                    .child(m.sender.clone()),
+                                                    .child(sender),
                                             )
                                             .child(
                                                 div()
                                                     .text_size(px(11.))
                                                     .text_color(rgb(c.muted))
-                                                    .child(format!("<{}>", m.from)),
+                                                    .child(format!("<{from}>")),
                                             ),
                                     )
                                     .child(
@@ -367,7 +391,8 @@ impl MailApp {
             self.dark,
         );
         let own: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
-        let needs_body = mail.body.is_none() && mail.html.is_none();
+        // Read also for the images the HTML shows from the message itself.
+        let needs_body = mail.body.is_none() && mail.html.is_none() || mail.lacks_inline_parts();
         let account = self.account_of(&mail);
         let unread = mail.unread;
         let made: Rc<std::cell::RefCell<Option<Entity<MessageWindow>>>> = Rc::default();

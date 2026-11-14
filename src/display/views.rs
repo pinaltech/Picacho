@@ -6,6 +6,42 @@ use super::tree::Dragged;
 use super::*;
 use crate::manage::backend::Layout;
 
+/// Where the person was: the open mailbox (an account's, All Mail's or an
+/// alias's), and whether its subscriptions (and one sender's mail) were
+/// shown. Saved as it changes and opened again at launch.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct Place {
+    pub account: String,
+    pub mailbox: Mailbox,
+    #[serde(default)]
+    pub subscriptions: bool,
+    #[serde(default)]
+    pub sender: Option<MailSubscription>,
+}
+/// The preference holding the last `Place`.
+const PLACE_PREFERENCE: &str = "last_place";
+
+/// How mail of a mailbox kept to its aliases is shown: its own address
+/// (and, on mail it sent, its name) in place of which the alias used is.
+pub(super) struct Mask {
+    pub address: String,
+    pub alias: String,
+    /// The name recipients see for the alias, when it has one.
+    pub alias_name: Option<String>,
+    /// The mailbox sent it, so its sender is the alias.
+    pub sent: bool,
+}
+impl Mask {
+    /// `text` with the mailbox's address replaced by the alias.
+    pub fn apply<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        fwd::mask_address(text, &self.address, &self.alias)
+    }
+    /// What the alias is called as a sender: its name, else its address.
+    pub fn sender(&self) -> String {
+        self.alias_name.clone().unwrap_or_else(|| self.alias.clone())
+    }
+}
+
 /// An alias's view has no Sent or Drafts: nothing is written from it.
 const ALIAS_FOLDERS: [Folder; 5] = [
     Folder::Inbox,
@@ -44,6 +80,110 @@ impl MailApp {
     /// layout and placeholders apply.
     pub(super) fn shows_only(&self, account: &str) -> bool {
         self.account.is_some() && self.scope.accounts == [account]
+    }
+    /// Remembers the open mailbox, to open it again at the next launch.
+    pub(super) fn save_place(&self) {
+        let Some(account) = self.account.clone() else {
+            return;
+        };
+        let place = Place {
+            account,
+            mailbox: self.mailbox(),
+            subscriptions: self.subs_open,
+            sender: self.subs_open.then(|| self.subs_sender.clone()).flatten(),
+        };
+        if let Ok(json) = serde_json::to_string(&place) {
+            self.backend.store.set_preference_soon(PLACE_PREFERENCE, &json);
+        }
+    }
+    /// The place saved last, when it can still be opened: its account,
+    /// view or alias is still listed, and so is its mailbox.
+    pub(super) fn saved_place(&self) -> Option<Place> {
+        let place: Place =
+            serde_json::from_str(&self.backend.store.preference(PLACE_PREFERENCE)?).ok()?;
+        let id = place.account.as_str();
+        let listed = if id == ALL_MAIL {
+            self.shows_all_mail()
+        } else if fwd::is_view(id) {
+            fwd::separate_views(&self.forwarding).iter().any(|v| v == id)
+        } else {
+            self.accounts.iter().any(|a| a.id == id)
+        };
+        if !listed {
+            return None;
+        }
+        let mailbox_listed = match &place.mailbox {
+            Mailbox::Standard(folder) if fwd::is_view(id) => {
+                Self::view_folders(id).contains(folder)
+            }
+            Mailbox::Standard(folder) => *folder != Folder::Other,
+            Mailbox::Remote(name) => {
+                !fwd::is_view(id)
+                    && self
+                        .folders
+                        .get(id)
+                        .is_some_and(|folders| folders.iter().any(|f| &f.name == name))
+            }
+        };
+        // Subscriptions are listed per account and for All Mail.
+        let subscriptions_listed = !place.subscriptions || id == ALL_MAIL || !fwd::is_view(id);
+        (mailbox_listed && subscriptions_listed).then_some(place)
+    }
+    /// Opens the place saved last; false when there is none to open.
+    pub(super) fn restore_place(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(place) = self.saved_place() else {
+            return false;
+        };
+        if place.subscriptions {
+            self.open_subscriptions(place.account, w, cx);
+            if let Some(sender) = place.sender {
+                self.open_subscription(sender, cx);
+            }
+        } else {
+            self.open_mailbox(Some(place.account), place.mailbox, w, cx);
+        }
+        true
+    }
+    /// Whether `account` may only send as an alias (Forwarding settings).
+    pub(super) fn requires_alias(&self, account: &str) -> bool {
+        fwd::requires_alias(&self.forwarding, &self.accounts, account)
+    }
+    /// Accounts that may only send as an alias.
+    pub(super) fn alias_only_accounts(&self) -> HashSet<String> {
+        self.accounts
+            .iter()
+            .filter(|a| self.requires_alias(&a.id))
+            .map(|a| a.id.clone())
+            .collect()
+    }
+    /// For mail of a mailbox kept to its aliases, the alias that stands for
+    /// the mailbox in `m`: the one it was sent as, or the one it came to.
+    pub(super) fn mask_for(&self, m: &Mail) -> Option<Mask> {
+        let a = self.accounts.iter().find(|a| a.id == m.account)?;
+        if !self.requires_alias(&a.id) {
+            return None;
+        }
+        let sent = m.folder == Folder::Sent || m.from.eq_ignore_ascii_case(&a.email);
+        let alias = sent
+            .then(|| fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes))
+            .flatten()
+            .or_else(|| {
+                super::compose::alias_addressed(m, &fwd::sendable(&self.forwarding))
+                    .map(|a| a.email.clone())
+            })?;
+        Some(Mask {
+            address: a.email.clone(),
+            alias_name: fwd::alias_name(&self.forwarding, &alias),
+            alias,
+            sent,
+        })
+    }
+    /// The alias a sent message went out as, for mail in Sent.
+    pub(super) fn sent_alias(&self, m: &Mail) -> Option<String> {
+        if m.folder != Folder::Sent && self.folder != Folder::Sent {
+            return None;
+        }
+        fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes)
     }
     pub(super) fn shows_all_mail(&self) -> bool {
         self.all_mail && self.accounts.len() > 1
@@ -484,10 +624,9 @@ impl MailApp {
 
     pub(super) fn set_all_mail(&mut self, on: bool, cx: &mut Context<Self>) {
         self.all_mail = on;
-        let _ = self
+        self
             .backend
-            .store
-            .set_preference(fwd::ALL_MAIL_PREFERENCE, if on { "true" } else { "false" });
+            .store.set_preference_soon(fwd::ALL_MAIL_PREFERENCE, if on { "true" } else { "false" });
         self.views_changed(cx);
     }
     /// After aliases, services or All Mail change: saves them, updates the
@@ -810,9 +949,10 @@ impl MailApp {
     pub(super) fn update_composer_aliases(&mut self, cx: &mut Context<Self>) {
         let aliases = fwd::sendable(&self.forwarding);
         let services = Self::alias_services(&self.forwarding);
+        let alias_only = self.alias_only_accounts();
         for composer in &self.composers {
             composer.update(cx, |c, cx| {
-                c.set_forwarding(aliases.clone(), services.clone());
+                c.set_forwarding(aliases.clone(), services.clone(), alias_only.clone());
                 cx.notify();
             });
         }
@@ -1329,6 +1469,13 @@ mod tests {
                 address: format!("ra+secret{i}@simplelogin.co"),
                 blocked: i == 3,
                 last_sent: (i % 2 == 0).then_some(1_700_000_000 + i as i64),
+                stats: (i % 3 == 0).then(|| fwd::ContactStats {
+                    received_recent: 1,
+                    received: i as u64,
+                    sent_recent: 0,
+                    sent: 2,
+                    partial: false,
+                }),
             })
             .collect();
         view.update(cx, |this, _| {
@@ -1518,6 +1665,244 @@ mod tests {
         view.read_with(cx, |this, _| {
             assert!(this.unsubscribing.is_empty());
             assert!(!this.unsubscribed.contains(&other.key()));
+        });
+    }
+
+    #[gpui::test]
+    fn a_mailbox_kept_to_its_aliases_writes_and_shows_as_them(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        // Off: Work writes as itself, and its address shows as it is.
+        view.update_in(cx, |this, w, cx| {
+            assert!(!this.requires_alias(&work));
+            this.new_compose(0, w, cx);
+            assert!(this.composers[0].read(cx).draft.send_as.is_empty());
+            this.composers.clear();
+        });
+        act(&view, Action::SetAliasesOnly("sl".into(), true), cx);
+        let store = view.read_with(cx, |this, _| {
+            assert!(this.requires_alias(&work));
+            assert!(fwd::load(&this.backend.store)[0].aliases_only, "saved");
+            this.backend.store.clone()
+        });
+        // New mail goes out as its alias; without one it can't be sent.
+        view.update_in(cx, |this, w, cx| {
+            this.new_compose(0, w, cx);
+            let composer = this.composers[0].clone();
+            assert_eq!(composer.read(cx).draft.send_as, "shop@sl.io");
+            composer.update(cx, |c, cx| {
+                c.draft.send_as.clear();
+                c.fill("ana@example.org", "Hi", w, cx);
+                c.request_send(w, cx);
+                let error = c.error.clone().unwrap_or_default();
+                assert!(error.contains("sends only as its aliases"), "{error}");
+            });
+        });
+        // Nor by any other way of sending.
+        let a = store.accounts().unwrap().into_iter().find(|a| a.id == work).unwrap();
+        let backend = view.read_with(cx, |this, _| this.backend.clone());
+        let refused = backend
+            .send(&a, &Draft { to: "ana@example.org".into(), ..Draft::default() })
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("sends only as its aliases"), "{refused}");
+        // Mail that came to the alias shows the alias where Work's address was.
+        let id = view.update(cx, |this, _| {
+            let m = this
+                .messages
+                .iter_mut()
+                .find(|m| m.account == work && m.to.contains("shop@sl.io"))
+                .unwrap();
+            m.html = None;
+            m.body = Some("This email was sent to WORK@example.com.".into());
+            m.id.clone()
+        });
+        act(&view, Action::Select(id.clone()), cx);
+        view.update_in(cx, |this, w, cx| {
+            let m = this.messages.iter().find(|m| m.id == id).unwrap().clone();
+            let body = this.plain_body(&m).0.to_string();
+            assert!(body.contains("shop@sl"), "{body}");
+            assert!(!body.to_lowercase().contains("work@example"), "{body}");
+            // A reply goes out as the alias, quoting nothing of Work's address.
+            this.compose_reply(1, Some(m), Some(Placement::Floating), w, cx);
+            let draft = this.composers.last().unwrap().read(cx).draft.clone();
+            assert_eq!(draft.send_as, "shop@sl.io");
+            assert!(!draft.body.to_lowercase().contains("work@example.com"), "{}", draft.body);
+        });
+        // Its sent mail is from the alias.
+        let sent = Mail {
+            id: format!("{work}:sent:9"),
+            account: work.clone(),
+            folder: Folder::Sent,
+            from: "work@example.com".into(),
+            sender: "Work".into(),
+            to: "ra+ana@simplelogin.co".into(),
+            ..Mail::default()
+        };
+        view.update(cx, |this, _| {
+            fwd::remember_routes(&store, "shop@sl.io", ["ra+ana@simplelogin.co".to_owned()])
+                .unwrap();
+            this.alias_routes = fwd::routes(&store);
+            let mask = this.mask_for(&sent).expect("masked");
+            assert!(mask.sent);
+            assert_eq!(mask.sender(), "shop@sl.io");
+            assert_eq!(mask.apply("Work <work@example.com>"), "Work <shop@sl.io>");
+        });
+        // Turned off, everything is as it was.
+        act(&view, Action::SetAliasesOnly("sl".into(), false), cx);
+        view.read_with(cx, |this, _| assert!(this.mask_for(&sent).is_none()));
+    }
+
+    #[gpui::test]
+    fn sent_mail_shows_the_alias_it_went_out_as(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        // One message sent through a SimpleLogin reverse alias, one not.
+        let (via, plain) = view.update(cx, |this, _| {
+            let store = &this.backend.store;
+            fwd::remember_routes(store, "shop@sl.io", ["ra+ana@simplelogin.co".to_owned()])
+                .unwrap();
+            this.alias_routes = fwd::routes(store);
+            let sent = |id: &str, to: &str| Mail {
+                id: format!("{work}:sent:{id}"),
+                account: work.clone(),
+                folder: Folder::Sent,
+                remote_folder: "Sent".into(),
+                from: "work@example.com".into(),
+                sender: "Work".into(),
+                to: to.into(),
+                subject: format!("Sent {id}"),
+                date: 1_800_000_000,
+                ..Mail::default()
+            };
+            let via = sent("1", "\"ana at example.org\" <ra+ana@simplelogin.co>");
+            let plain = sent("2", "bo@example.net");
+            store.save_messages(&[via.clone(), plain.clone()]).unwrap();
+            (via.id, plain.id)
+        });
+        view.update_in(cx, |this, w, cx| {
+            this.open_mailbox(Some(work.clone()), Folder::Sent.into(), w, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            let find = |id: &str| this.messages.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(this.sent_alias(find(&via)).as_deref(), Some("shop@sl.io"));
+            assert_eq!(this.sent_alias(find(&plain)), None);
+        });
+        frame(cx);
+        frame(cx);
+        let tag: &'static str = Box::leak(format!("sent-alias-{via}").into_boxed_str());
+        assert!(cx.debug_bounds(tag).is_some(), "the row names the alias");
+        let other: &'static str = Box::leak(format!("sent-alias-{plain}").into_boxed_str());
+        assert!(cx.debug_bounds(other).is_none());
+        // The reader says it too.
+        act(&view, Action::Select(via.clone()), cx);
+        frame(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("reader-sent-alias").is_some());
+    }
+
+    #[gpui::test]
+    fn subscription_opens_its_mail_and_comes_back_to_it(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        // More mail from The Browser: enough to scroll, one of it unread.
+        let newest = view.update(cx, |this, _| {
+            let base = this
+                .backend
+                .store
+                .message(&format!("{work}:demo-9"))
+                .unwrap()
+                .unwrap();
+            let extra: Vec<Mail> = (0..30)
+                .map(|i| Mail {
+                    id: format!("{work}:browser-{i}"),
+                    uid: 100 + i,
+                    message_id: format!("<browser-{i}@thebrowser.com>"),
+                    unread: i == 0,
+                    date: base.date - 10_000 - i as i64 * 60,
+                    ..base.clone()
+                })
+                .collect();
+            this.backend.store.save_messages(&extra).unwrap();
+            base.date
+        });
+        act(&view, Action::OpenSubscriptions(work.clone()), cx);
+        frame(cx);
+        let sub = view.read_with(cx, |this, _| {
+            assert_eq!(this.subs[0].count, 31);
+            assert_eq!(this.subs[0].unread, 1);
+            this.subs[0].clone()
+        });
+        // When its latest message came, as the mail list shows times.
+        assert_eq!(sub.latest, newest);
+        let row = cx.debug_bounds("subscription-0").unwrap();
+        let address = cx.debug_bounds("subscription-0-address").unwrap();
+        let latest = cx.debug_bounds("subscription-0-latest").unwrap();
+        // Under the address, lined up with it, inside the row.
+        assert_eq!(latest.left(), address.left());
+        assert!(latest.top() >= address.bottom(), "{latest:?} under {address:?}");
+        assert!(latest.bottom() <= row.bottom(), "{latest:?} in {row:?}");
+        assert!(cx.debug_bounds("subs-tab-unsubscribed").is_some());
+        // What to do with all of its mail is in a menu, not beside it.
+        assert!(cx.debug_bounds("subscription-0-menu").is_some());
+        assert!(cx.debug_bounds("subscription-0-read").is_none());
+        view.read_with(cx, |this, _| {
+            let labels: Vec<String> = this
+                .subscription_entries(&sub)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    Entry::Separator => None,
+                })
+                .collect();
+            assert_eq!(
+                labels,
+                ["Mark All as Read", "Move All to Inbox", "Archive All", "Move All to Spam", "Move All to Trash"]
+            );
+        });
+        // Clicking it lists its mail on the right, beside the subscriptions.
+        act(&view, Action::OpenSubscription(sub.clone()), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.messages.len(), 31);
+            assert_eq!(this.visible.len(), 31);
+        });
+        let list = cx.debug_bounds("subscription-list").unwrap();
+        let mail = cx.debug_bounds("subscription-mail-pane").unwrap();
+        assert!(mail.left() >= list.right(), "{list:?} {mail:?}");
+        assert!(cx.debug_bounds("sender-menu").is_some());
+        // A message opens in place of the list, which keeps its place.
+        let offset = point(px(0.), px(-400.));
+        view.update(cx, |this, _| {
+            this.list_scroll.0.borrow().base_handle.set_offset(offset)
+        });
+        frame(cx);
+        let id = view.read_with(cx, |this, _| this.messages[this.visible[10]].id.clone());
+        act(&view, Action::Select(id.clone()), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| assert_eq!(this.selected.as_ref(), Some(&id)));
+        assert!(cx.debug_bounds("subscription-mail-back").is_some());
+        view.read_with(cx, |this, _| assert!(this.selected_ref().is_some(), "the message shows"));
+        act(&view, Action::BackToList, cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.selected.is_none());
+            assert_eq!(this.messages.len(), 31);
+            assert_eq!(this.list_scroll.0.borrow().base_handle.offset(), offset);
+        });
+        assert!(cx.debug_bounds("subscription-list").is_some());
+        // Back to the subscriptions; unsubscribed senders have their own tab.
+        act(&view, Action::CloseSubscription, cx);
+        view.update(cx, |this, _| {
+            this.unsubscribed.insert(sub.key());
+        });
+        view.read_with(cx, |this, _| {
+            assert!(this.subs_sender.is_none());
+            assert!(this.subs_shown().iter().all(|&i| this.subs[i].key() != sub.key()));
+        });
+        act(&view, Action::SubscriptionsTab(true), cx);
+        view.read_with(cx, |this, _| {
+            let shown = this.subs_shown();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(this.subs[shown[0]].key(), sub.key());
         });
     }
 }

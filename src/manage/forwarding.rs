@@ -186,6 +186,10 @@ pub struct ForwardingAccount {
     /// The service's mailboxes or recipients, where it has them.
     #[serde(default)]
     pub mailboxes: Vec<ServiceMailbox>,
+    /// The mailboxes it forwards to send only as its aliases: they can't
+    /// write as themselves, and their address is shown as the alias used.
+    #[serde(default)]
+    pub aliases_only: bool,
 }
 impl ForwardingAccount {
     fn secret_id(&self) -> String {
@@ -258,6 +262,7 @@ pub fn connect(
             .map(|a| a.id.clone()),
         aliases,
         mailboxes,
+        aliases_only: false,
     };
     store::write_secret(
         &account.secret_id(),
@@ -331,43 +336,127 @@ pub struct ReverseAlias {
     pub id: String,
     /// The contact's own address.
     pub contact: String,
-    /// The reverse alias, lowercase. Shown only as `obscure` makes it.
+    /// The reverse alias, lowercase. Never shown; only `obscure`d.
     pub address: String,
     /// Whether mail from the contact to the alias is blocked.
     pub blocked: bool,
     /// When the alias last wrote to the contact, in Unix seconds.
     pub last_sent: Option<i64>,
+    /// How much mail went between the alias and the contact; `None` when
+    /// the alias's activity couldn't be read.
+    pub stats: Option<ContactStats>,
 }
-/// A SimpleLogin alias's reverse aliases, as the service lists them now.
+
+/// Days counted as recent in a contact's stats.
+pub const CONTACT_RECENT_DAYS: i64 = 14;
+
+/// How much mail an alias has had with one contact, counted from the
+/// alias's activity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContactStats {
+    /// Mail from the contact forwarded to you, in the last
+    /// `CONTACT_RECENT_DAYS` days and all time.
+    pub received_recent: u64,
+    pub received: u64,
+    /// Mail you sent the contact through the reverse alias.
+    pub sent_recent: u64,
+    pub sent: u64,
+    /// Whether the activity was too long to read in full, so the all-time
+    /// counts are at least these.
+    pub partial: bool,
+}
+
+/// What happened in one entry of an alias's activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// Mail from a contact forwarded to your mailbox.
+    Forward,
+    /// Mail you sent a contact through its reverse alias.
+    Reply,
+    /// Anything else: blocked or bounced mail.
+    Other,
+}
+
+/// One entry of a SimpleLogin alias's activity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    pub kind: ActivityKind,
+    /// The reverse alias involved, lowercase; may be empty.
+    pub reverse_alias: String,
+    /// The contact's address, lowercase: the sender of forwarded mail, the
+    /// recipient of a reply.
+    pub contact: String,
+    /// Unix seconds.
+    pub timestamp: i64,
+}
+
+/// Counts each contact's mail from an alias's activity. `partial` says the
+/// activity wasn't read to its start.
+pub fn tally(contacts: &mut [ReverseAlias], activity: &[Activity], partial: bool, now: i64) {
+    let since = now - CONTACT_RECENT_DAYS * 24 * 60 * 60;
+    let mut by_address: HashMap<String, usize> = HashMap::new();
+    let mut by_contact: HashMap<String, usize> = HashMap::new();
+    for (i, c) in contacts.iter_mut().enumerate() {
+        c.stats = Some(ContactStats {
+            partial,
+            ..ContactStats::default()
+        });
+        by_address.insert(c.address.clone(), i);
+        by_contact.entry(c.contact.to_lowercase()).or_insert(i);
+    }
+    for a in activity {
+        let Some(&i) = (!a.reverse_alias.is_empty())
+            .then(|| by_address.get(&a.reverse_alias))
+            .flatten()
+            .or_else(|| by_contact.get(&a.contact))
+        else {
+            continue;
+        };
+        let Some(stats) = contacts[i].stats.as_mut() else {
+            continue;
+        };
+        let recent = a.timestamp >= since;
+        match a.kind {
+            ActivityKind::Forward => {
+                stats.received += 1;
+                stats.received_recent += recent as u64;
+            }
+            ActivityKind::Reply => {
+                stats.sent += 1;
+                stats.sent_recent += recent as u64;
+            }
+            ActivityKind::Other => {}
+        }
+    }
+}
+
+/// A SimpleLogin alias's reverse aliases, as the service lists them now,
+/// with how much mail each has had. Stats are left out, rather than the
+/// list failing, when the activity can't be read.
 pub fn reverse_aliases(account: &ForwardingAccount, alias: &Alias) -> Result<Vec<ReverseAlias>> {
-    account.client()?.contacts(alias)
+    let client = account.client()?;
+    let (contacts, activity) = std::thread::scope(|scope| {
+        let activity = scope.spawn(|| client.activity(alias));
+        let contacts = client.contacts(alias);
+        let activity = activity
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Reading the alias's activity failed")));
+        (contacts, activity)
+    });
+    let mut contacts = contacts?;
+    if let Ok((activity, partial)) = activity {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        tally(&mut contacts, &activity, partial, now);
+    }
+    Ok(contacts)
 }
-/// An address with most of it hidden, for showing a reverse alias without
-/// revealing it: `ra+x7k2abcd@simplelogin.co` reads `ra•••cd@s•••n.co`.
-/// The local part keeps two characters at each end, the domain name one,
-/// and the top-level domain stays readable.
-pub fn obscure(address: &str) -> String {
-    fn hide(text: &str, keep: usize) -> String {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() > keep * 2 + 1 {
-            let head: String = chars[..keep].iter().collect();
-            let tail: String = chars[chars.len() - keep..].iter().collect();
-            format!("{head}•••{tail}")
-        } else {
-            let head: String = chars.iter().take(1).collect();
-            format!("{head}•••")
-        }
-    }
-    match address.rsplit_once('@') {
-        Some((local, domain)) => {
-            let domain = match domain.rsplit_once('.') {
-                Some((name, tld)) => format!("{}.{tld}", hide(name, 1)),
-                None => hide(domain, 1),
-            };
-            format!("{}@{domain}", hide(local, 2))
-        }
-        None => hide(address, 2),
-    }
+/// What a reverse alias shows in place of its address: nothing of it, not
+/// even its length, so it can't be read off the screen. It can be copied.
+pub fn obscure(_address: &str) -> String {
+    "••••••••••••".to_owned()
 }
 
 /// What kind of domain an alias can be made at.
@@ -528,6 +617,89 @@ pub fn sendable(forwarding: &[ForwardingAccount]) -> Vec<SendAlias> {
         })
         .collect()
 }
+/// The Picacho mailboxes a service forwards to: the one it delivers to,
+/// and those that are among its mailboxes.
+pub fn forwards_to(f: &ForwardingAccount, accounts: &[Account]) -> Vec<String> {
+    accounts
+        .iter()
+        .filter(|a| {
+            f.deliver_to.as_deref() == Some(a.id.as_str())
+                || f.mailboxes
+                    .iter()
+                    .any(|m| m.email.eq_ignore_ascii_case(&a.email))
+        })
+        .map(|a| a.id.clone())
+        .collect()
+}
+
+/// Whether `account` may send only as an alias: a service that can send
+/// forwards to it, with "Send only as aliases" on.
+pub fn requires_alias(forwarding: &[ForwardingAccount], accounts: &[Account], account: &str) -> bool {
+    forwarding.iter().any(|f| {
+        f.aliases_only
+            && f.service.can_send()
+            && forwards_to(f, accounts).iter().any(|id| id == account)
+    })
+}
+
+/// The alias `account` writes as when none was chosen: the first turned-on
+/// alias (pinned ones first) of a service that keeps it to its aliases.
+pub fn default_alias(
+    forwarding: &[ForwardingAccount],
+    accounts: &[Account],
+    account: &str,
+) -> Option<String> {
+    forwarding
+        .iter()
+        .filter(|f| {
+            f.aliases_only
+                && f.service.can_send()
+                && forwards_to(f, accounts).iter().any(|id| id == account)
+        })
+        .flat_map(|f| {
+            let mut aliases: Vec<&Alias> = f.aliases.iter().filter(|a| a.enabled).collect();
+            aliases.sort_by_key(|a| !a.pinned);
+            aliases
+        })
+        .map(|a| a.email.clone())
+        .next()
+}
+
+/// The name recipients see for `alias`, when it has one.
+pub fn alias_name(forwarding: &[ForwardingAccount], alias: &str) -> Option<String> {
+    forwarding
+        .iter()
+        .flat_map(|f| &f.aliases)
+        .find(|a| a.email.eq_ignore_ascii_case(alias))
+        .map(|a| a.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// `text` with every mention of `address` (in any case) replaced by `alias`.
+pub fn mask_address<'a>(text: &'a str, address: &str, alias: &str) -> std::borrow::Cow<'a, str> {
+    let address = address.trim();
+    if address.is_empty() || !address.is_ascii() {
+        return text.into();
+    }
+    let lower = text.to_ascii_lowercase();
+    let needle = address.to_ascii_lowercase();
+    if !lower.contains(&needle) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(i) = lower[from..].find(&needle) {
+        let at = from + i;
+        out.push_str(&text[last..at]);
+        out.push_str(alias);
+        last = at + needle.len();
+        from = last;
+    }
+    out.push_str(&text[last..]);
+    out.into()
+}
+
 /// The sendable alias with this address, and its service account.
 fn find_sendable<'a>(
     forwarding: &'a [ForwardingAccount],
@@ -649,10 +821,22 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
                 }
                 out.push(field);
             }
+            // Sent copies are addressed to these: note them, so Sent can
+            // say which alias each went out as.
+            let _ = remember_routes(
+                store,
+                &alias.email,
+                reverse.into_iter().chain(made.into_values()),
+            );
             out
         }
         ForwardingService::FirefoxRelay => unreachable!("Firefox Relay cannot send"),
     };
+    let _ = remember_routes(
+        store,
+        &alias.email,
+        routed.iter().flatten().map(|(_, address)| address.clone()),
+    );
     let join = |list: &[(Option<String>, String)]| {
         list.iter()
             .map(|(name, address)| match name {
@@ -670,6 +854,96 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
         bcc: join(&routed[2]),
         ..draft.clone()
     })
+}
+
+/// Where the reverse addresses that write as an alias are kept:
+/// a JSON object of address (lowercase) to the alias's address.
+const ROUTES_PREFERENCE: &str = "alias_routes";
+
+/// The reverse addresses known to write as an alias, to tell which alias a
+/// sent message went out as: its recipients are those addresses.
+pub fn routes(store: &Store) -> HashMap<String, String> {
+    store
+        .preference(ROUTES_PREFERENCE)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Notes that `addresses` write as `alias`. Saving is serialized, since
+/// sends and the Forwarding settings can both note some at once.
+pub fn remember_routes<I: IntoIterator<Item = String>>(
+    store: &Store,
+    alias: &str,
+    addresses: I,
+) -> Result<()> {
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = routes(store);
+    let alias = alias.trim().to_lowercase();
+    let mut changed = false;
+    for address in addresses {
+        let address = address.trim().to_lowercase();
+        if !address.is_empty() && all.get(&address) != Some(&alias) {
+            all.insert(address, alias.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        store.set_preference(ROUTES_PREFERENCE, &serde_json::to_string(&all)?)?;
+    }
+    Ok(())
+}
+
+/// The alias a message you sent went out as, if any: a recipient is a
+/// reverse address noted for it, an addy.io routed address
+/// (`alias+name=domain@alias-domain`) of a known alias, or the message is
+/// from the alias itself.
+pub fn sent_as(
+    from: &str,
+    to: &str,
+    cc: &str,
+    forwarding: &[ForwardingAccount],
+    routes: &HashMap<String, String>,
+) -> Option<String> {
+    let known = |email: &str| {
+        forwarding
+            .iter()
+            .flat_map(|f| &f.aliases)
+            .any(|a| a.email.eq_ignore_ascii_case(email))
+    };
+    if !from.is_empty() && known(from) {
+        return Some(from.trim().to_lowercase());
+    }
+    let recipients = [to, cc]
+        .into_iter()
+        .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
+        .map(|(_, email)| email.to_lowercase());
+    for email in recipients {
+        if let Some(alias) = routes.get(&email) {
+            return Some(alias.clone());
+        }
+        if let Some(alias) = addy_alias(&email, forwarding) {
+            return Some(alias);
+        }
+    }
+    None
+}
+
+/// The addy.io alias a routed address (`alias+name=domain@alias-domain`)
+/// writes as, when it is one of the person's aliases.
+fn addy_alias(address: &str, forwarding: &[ForwardingAccount]) -> Option<String> {
+    let (local, domain) = address.rsplit_once('@')?;
+    let (alias_local, rest) = local.split_once('+')?;
+    if !rest.contains('=') {
+        return None;
+    }
+    let alias = format!("{alias_local}@{domain}");
+    forwarding
+        .iter()
+        .filter(|f| f.service == ForwardingService::Addy)
+        .flat_map(|f| &f.aliases)
+        .any(|a| a.email.eq_ignore_ascii_case(&alias))
+        .then_some(alias)
 }
 
 /// addy.io's address for writing to `recipient` as `alias`:
@@ -873,6 +1147,110 @@ mod tests {
             "shop+ana=example.org@me.anonaddy.com"
         );
         assert!(addy_route("shop@me.anonaddy.com", "nobody").is_err());
+    }
+
+    #[test]
+    fn mailboxes_kept_to_their_aliases() {
+        let account = |id: &str, email: &str| Account {
+            id: id.into(),
+            email: email.into(),
+            ..Account::new(Provider::Imap)
+        };
+        let accounts = [account("w", "work@example.com"), account("h", "home@example.com")];
+        let alias = |email: &str, enabled, pinned| Alias {
+            id: email.into(),
+            email: email.into(),
+            enabled,
+            pinned,
+            ..Alias::default()
+        };
+        let mut services = vec![ForwardingAccount {
+            id: "sl".into(),
+            service: ForwardingService::SimpleLogin,
+            deliver_to: Some("w".into()),
+            mailboxes: vec![ServiceMailbox {
+                id: "1".into(),
+                email: "HOME@example.com".into(),
+            }],
+            aliases: vec![
+                alias("off@sl.io", false, true),
+                alias("a@sl.io", true, false),
+                alias("b@sl.io", true, true),
+            ],
+            ..ForwardingAccount::default()
+        }];
+        assert_eq!(forwards_to(&services[0], &accounts), ["w", "h"]);
+        assert!(!requires_alias(&services, &accounts, "w"), "off by default");
+        services[0].aliases_only = true;
+        assert!(requires_alias(&services, &accounts, "w"));
+        assert!(requires_alias(&services, &accounts, "h"));
+        // A pinned, turned-on alias first.
+        assert_eq!(default_alias(&services, &accounts, "w").as_deref(), Some("b@sl.io"));
+        // Firefox Relay can't send, so it never keeps a mailbox from sending.
+        services[0].service = ForwardingService::FirefoxRelay;
+        assert!(!requires_alias(&services, &accounts, "w"));
+
+        assert_eq!(
+            mask_address("To: Work <WORK@example.com>, work@example.com", "work@example.com", "a@sl.io"),
+            "To: Work <a@sl.io>, a@sl.io"
+        );
+        assert!(matches!(
+            mask_address("nothing here", "work@example.com", "a@sl.io"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn sent_mail_names_the_alias_it_went_out_as() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&p)?;
+        let alias = |email: &str| Alias {
+            id: email.into(),
+            email: email.into(),
+            enabled: true,
+            ..Alias::default()
+        };
+        let forwarding = [
+            ForwardingAccount {
+                id: "addy".into(),
+                service: ForwardingService::Addy,
+                aliases: vec![alias("shop@me.anonaddy.com")],
+                ..ForwardingAccount::default()
+            },
+            ForwardingAccount {
+                id: "sl".into(),
+                service: ForwardingService::SimpleLogin,
+                aliases: vec![alias("news@sl.io")],
+                ..ForwardingAccount::default()
+            },
+        ];
+        // SimpleLogin's reverse aliases are opaque: they are noted when used.
+        remember_routes(&store, "News@sl.io", ["RA+abc@SimpleLogin.co".to_owned()])?;
+        remember_routes(&store, "news@sl.io", ["ra+def@simplelogin.co".to_owned()])?;
+        let routes = routes(&store);
+        assert_eq!(routes.len(), 2);
+        let me = "me@example.com";
+        let sent = |to: &str, cc: &str| sent_as(me, to, cc, &forwarding, &routes);
+        assert_eq!(
+            sent("\"ana at example.org\" <ra+abc@simplelogin.co>", "").as_deref(),
+            Some("news@sl.io")
+        );
+        assert_eq!(sent("bo@example.net", "ra+def@simplelogin.co").as_deref(), Some("news@sl.io"));
+        // addy.io's routed addresses name their alias.
+        assert_eq!(
+            sent("shop+ana=example.org@me.anonaddy.com", "").as_deref(),
+            Some("shop@me.anonaddy.com")
+        );
+        // Only the person's own aliases, and not plain plus addressing.
+        assert_eq!(sent("other+ana=example.org@me.anonaddy.com", ""), None);
+        assert_eq!(sent("shop+news@me.anonaddy.com", ""), None);
+        assert_eq!(sent("ana@example.org", ""), None);
+        // Sent from the alias's own address.
+        assert_eq!(
+            sent_as("news@sl.io", "ana@example.org", "", &forwarding, &routes).as_deref(),
+            Some("news@sl.io")
+        );
+        Ok(())
     }
 
     #[test]
@@ -1095,16 +1473,60 @@ mod tests {
     }
 
     #[test]
-    fn reverse_aliases_are_shown_mostly_hidden() {
-        assert_eq!(obscure("ra+x7k2abcd@simplelogin.co"), "ra•••cd@s•••n.co");
-        assert_eq!(obscure("reply+a1b2c3@sl.local"), "re•••c3@s•••.local");
-        // Short parts keep only their first character.
-        assert_eq!(obscure("ab@x.cc"), "a•••@x•••.cc");
-        let shown = obscure("ra+secretpart@simplelogin.cc");
-        assert!(!shown.contains("secretpart") && !shown.contains("simplelogin"));
-        assert!(shown.ends_with(".cc"));
-        // Non-ASCII is cut on character boundaries.
-        assert_eq!(obscure("ñandú+ñ@dominio.es"), "ña•••+ñ@d•••o.es");
+    fn reverse_aliases_are_hidden_entirely() {
+        let a = obscure("ra+x7k2abcd@simplelogin.co");
+        let b = obscure("ab@x.cc");
+        assert_eq!(a, b, "not even the length shows");
+        assert!(!a.contains('@') && !a.chars().any(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn contacts_count_their_mail_recently_and_all_time() {
+        let day = 24 * 60 * 60;
+        let now = 100 * day;
+        let contact = |id: &str, who: &str, ra: &str| ReverseAlias {
+            id: id.into(),
+            contact: who.into(),
+            address: ra.into(),
+            ..ReverseAlias::default()
+        };
+        let mut list = vec![
+            contact("1", "ana@example.org", "ra+ana@sl.co"),
+            contact("2", "Bo@Example.org", "ra+bo@sl.co"),
+        ];
+        let act = |kind, ra: &str, who: &str, days_ago: i64| Activity {
+            kind,
+            reverse_alias: ra.into(),
+            contact: who.into(),
+            timestamp: now - days_ago * day,
+        };
+        let activity = vec![
+            act(ActivityKind::Forward, "ra+ana@sl.co", "ana@example.org", 1),
+            act(ActivityKind::Forward, "ra+ana@sl.co", "ana@example.org", 30),
+            act(ActivityKind::Reply, "ra+ana@sl.co", "ana@example.org", 2),
+            act(ActivityKind::Other, "ra+ana@sl.co", "ana@example.org", 2),
+            // No reverse alias given: matched by the contact's address.
+            act(ActivityKind::Reply, "", "bo@example.org", 20),
+            act(ActivityKind::Forward, "ra+someone@sl.co", "x@example.org", 1),
+        ];
+        tally(&mut list, &activity, false, now);
+        assert_eq!(
+            list[0].stats,
+            Some(ContactStats {
+                received_recent: 1,
+                received: 2,
+                sent_recent: 1,
+                sent: 1,
+                partial: false,
+            })
+        );
+        assert_eq!(
+            list[1].stats,
+            Some(ContactStats {
+                sent: 1,
+                ..ContactStats::default()
+            })
+        );
     }
 
     #[test]

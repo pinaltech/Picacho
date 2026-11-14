@@ -954,8 +954,6 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28803328124d7b7ea5f8f41501513ccb005559e9f6baf33fa0c1fb7612654a93"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -3347,8 +3345,6 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "979b45cfa6ec723b6f42330915a1b3769b930d02b2d505f9697f8ca602bee707"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",
@@ -3444,8 +3440,6 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d021d46b4088d3d93a57ccdf443da85695a77272108caca2f6fe5369f584966a"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -6391,6 +6385,7 @@ dependencies = [
  "cursor-icon",
  "data-url",
  "directories",
+ "flate2",
  "fontique",
  "futures",
  "gpui",
@@ -6407,6 +6402,7 @@ dependencies = [
  "mail-auth",
  "mailparse",
  "markdown",
+ "mime_guess",
  "native-tls",
  "notify-rust",
  "objc",
@@ -6423,6 +6419,7 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "url",
+ "url-sanitize-core",
  "uuid",
  "zeroize",
 ]
@@ -7135,6 +7132,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
@@ -9597,6 +9600,20 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "url-sanitize-core"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de28bc04e53d02621c41195bf4d148a3294967122e7a3698928080edac355b2c"
+dependencies = [
+ "base64 0.23.1",
+ "percent-encoding",
+ "regex-lite",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

@@ -2,6 +2,179 @@
 use super::*;
 
 impl MailApp {
+    /// Takes the reader's place while several messages are selected: how
+    /// many, from whom, and the actions for all of them.
+    fn selection_summary(
+        &self,
+        corners: Corners<Pixels>,
+        framed: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let c = self.colors();
+        let picked: Vec<&Mail> = self
+            .messages
+            .iter()
+            .filter(|m| self.selection.contains(&m.id))
+            .collect();
+        let n = picked.len();
+        let unread = picked.iter().filter(|m| m.unread).count();
+        let all_starred = n > 0 && picked.iter().all(|m| m.starred);
+        // The senders, most frequent first.
+        let mut senders: Vec<(String, usize)> = Vec::new();
+        for m in &picked {
+            let name = if m.sender.trim().is_empty() { &m.from } else { &m.sender };
+            match senders.iter_mut().find(|(s, _)| s == name) {
+                Some((_, count)) => *count += 1,
+                None => senders.push((name.clone(), 1)),
+            }
+        }
+        senders.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let shown = senders.len().min(3);
+        let mut who = senders[..shown]
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if senders.len() > shown {
+            who += &format!(" and {} more", fmt_count(senders.len() - shown));
+        }
+        let action = |id: &str, label: &str, icon: &str, change: Change| {
+            self.button(id.to_owned(), label, icon, Action::ApplySelection(change), false, cx)
+                .w(px(220.))
+                .justify_start()
+                .bg(rgb(c.bg))
+        };
+        div()
+            .id("reader-pane")
+            .debug_selector(|| "reader-pane".into())
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .bg(rgb(c.surface))
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_6()
+            .when(framed, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(10.))
+                        .left(px(8.))
+                        .child(self.reader_toggle(false, cx)),
+                )
+            })
+            .child(icon_el("select", 36., c.accent))
+            .child(
+                div()
+                    .id("selection-summary")
+                    .debug_selector(|| "selection-summary".into())
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} messages selected", fmt_count(n))),
+            )
+            .child(
+                div()
+                    .max_w(px(360.))
+                    .text_center()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if unread > 0 {
+                        format!("{} unread · from {who}", fmt_count(unread))
+                    } else {
+                        format!("From {who}")
+                    }),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(if unread > 0 {
+                        action("summary-read", "Mark as read", "mail-open", Change::Read(true))
+                    } else {
+                        action("summary-unread", "Mark as unread", "mail", Change::Read(false))
+                    })
+                    .child(if all_starred {
+                        action("summary-unstar", "Unstar", "star", Change::Star(false))
+                    } else {
+                        action("summary-star", "Star", "star", Change::Star(true))
+                    })
+                    .when(self.folder != Folder::Archive, |d| {
+                        d.child(action(
+                            "summary-archive",
+                            "Archive",
+                            "archive",
+                            Change::Move(Folder::Archive),
+                        ))
+                    })
+                    .when(self.folder != Folder::Inbox, |d| {
+                        d.child(action(
+                            "summary-inbox",
+                            "Move to Inbox",
+                            "inbox",
+                            Change::Move(Folder::Inbox),
+                        ))
+                    })
+                    .when(self.folder != Folder::Junk, |d| {
+                        d.child(action(
+                            "summary-spam",
+                            "Move to spam",
+                            "spam",
+                            Change::Move(Folder::Junk),
+                        ))
+                    })
+                    .when(self.folder != Folder::Trash, |d| {
+                        d.child(action(
+                            "summary-trash",
+                            "Move to trash",
+                            "trash",
+                            Change::Move(Folder::Trash),
+                        ))
+                    })
+                    .when(
+                        self.move_folder_entry("", MoveTarget::Selection).is_some(),
+                        |d| {
+                            d.child(
+                                self.button(
+                                    "summary-folder",
+                                    "Move to folder…",
+                                    "folder",
+                                    Action::MoveMenu(MoveTarget::Selection),
+                                    false,
+                                    cx,
+                                )
+                                .w(px(220.))
+                                .justify_start()
+                                .bg(rgb(c.bg)),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        self.button(
+                            "summary-done",
+                            "Clear selection",
+                            "",
+                            Action::StopSelecting,
+                            false,
+                            cx,
+                        )
+                        .text_size(px(12.))
+                        .h(px(30.)),
+                    ),
+            )
+    }
     /// The message's saved choices or the defaults. The open message's are
     /// read once, not on every frame.
     pub(super) fn reading_options(&self, mail: &Mail) -> ReadingOptions {
@@ -67,6 +240,10 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let c = self.colors();
+        // Several messages picked: what can be done with all of them.
+        if self.selection.len() > 1 && !self.subs_open {
+            return self.selection_summary(corners, framed, cx).into_any_element();
+        }
         let Some(m) = self.selected_ref() else {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             return div()
@@ -100,6 +277,15 @@ impl MailApp {
         };
         let compact = window.viewport_size().width < px(1180.);
         let single = window.viewport_size().width < px(900.);
+        // A mailbox kept to its aliases shows the alias used in its place.
+        let mask = self.mask_for(m);
+        let (sender, from) = match &mask {
+            Some(k) => (
+                if k.sent { k.sender() } else { m.sender.clone() },
+                k.apply(&m.from).into_owned(),
+            ),
+            None => (m.sender.clone(), m.from.clone()),
+        };
         let toolbar = div()
             .id("reader-toolbar")
             .debug_selector(|| "reader-toolbar".into())
@@ -208,10 +394,17 @@ impl MailApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(23.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(relative(1.35))
-                            .child(m.subject.clone()),
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(23.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .line_height(relative(1.35))
+                                    .child(m.subject.clone()),
+                            )
+                            .children(self.label_chips(m, cx)),
                     )
                     .child(
                         self.button(
@@ -259,15 +452,22 @@ impl MailApp {
                                         div()
                                             .text_size(px(13.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child(m.sender.clone()),
+                                            .child(sender),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
                                             .text_color(rgb(c.muted))
                                             .truncate()
-                                            .child(format!("<{}>", m.from)),
-                                    ),
+                                            .child(format!("<{from}>")),
+                                    )
+                                    .when_some(self.sent_alias(m), |d, alias| {
+                                        d.child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .child(alias_tag("reader-sent-alias", alias, c)),
+                                        )
+                                    }),
                             )
                             .child(self.details_toggle(m, cx)),
                     )
@@ -304,8 +504,10 @@ impl MailApp {
                     Some(hidden) if !self.quotes_open => hidden.as_str(),
                     _ => html.as_str(),
                 };
+                let masked = mask.as_ref().map(|k| k.apply(shown));
+                let shown = masked.as_deref().unwrap_or(shown);
                 self.html_view.update(cx, |view, cx| {
-                    view.set_content(shown, options.block_remote, dark, cx)
+                    view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
                 content = content.child(self.html_view.clone());
             } else {
@@ -389,6 +591,11 @@ impl MailApp {
                 content = content.child(div().mt_8().children(later));
             }
             if let Some(reply) = self.inline_composer(&m.id) {
+                if self.reader_to_end.get() > 0 {
+                    self.reader_to_end.set(self.reader_to_end.get() - 1);
+                    self.reader_scroll.scroll_to_bottom();
+                    window.refresh();
+                }
                 content = content.child(
                     div()
                         .id("inline-reply")
@@ -613,10 +820,19 @@ impl MailApp {
             .flex_col()
             .gap(px(7.))
             .text_size(px(12.));
-        let from = if m.sender != m.from && !m.sender.is_empty() {
-            format!("{} <{}>", m.sender, m.from)
+        let mask = self.mask_for(m);
+        let masked = |v: &str| match &mask {
+            Some(k) => k.apply(v).into_owned(),
+            None => v.to_owned(),
+        };
+        let sender = match &mask {
+            Some(k) if k.sent => k.sender(),
+            _ => m.sender.clone(),
+        };
+        let from = if sender != m.from && !sender.is_empty() {
+            masked(&format!("{} <{}>", sender, m.from))
         } else {
-            m.from.clone()
+            masked(&m.from)
         };
         let details = info
             .and_then(|i| i.result.as_ref())
@@ -624,11 +840,11 @@ impl MailApp {
         let header = |value: Option<&String>| value.filter(|v| !v.trim().is_empty()).cloned();
         let mut panel_rows: Vec<AnyElement> = vec![row("from:", text(from)).into_any_element()];
         if let Some(v) = header(details.map(|d| &d.details.reply_to)) {
-            panel_rows.push(row("reply-to:", text(v)).into_any_element());
+            panel_rows.push(row("reply-to:", text(masked(&v))).into_any_element());
         }
-        panel_rows.push(row("to:", text(m.to.clone())).into_any_element());
+        panel_rows.push(row("to:", text(masked(&m.to))).into_any_element());
         if let Some(v) = header(details.map(|d| &d.details.cc)) {
-            panel_rows.push(row("cc:", text(v)).into_any_element());
+            panel_rows.push(row("cc:", text(masked(&v))).into_any_element());
         }
         panel_rows.push(row("date:", text(date_full(m.date))).into_any_element());
         panel_rows.push(row("subject:", text(m.subject.clone())).into_any_element());
@@ -1480,11 +1696,14 @@ impl MailApp {
 
     /// The plain body as the reader's Markdown, without the quoted history
     /// unless it is open; and whether there is quoted history.
-    fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
+    pub(super) fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
+        let mask = self.mask_for(m);
         let key = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             m.id,
             self.quotes_open,
+            self.clean_links,
+            mask.as_ref().map_or("", |k| k.alias.as_str()),
             m.body.as_ref().map_or(0, String::len)
         );
         if let Some((k, text, quoted)) = &*self.plain_cache.borrow()
@@ -1502,7 +1721,16 @@ impl MailApp {
         } else {
             written
         };
-        let text = SharedString::from(plain_markdown(shown));
+        let shown = match &mask {
+            Some(k) => k.apply(shown),
+            None => shown.into(),
+        };
+        let shown = if self.clean_links {
+            crate::manage::tracking::clean_text(&shown).into_owned().into()
+        } else {
+            shown
+        };
+        let text = SharedString::from(plain_markdown(&shown));
         *self.plain_cache.borrow_mut() = Some((key, text.clone(), quoted.is_some()));
         (text, quoted.is_some())
     }
@@ -1536,5 +1764,69 @@ impl MailApp {
             })
             .on_click(cx.listener(|this, _, w, cx| this.handle(Action::ToggleQuotes, w, cx)))
             .into_any_element()
+    }
+}
+
+impl MailApp {
+    /// A message's labels, each removable; choosing one shows the mail
+    /// that has it.
+    fn label_chips(&self, m: &Mail, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        if m.labels.is_empty() {
+            return None;
+        }
+        let c = self.colors();
+        let gmail = self
+            .account_of(m)
+            .is_some_and(|a| a.provider == Provider::Gmail);
+        let mut row = div()
+            .id("reader-labels")
+            .debug_selector(|| "reader-labels".into())
+            .flex()
+            .flex_wrap()
+            .gap_1();
+        for (i, label) in m.labels.iter().enumerate() {
+            let shown = if gmail {
+                crate::sync::transport::decode_name(label)
+            } else {
+                label.clone()
+            };
+            let search = Action::SearchFor(search_term("label", &shown));
+            let remove = Action::Apply(vec![m.id.clone()], Change::Label(label.clone(), false));
+            row = row.child(
+                div()
+                    .id(("reader-label", i))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl_2()
+                    .pr_1()
+                    .h(px(22.))
+                    .rounded_full()
+                    .bg(rgb(c.soft))
+                    .text_size(px(11.))
+                    .text_color(rgb(c.accent))
+                    .cursor_pointer()
+                    .child(icon_el("tag", 11., c.accent))
+                    .child(shown.clone())
+                    .tooltip(move |w, cx| Tooltip::new(format!("Show mail labeled “{shown}”")).build(w, cx))
+                    .on_click(cx.listener(move |this, _, w, cx| this.handle(search.clone(), w, cx)))
+                    .child(
+                        div()
+                            .id(("reader-label-remove", i))
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .hover(move |s| s.bg(rgb(c.border)))
+                            .child(icon_el("close", 9., c.muted))
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                cx.stop_propagation();
+                                this.handle(remove.clone(), w, cx)
+                            })),
+                    ),
+            );
+        }
+        Some(row)
     }
 }

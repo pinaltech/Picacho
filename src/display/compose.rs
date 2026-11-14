@@ -41,16 +41,38 @@ impl MailApp {
         if self.onboarding {
             return;
         }
-        let forced = placement;
+        let mut forced = placement;
         let options = self.compose_options.clone();
         let original = original.filter(|_| mode > 0);
-        // One inline reply per message: go back to it rather than start another.
-        if let Some(m) = &original
-            && let Some(existing) = self.inline_composer(&m.id)
-        {
-            existing.update(cx, |c, cx| c.focus_first(w, cx));
-            self.scroll_reader_to_end(w);
-            return;
+        // Asked again to answer a message whose answer of that kind is open
+        // (Reply and Reply all are one kind), go back to it rather than start
+        // another. A message has one inline answer: asked for the other kind
+        // (Reply while forwarding it), open that where new messages open, so
+        // it is seen and neither is lost.
+        if let Some(m) = &original {
+            if let Some(existing) = self.open_answer(m, mode == 3, cx) {
+                let inline = existing.read(cx).placement == Placement::Inline;
+                let window = existing.read(cx).window;
+                existing.update(cx, |c, cx| {
+                    c.minimized = false;
+                    c.focus_first(w, cx);
+                    cx.notify();
+                });
+                if inline {
+                    self.scroll_reader_to_end(w);
+                } else if let Some(window) = window {
+                    let _ = window.update(cx, |_, w, _| w.activate_window());
+                }
+                cx.notify();
+                return;
+            }
+            if self.inline_composer(&m.id).is_some() {
+                forced = forced.or(Some(match options.open_in {
+                    ComposeOpen::Floating => Placement::Floating,
+                    ComposeOpen::Maximized => Placement::Maximized,
+                    ComposeOpen::Window => Placement::Window,
+                }));
+            }
         }
         let account = original
             .as_ref()
@@ -87,6 +109,23 @@ impl MailApp {
                 if let Some(alias) = alias_addressed(m, &aliases) {
                     draft.send_as = alias.email.clone();
                 }
+                // A mailbox kept to its aliases answers its own sent mail as
+                // the alias it went out as.
+                let mask = self.mask_for(m);
+                if draft.send_as.is_empty()
+                    && let Some(k) = &mask
+                {
+                    draft.send_as = k.alias.clone();
+                }
+                // Nothing quoted names the mailbox behind the alias.
+                let masked = |text: &str| match &mask {
+                    Some(k) => k.apply(text).into_owned(),
+                    None => text.to_owned(),
+                };
+                let sender = match &mask {
+                    Some(k) if k.sent => k.sender(),
+                    _ => m.sender.clone(),
+                };
                 if !forward {
                     let (to, cc) =
                         reply_recipients(m, mode == 2, &[own.as_str(), draft.send_as.as_str()]);
@@ -97,19 +136,19 @@ impl MailApp {
                         .trim()
                         .to_string();
                 }
-                let quoted = m.body.clone().unwrap_or_default();
+                let quoted = masked(&m.body.clone().unwrap_or_default());
                 let quote = if forward {
                     format!(
                         "\n\n---------- Forwarded message ----------\nFrom: {} <{}>\nDate: {}\nSubject: {}\nTo: {}\n{}\n{}",
-                        m.sender,
-                        m.from,
+                        sender,
+                        masked(&m.from),
                         date_full(m.date),
                         m.subject,
-                        m.to,
+                        masked(&m.to),
                         if m.cc.is_empty() {
                             String::new()
                         } else {
-                            format!("Cc: {}\n", m.cc)
+                            format!("Cc: {}\n", masked(&m.cc))
                         },
                         quoted
                     )
@@ -117,7 +156,7 @@ impl MailApp {
                     format!(
                         "\n\nOn {}, {} wrote:\n{}",
                         date_full(m.date),
-                        m.sender,
+                        sender,
                         quoted
                             .lines()
                             // Nested quotes stay compact: ">>", not "> >".
@@ -134,6 +173,13 @@ impl MailApp {
                 };
                 draft.body = format!("{}{quote}", sign(true));
             }
+        }
+        // A mailbox kept to its aliases writes as one of them.
+        if draft.send_as.is_empty()
+            && let Some(alias) =
+                fwd::default_alias(&self.forwarding, &self.accounts, &draft.account)
+        {
+            draft.send_as = alias;
         }
         let placement = forced.unwrap_or(match (&original, options.reply_placement) {
             (Some(_), ReplyPlacement::Inline) if self.reader_visible(w) => Placement::Inline,
@@ -177,6 +223,26 @@ impl MailApp {
         self.selected.is_some()
             && !self.reader_collapsed
             && (w.viewport_size().width >= px(900.) || self.selected.is_some())
+    }
+
+    /// An open composer answering `m`: forwarding it, or replying to it.
+    fn open_answer(&self, m: &Mail, forward: bool, cx: &App) -> Option<Entity<Composer>> {
+        if forward {
+            // Forwards don't name the message; only its inline one is known.
+            return self
+                .inline_composer(&m.id)
+                .filter(|c| c.read(cx).draft.reply_id.is_empty());
+        }
+        if m.message_id.is_empty() {
+            return self
+                .inline_composer(&m.id)
+                .filter(|c| !c.read(cx).draft.reply_id.is_empty());
+        }
+        let replies = |c: &&Entity<Composer>| c.read(cx).draft.reply_id == m.message_id;
+        // The inline one first: it is where the reader is.
+        self.inline_composer(&m.id)
+            .filter(|c| replies(&c))
+            .or_else(|| self.composers.iter().find(replies).cloned())
     }
 
     pub(super) fn inline_composer(&self, message: &str) -> Option<Entity<Composer>> {
@@ -261,7 +327,10 @@ impl MailApp {
             composer
         };
         let services = Self::alias_services(&self.forwarding);
-        composer.update(cx, |c, _| c.set_forwarding(fwd::sendable(&self.forwarding), services));
+        let alias_only = self.alias_only_accounts();
+        composer.update(cx, |c, _| {
+            c.set_forwarding(fwd::sendable(&self.forwarding), services, alias_only)
+        });
         // The From menu should not offer aliases deleted elsewhere.
         self.refresh_aliases_due(super::views::ALIAS_REFRESH_SOON, cx);
         if let Some(message) = answers {
@@ -289,14 +358,20 @@ impl MailApp {
             ComposerEvent::Send => self.queue_send(composer, cx),
             ComposerEvent::Close => {
                 composer.update(cx, |c, cx| c.save_now(cx));
+                let account = composer.read(cx).draft.account.clone();
                 self.close_composer(&composer, cx);
                 self.refresh_drafts(cx);
+                self.sync_drafts_soon(&account, cx);
             }
             ComposerEvent::Discard => {
-                let id = composer.read(cx).draft.id.clone();
-                let _ = self.backend.store.delete_draft(&id);
+                let (id, account) = {
+                    let d = &composer.read(cx).draft;
+                    (d.id.clone(), d.account.clone())
+                };
+                let _ = self.backend.discard_draft(&id);
                 self.close_composer(&composer, cx);
                 self.refresh_drafts(cx);
+                self.sync_drafts_soon(&account, cx);
             }
             ComposerEvent::Place(placement) => self.place_composer(composer, *placement, w, cx),
             ComposerEvent::Saved => self.refresh_drafts(cx),
@@ -308,28 +383,58 @@ impl MailApp {
     }
 
     pub(super) fn save_compose_options(&mut self, options: ComposeOptions, cx: &mut Context<Self>) {
-        match self.backend.store.set_preference(
+        let before = self.compose_options.clone();
+        self.save_preference(
             crate::manage::composing::PREFERENCE,
             &serde_json::to_string(&options).unwrap(),
-        ) {
-            Ok(()) => {
-                for composer in &self.composers {
-                    composer.update(cx, |c, cx| {
-                        c.options = options.clone();
-                        cx.notify();
-                    });
-                }
-                self.compose_options = options;
-            }
-            Err(e) => self.notice(e.to_string(), true, cx),
-        }
+            cx,
+            move |this, cx| this.use_compose_options(before, cx),
+        );
+        self.use_compose_options(options, cx);
         cx.notify();
+    }
+
+    fn use_compose_options(&mut self, options: ComposeOptions, cx: &mut Context<Self>) {
+        for composer in &self.composers {
+            composer.update(cx, |c, cx| {
+                c.options = options.clone();
+                cx.notify();
+            });
+        }
+        self.compose_options = options;
     }
 
     pub(super) fn refresh_drafts(&mut self, cx: &mut Context<Self>) {
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
         }
+    }
+    /// Brings an account's drafts and its server's Drafts folder in step,
+    /// in the background; the Drafts list reloads if anything changed.
+    pub(super) fn sync_drafts_soon(&mut self, account: &str, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
+            return;
+        };
+        if a.provider == Provider::Pop3
+            || self.account_blocked(&a.id)
+            || !self.draft_syncs.insert(a.id.clone())
+        {
+            return;
+        }
+        self.draft_synced
+            .insert(a.id.clone(), std::time::Instant::now());
+        let id = a.id.clone();
+        self.task(
+            cx,
+            move |b| b.sync_drafts(&a),
+            move |this, result, cx| {
+                this.draft_syncs.remove(&id);
+                this.account_result(&id, IssueSource::Sync(Folder::Drafts.key().into()), &result);
+                if result.is_ok() {
+                    this.refresh_drafts(cx);
+                }
+            },
+        );
     }
 
     /// Moves a composer. Within the main window it only changes how it is
@@ -434,16 +539,15 @@ impl MailApp {
         Rc::new(out)
     }
 
+    /// Brings the end of the reader, where its inline reply is, into view.
+    /// The reader asks for it while it is drawn with the reply in it, so
+    /// the scroll uses the layout the reply is part of; a few times over,
+    /// as the reply sizes itself once it is shown. (Waiting for frames
+    /// instead could scroll before the reply was laid out, leaving it
+    /// below a long email, out of sight.)
     fn scroll_reader_to_end(&self, w: &mut Window) {
-        // After the reply is laid out (two frames: added, then measured).
-        let scroll = self.reader_scroll.clone();
-        w.on_next_frame(move |w, _| {
-            w.on_next_frame(move |w, _| {
-                scroll.scroll_to_bottom();
-                w.refresh();
-            });
-            w.refresh();
-        });
+        self.reader_to_end.set(3);
+        w.refresh();
     }
 
     // Sending.
@@ -515,7 +619,7 @@ impl MailApp {
         let account_id = a.id.clone();
         self.task(
             cx,
-            move |b| b.send(&a, &draft),
+            move |b| b.send_noting(&a, &draft),
             move |this, result, cx| {
                 let gone = result
                     .as_ref()
@@ -527,10 +631,17 @@ impl MailApp {
                     this.account_result(&account_id, IssueSource::Send, &result);
                 }
                 match (result, gone) {
-                    (Ok(()), _) => {
+                    (Ok(notes), _) => {
+                        // Sent as an alias: its routed addresses are known now.
+                        this.alias_routes = fwd::routes(&this.backend.store);
                         this.outbox.retain(|o| o.id != id);
-                        this.notice("Message sent", false, cx);
+                        if notes.is_empty() {
+                            this.notice("Message sent", false, cx);
+                        } else {
+                            this.notice(format!("Message sent. {}", notes.join(" ")), false, cx);
+                        }
                         this.refresh_drafts(cx);
+                        this.sync_drafts_soon(&account_id, cx);
                     }
                     (Err(_), Some(gone)) => this.alias_gone(id, gone, cx),
                     (Err(e), None) => this.send_failed(id, format!("{e:#}"), cx),
@@ -625,14 +736,20 @@ impl MailApp {
                 ComposerEvent::Send => this.queue_send(composer, cx),
                 ComposerEvent::Close => {
                     composer.update(cx, |c, cx| c.save_now(cx));
+                    let account = composer.read(cx).draft.account.clone();
                     this.close_composer(&composer, cx);
                     this.refresh_drafts(cx);
+                    this.sync_drafts_soon(&account, cx);
                 }
                 ComposerEvent::Discard => {
-                    let id = composer.read(cx).draft.id.clone();
-                    let _ = this.backend.store.delete_draft(&id);
+                    let (id, account) = {
+                        let d = &composer.read(cx).draft;
+                        (d.id.clone(), d.account.clone())
+                    };
+                    let _ = this.backend.discard_draft(&id);
                     this.close_composer(&composer, cx);
                     this.refresh_drafts(cx);
+                    this.sync_drafts_soon(&account, cx);
                 }
                 // Moving needs the window; the next render applies it.
                 ComposerEvent::Place(p) => {

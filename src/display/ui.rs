@@ -47,7 +47,7 @@ use super::html::{HtmlContextMenu, HtmlView};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::subscriptions::Subscription as MailSubscription;
-use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
+use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource, SignInStep};
 use crate::{
     manage::{
         backend::{Backend, Change},
@@ -143,6 +143,8 @@ const IMAP_HOST: usize = 2;
 const IMAP_PORT: usize = 3;
 const SMTP_HOST: usize = 4;
 const SMTP_PORT: usize = 5;
+/// The servers' user name, when it isn't the email address.
+const LOGIN: usize = 6;
 
 #[derive(Clone, Copy)]
 struct Colors {
@@ -285,6 +287,15 @@ fn system_dark(w: &Window) -> bool {
     )
 }
 /// Shortcut text for this platform: macOS symbols, or Ctrl/Alt/Shift words.
+/// A search for `value` in `field`, quoted when it has spaces.
+fn search_term(field: &str, value: &str) -> String {
+    let value = value.replace('"', "");
+    if value.chars().any(char::is_whitespace) {
+        format!("{field}:\"{value}\"")
+    } else {
+        format!("{field}:{value}")
+    }
+}
 fn keys(text: &str) -> String {
     if cfg!(target_os = "macos") {
         return text.into();
@@ -306,6 +317,12 @@ enum Modal {
     About,
     Help,
     RemoveAccount(String),
+    /// Confirms deleting a folder on an account's server: (account, folder).
+    DeleteFolder(String, String),
+    /// Confirms deleting mail for good.
+    Erase(Erase),
+    /// Names a new label for messages.
+    NewLabel(MoveTarget),
     Reconnect(String),
     /// The raw source of the open message.
     Original,
@@ -314,6 +331,22 @@ enum Modal {
     /// A message wasn't sent because the alias in From no longer exists:
     /// (why, the address From was reset to).
     AliasGone(String, String),
+}
+/// What is deleted for good, once confirmed.
+#[derive(Clone, Debug, PartialEq)]
+enum Erase {
+    /// These messages.
+    Mail(Vec<String>),
+    /// Everything in an account's Trash or Spam.
+    Mailbox(String, Folder),
+}
+/// A server folder being named in the sidebar, as top folders are.
+#[derive(Clone, Debug, PartialEq)]
+enum FolderEdit {
+    /// Makes a folder inside this one, or at the top level.
+    New(Option<String>),
+    /// Renames this folder.
+    Rename(String),
 }
 /// What the Original Message window shows of the open message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,6 +457,16 @@ enum Page {
     Forwarding,
     Account(String),
 }
+/// What a folder picker moves into the chosen folder.
+#[derive(Clone, Debug, PartialEq)]
+enum MoveTarget {
+    /// These messages.
+    Mail(Vec<String>),
+    /// The selected messages.
+    Selection,
+    /// Every message from a subscription.
+    Subscription(Box<MailSubscription>),
+}
 #[derive(Clone)]
 enum Action {
     Compose,
@@ -453,6 +496,14 @@ enum Action {
     NewSeparator(Option<String>),
     RenameFolder(String),
     DeleteFolder(String),
+    /// Asks to delete an account's folder on its server: (account, folder).
+    DeleteRemoteFolder(String, String),
+    /// Deletes it, as confirmed in the dialog.
+    ConfirmDeleteFolder(String, String),
+    /// Asks for a new folder's name on an account's server: (account, parent).
+    NewRemoteFolder(String, Option<String>),
+    /// Asks for a new name for an account's folder: (account, folder).
+    RenameRemoteFolder(String, String),
     RemoveSeparator(String),
     ConfirmRemove(String),
     ToggleSidebar,
@@ -468,7 +519,13 @@ enum Action {
     ToggleSelected(String),
     SelectAll,
     StopSelecting,
+    /// Shows the list's checkboxes, or leaves selection mode.
+    ToggleSelectMode,
+    /// Selects every listed message from the same sender as this one.
+    SelectFromSender(String),
     OpenSearch,
+    /// Opens the search with this query, as `from:ana@example.com`.
+    SearchFor(String),
     CloseSearch,
     SetFilter(Filter),
     OldestFirst(bool),
@@ -487,6 +544,8 @@ enum Action {
     SetAccent(Accent),
     SetSync(String, SyncSettings),
     SetReadingDefaults(ReadingOptions),
+    /// Removes tracking from links in mail, or stops.
+    SetCleanLinks(bool),
     ToggleHtml,
     ToggleRemote,
     /// Shows the open email's body in light or dark colors.
@@ -508,6 +567,34 @@ enum Action {
     OpenSubscriptions(String),
     /// Asks a subscription's sender to stop, from the list or an email.
     Unsubscribe(MailSubscription),
+    /// Lists a subscription's mail in place of the subscriptions.
+    OpenSubscription(MailSubscription),
+    /// Back from a subscription's mail to the subscriptions.
+    CloseSubscription,
+    /// Shows subscribed (false) or unsubscribed (true) senders.
+    SubscriptionsTab(bool),
+    /// Marks or moves all of a subscription's mail.
+    ChangeSubscription(Box<MailSubscription>, Change),
+    /// Lists the account's server folders to move mail into.
+    MoveMenu(MoveTarget),
+    /// Turns asking for read receipts on or off for an account.
+    ToggleReadReceipts(String),
+    /// Turns asking for delivery receipts on or off for an account.
+    ToggleDeliveryReceipts(String),
+    /// Asks before deleting messages for good.
+    DeleteForever(Vec<String>),
+    /// Asks before emptying an account's Trash or Spam.
+    EmptyMailbox(String, Folder),
+    /// Deletes, as confirmed in the dialog.
+    ConfirmErase(Erase),
+    /// The labels to add to or remove from messages.
+    LabelMenu(MoveTarget),
+    /// Asks for a new label's name.
+    NewLabel(MoveTarget),
+    /// Adds the label named in the dialog.
+    SaveLabel,
+    /// What can be done with all of a subscription's mail.
+    SubscriptionMenu(MailSubscription),
     /// Opens the open message's headers, HTML or whole source.
     ShowSource(SourceView),
     CopyOriginal,
@@ -524,6 +611,7 @@ enum Action {
     Start,
     Discover,
     SetupBack,
+    RetrySignIn,
     Manual,
     Finish,
     #[cfg(feature = "sample-data")]
@@ -602,6 +690,9 @@ enum Action {
     /// Menus in Forwarding settings: a service's, where it delivers, an alias's.
     ServiceMenu(String),
     DeliverMenu(String),
+    /// Keeps the mailboxes a service forwards to from sending as
+    /// themselves (service, on).
+    SetAliasesOnly(String, bool),
     AliasMenu(String, String),
     /// Leaves a pending Remove or Delete in Forwarding settings.
     CancelForwardingConfirm,
@@ -612,6 +703,9 @@ enum Action {
 
 /// A conversation's rows for one message at one list revision.
 type ThreadRows = (String, u64, Rc<Vec<usize>>);
+
+/// How long typing in the sign-in name field pauses before the name applies.
+const LOGIN_PAUSE: Duration = Duration::from_millis(1500);
 
 pub struct MailApp {
     backend: Arc<Backend>,
@@ -624,6 +718,10 @@ pub struct MailApp {
     folder: Folder,
     remote: String,
     folders: HashMap<String, Vec<RemoteFolder>>,
+    /// The order server folders are shown in, by account, once one was made
+    /// or renamed here: like top folders, they stay where they were put.
+    /// Folders not in it (made elsewhere) follow, by name.
+    folder_order: HashMap<String, Vec<String>>,
     unread: HashMap<(String, String), usize>,
     collapsed: HashSet<String>,
     /// The sidebar's accounts, folders and separators, in order.
@@ -658,6 +756,9 @@ pub struct MailApp {
     menu: Option<PopupMenu>,
     filter_anchor: Rc<Cell<Bounds<Pixels>>>,
     selecting: bool,
+    /// Selection mode was turned on from the list's Select button, so the
+    /// checkboxes stay while nothing is picked yet.
+    select_mode: bool,
     selection: HashSet<String>,
     select_anchor: Option<String>,
     select_anim: u64,
@@ -695,6 +796,8 @@ pub struct MailApp {
     known: HashMap<String, HashSet<String>>,
     busy: usize,
     syncing: bool,
+    /// The open mailbox's cached mail is being read, before any sync.
+    cache_loading: bool,
     status: String,
     error: bool,
     form: Vec<Entity<InputState>>,
@@ -702,6 +805,10 @@ pub struct MailApp {
     provider: Provider,
     oauth: bool,
     connecting: bool,
+    /// The last sign-in failed after the browser and can be retried as is.
+    sign_in_retry: bool,
+    /// How far the running sign-in has come, followed from the backend.
+    sign_in_step: SignInStep,
     cancel: Arc<AtomicBool>,
     onboarding: bool,
     step: Step,
@@ -725,6 +832,17 @@ pub struct MailApp {
     /// The nickname field on an account's Settings page, and the account it
     /// shows.
     nickname_input: Entity<InputState>,
+    /// The account page's sign-in name and Reply-To fields.
+    login_input: Entity<InputState>,
+    reply_to_input: Entity<InputState>,
+    /// A sign-in name being typed and not yet applied: (account, name).
+    /// Each change signs the account out, so it applies once typing pauses
+    /// or ends, not on every key; see `apply_login`.
+    login_pending: Option<(String, String)>,
+    /// Counts edits of the sign-in name, so only the latest pause applies.
+    login_revision: u64,
+    /// Storage use by account, once asked (None: no quota).
+    quotas: HashMap<String, Option<crate::sync::transport::Quota>>,
     nickname_for: Option<String>,
     /// The preset picker was opened from Settings, which it returns to.
     /// The account whose preset pictures are shown over Settings.
@@ -795,6 +913,31 @@ pub struct MailApp {
     subs_loading: bool,
     subs_generation: u64,
     subs_scroll: UniformListScrollHandle,
+    /// Subscribed or Unsubscribed senders.
+    subs_tab: subscriptions::SubsTab,
+    /// The subscription whose mail is listed, in place of the subscriptions.
+    subs_sender: Option<MailSubscription>,
+    subs_sender_loading: bool,
+    /// Subscriptions whose mail is being marked or moved, by key.
+    subs_busy: HashSet<String>,
+    /// Server folders being deleted: (account, folder).
+    deleting_folders: HashSet<(String, String)>,
+    /// Accounts whose drafts are being synced with the server now.
+    draft_syncs: HashSet<String>,
+    /// Inbox watchers (IDLE) send their account's id here when the server
+    /// reports a change.
+    pushed: futures::channel::mpsc::UnboundedSender<String>,
+    /// When each account's drafts were last synced.
+    draft_synced: HashMap<String, std::time::Instant>,
+    /// The name in the new label dialog.
+    label_input: Entity<InputState>,
+    /// The server folder being named in the sidebar: (account, edit).
+    folder_edit: Option<(String, FolderEdit)>,
+    /// A server folder change being made: (account, edit, its new name).
+    folder_saving: Option<(String, FolderEdit, String)>,
+    /// Where the sender's mail list was scrolled when a message opened over
+    /// it, put back when the message closes.
+    subs_return: Cell<Option<Point<Pixels>>>,
     /// Subscriptions being, or already, unsubscribed from.
     unsubscribing: HashSet<String>,
     unsubscribed: HashSet<String>,
@@ -802,6 +945,8 @@ pub struct MailApp {
     original_scroll: UniformListScrollHandle,
     list_scroll: UniformListScrollHandle,
     reader_scroll: ScrollHandle,
+    /// Renders left that scroll the reader to its end (see `scroll_reader_to_end`).
+    reader_to_end: std::cell::Cell<u8>,
     reading_defaults: ReadingOptions,
     html_view: Entity<HtmlView>,
     settings_scroll: ScrollHandle,
@@ -820,6 +965,11 @@ pub struct MailApp {
     forwarding: Vec<ForwardingAccount>,
     /// All Mail is listed when there are several accounts.
     all_mail: bool,
+    /// Links in mail lose their tracking parameters and redirect wrappers.
+    clean_links: bool,
+    /// Reverse addresses that write as an alias, to show which alias sent
+    /// mail went out as (see `fwd::routes`).
+    alias_routes: HashMap<String, String>,
     /// What the open view lists: its mailboxes and address filters.
     scope: fwd::Scope,
     /// Forwarding settings' add form, and the work running there.
@@ -887,6 +1037,11 @@ impl MailApp {
         let accounts = store.accounts().unwrap_or_default();
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
+        let alias_routes = fwd::routes(&store);
+        let clean_links = store.preference("clean_links").as_deref() != Some("false");
+        if clean_links {
+            crate::manage::tracking::warm_up();
+        }
         let tree = Self::load_tree(&store, &Self::tree_ids(&accounts, &forwarding));
         let account = tree::account_order(&tree)
             .into_iter()
@@ -902,7 +1057,7 @@ impl MailApp {
         };
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
         let backend = Arc::new(Backend::new(store));
-        let search = input("Search", false, false, window, cx);
+        let search = input("Search, or from: reply-to: is:unread", false, false, window, cx);
         let placeholders = [
             "you@example.com",
             "Password",
@@ -910,6 +1065,7 @@ impl MailApp {
             "993",
             "smtp.example.com",
             "587",
+            "Same as the email address",
         ];
         let form: Vec<_> = placeholders
             .iter()
@@ -945,6 +1101,14 @@ impl MailApp {
             cx.subscribe_in(&rename_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                     this.commit_rename(w, cx);
+                }
+            }),
+        );
+        let label_input = input("Label name", false, false, window, cx);
+        subscriptions.push(
+            cx.subscribe_in(&label_input, window, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.handle(Action::SaveLabel, w, cx);
                 }
             }),
         );
@@ -1037,13 +1201,20 @@ impl MailApp {
         }));
         subscriptions.push(cx.on_app_quit(|this, cx| {
             this.persist_draft(cx);
+            // Preferences changed just before quitting are still written.
+            this.backend.store.flush();
             std::future::ready(())
         }));
         #[cfg(feature = "sample-data")]
         let demo = demo_mail();
         #[cfg(not(feature = "sample-data"))]
         let demo = Vec::new();
-        let messages = if let Some(id) = &account {
+        // A saved place is opened once the app is up; the first mailbox's
+        // mail isn't read for it meanwhile.
+        let restoring = backend.store.preference("last_place").is_some();
+        let messages = if restoring {
+            vec![]
+        } else if let Some(id) = &account {
             backend
                 .store
                 .summaries(id, Folder::Inbox)
@@ -1055,6 +1226,13 @@ impl MailApp {
         let folders = accounts
             .iter()
             .map(|a| (a.id.clone(), backend.store.folders(&a.id)))
+            .collect();
+        let folder_order = accounts
+            .iter()
+            .filter_map(|a| {
+                let order = backend.store.preference(&format!("folder_order:{}", a.id))?;
+                Some((a.id.clone(), serde_json::from_str(&order).ok()?))
+            })
             .collect();
         let collapsed = backend
             .store
@@ -1119,12 +1297,68 @@ impl MailApp {
                 }
             }
         }));
+        let login_input = input("Same as the email address", false, false, window, cx);
+        subscriptions.push(cx.subscribe(&login_input, |this, input, e, cx| {
+            // Applied once typed (a pause, Enter or leaving the field), not
+            // on every key: each change signs the account out, and its
+            // connections would sign in again with half a name, failing
+            // until the server throttles or locks the account.
+            match e {
+                InputEvent::Change => {
+                    let Some(id) = this.nickname_for.clone() else {
+                        return;
+                    };
+                    let value = input.read(cx).value().trim().to_owned();
+                    let saved = this.accounts.iter().find(|a| a.id == id);
+                    if saved.is_none_or(|a| a.username == value) {
+                        this.login_pending = None;
+                        return;
+                    }
+                    this.login_pending = Some((id, value));
+                    this.login_revision += 1;
+                    let revision = this.login_revision;
+                    cx.spawn(async move |this, cx| {
+                        // The executor's timer, which tests can move on.
+                        cx.background_executor().timer(LOGIN_PAUSE).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.login_revision == revision {
+                                this.apply_login(cx);
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.apply_login(cx),
+                _ => {}
+            }
+        }));
+        let reply_to_input = input("Replies come to the sending address", false, false, window, cx);
+        subscriptions.push(cx.subscribe(&reply_to_input, |this, input, e, cx| {
+            if matches!(e, InputEvent::Change)
+                && let Some(id) = this.nickname_for.clone()
+            {
+                let value = input.read(cx).value().trim().to_owned();
+                if this.accounts.iter().any(|a| a.id == id && a.reply_to != value) {
+                    this.edit_account(&id, |a| a.reply_to = value, cx);
+                }
+            }
+        }));
         let html_view = cx.new(HtmlView::new);
         subscriptions.push(
             cx.subscribe(&html_view, |this, _, menu: &HtmlContextMenu, cx| {
                 this.html_menu(menu, cx)
             }),
         );
+        let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<String>();
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            while let Some(id) = pushes.next().await {
+                if this.update(cx, |this, cx| this.on_push(id, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let mut this = Self {
             backend,
             accounts,
@@ -1136,6 +1370,7 @@ impl MailApp {
             folder: Folder::Inbox,
             remote: String::new(),
             folders,
+            folder_order,
             unread: HashMap::new(),
             collapsed,
             tree,
@@ -1160,6 +1395,7 @@ impl MailApp {
             menu: None,
             filter_anchor: Rc::new(Cell::new(Bounds::default())),
             selecting: false,
+            select_mode: false,
             selection: HashSet::new(),
             select_anchor: None,
             select_anim: 0,
@@ -1190,6 +1426,7 @@ impl MailApp {
             known: HashMap::new(),
             busy: 0,
             syncing: false,
+            cache_loading: false,
             status: String::new(),
             error: false,
             form,
@@ -1197,6 +1434,8 @@ impl MailApp {
             provider: Provider::Gmail,
             oauth: false,
             connecting: false,
+            sign_in_retry: false,
+            sign_in_step: SignInStep::Browser,
             cancel: Arc::new(AtomicBool::new(false)),
             onboarding,
             step: Step::Welcome,
@@ -1214,6 +1453,11 @@ impl MailApp {
             signature_input,
             signature_revision: 0,
             nickname_input,
+            login_input,
+            reply_to_input,
+            login_pending: None,
+            login_revision: 0,
+            quotas: HashMap::new(),
             nickname_for: None,
             presets_for: None,
             settings_place: SettingsPlace::Dialog,
@@ -1254,12 +1498,25 @@ impl MailApp {
             subs_loading: false,
             subs_generation: 0,
             subs_scroll: UniformListScrollHandle::new(),
+            subs_tab: subscriptions::SubsTab::Subscribed,
+            subs_sender: None,
+            subs_sender_loading: false,
+            subs_busy: HashSet::new(),
+            deleting_folders: HashSet::new(),
+            draft_syncs: HashSet::new(),
+            pushed,
+            draft_synced: HashMap::new(),
+            label_input,
+            folder_edit: None,
+            folder_saving: None,
+            subs_return: Cell::new(None),
             unsubscribing: HashSet::new(),
             unsubscribed: Default::default(),
             details: None,
             original_scroll: UniformListScrollHandle::new(),
             list_scroll: UniformListScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
+            reader_to_end: Default::default(),
             reading_defaults,
             html_view,
             settings_scroll: ScrollHandle::new(),
@@ -1274,6 +1531,8 @@ impl MailApp {
             unlock_errors: HashMap::new(),
             forwarding,
             all_mail,
+            alias_routes,
+            clean_links,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -1311,10 +1570,18 @@ impl MailApp {
         this.apply_theme(window, cx);
         #[cfg(all(debug_assertions, target_os = "macos"))]
         devdriver::start(window, cx);
+        this.watch_inboxes();
         if this.account.is_some() {
-            cx.defer_in(window, |this, _, cx| {
+            cx.defer_in(window, |this, w, cx| {
                 this.refresh_counts(cx);
-                this.refresh(cx);
+                // Back where the person was, else the first mailbox.
+                if this.restore_place(w, cx) {
+                } else if this.messages.is_empty() {
+                    let first = this.account.clone();
+                    this.open_mailbox(first, Folder::Inbox.into(), w, cx);
+                } else {
+                    this.refresh(cx);
+                }
             });
         }
         for a in this.accounts.clone() {
@@ -1324,6 +1591,7 @@ impl MailApp {
             loop {
                 Timer::after(Duration::from_secs(20)).await;
                 let checked = this.update(cx, |this, cx| {
+                    this.watch_inboxes();
                     this.check_due(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
                 });
@@ -1408,6 +1676,7 @@ impl MailApp {
     }
     fn apply_filter(&mut self, cx: &App) {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
+        let search = crate::manage::search::Search::parse(&query);
         let filter = self.filter_by;
         let open = self.selected.clone();
         self.visible = self
@@ -1424,10 +1693,11 @@ impl MailApp {
                 Filter::Starred => m.starred,
                 Filter::Attachments => m.has_attachments(),
             })
-            .filter(|(_, m)| m.matches(&query))
+            .filter(|(_, m)| search.matches(m))
             // Views leave out mail of aliases shown on their own, or list
             // only an alias's mail.
-            .filter(|(_, m)| m.pending || self.scope.admits(m))
+            // A subscription's mail is listed whole, as its counts are.
+            .filter(|(_, m)| m.pending || self.subs_open || self.scope.admits(m))
             .map(|(i, _)| i)
             .collect();
         if self.oldest_first {
@@ -1532,6 +1802,45 @@ impl MailApp {
             self.check_inbox(a, cx);
         }
     }
+    /// Keeps an IDLE watch on each IMAP account's inbox, so new mail shows
+    /// at once rather than at the next check; ends watches of accounts that
+    /// are gone or can't sign in. Polling carries on regardless.
+    fn watch_inboxes(&mut self) {
+        let watching = self.backend.watching();
+        for id in &watching {
+            let keep = self.accounts.iter().any(|a| &a.id == id) && !self.account_blocked(id);
+            if !keep {
+                self.backend.stop_watching(id);
+            }
+        }
+        for a in &self.accounts {
+            if a.provider == Provider::Pop3
+                || a.incoming_host.is_empty()
+                || watching.contains(&a.id)
+                || self.account_blocked(&a.id)
+            {
+                continue;
+            }
+            let (pushed, id) = (self.pushed.clone(), a.id.clone());
+            self.backend
+                .watch_inbox(a, move || drop(pushed.unbounded_send(id.clone())));
+        }
+    }
+    /// The server reported a change in an account's inbox (IDLE): check it
+    /// now, as the regular check would.
+    fn on_push(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        if self.account_blocked(&id) {
+            return;
+        }
+        if self.account.as_ref() == Some(&id) && self.folder == Folder::Inbox {
+            self.refresh(cx);
+        } else {
+            self.check_inbox(a, cx);
+        }
+    }
     fn check_inbox(&mut self, a: Account, cx: &mut Context<Self>) {
         self.sync_mailbox(a, Folder::Inbox.into(), 100, cx);
     }
@@ -1611,12 +1920,38 @@ impl MailApp {
         .detach();
         cx.notify();
     }
+    /// Saves a preference without waiting for the cache. If it can't be
+    /// saved, says why and calls `undo` to put back what it changed.
+    pub(super) fn save_preference(
+        &mut self,
+        key: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+        undo: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        let store = self.backend.store.clone();
+        let ticket = store.set_preference_soon(key, value);
+        let key = key.to_owned();
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn(async move { store.preference_saved(&key, ticket) })
+                .await;
+            if let Err(e) = saved {
+                let _ = this.update(cx, |this, cx| {
+                    this.notice(e.to_string(), true, cx);
+                    undo(this, cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
     fn save_collapsed(&self) {
         if let Ok(json) = serde_json::to_string(&self.collapsed) {
-            let _ = self
+            self
                 .backend
-                .store
-                .set_preference("collapsed_accounts", &json);
+                .store.set_preference_soon("collapsed_accounts", &json);
         }
     }
     fn open_menu(&mut self, position: Point<Pixels>, entries: Vec<Entry>, cx: &mut Context<Self>) {
@@ -1704,10 +2039,342 @@ impl MailApp {
             entries.push(entry(
                 "Mark All as Read",
                 "mail-open",
-                Action::MarkAllRead(id.into(), mailbox),
+                Action::MarkAllRead(id.into(), mailbox.clone()),
+            ));
+        }
+        if let Mailbox::Standard(folder @ (Folder::Trash | Folder::Junk)) = mailbox
+            && self.accounts.iter().any(|a| a.id == id)
+        {
+            entries.push(Entry::Separator);
+            entries.push(danger(
+                if folder == Folder::Trash {
+                    "Empty Trash…"
+                } else {
+                    "Empty Spam…"
+                },
+                "trash",
+                Action::EmptyMailbox(id.into(), folder),
+            ));
+        }
+        // The same entries, in the same order, as top folders have.
+        if mailbox == Mailbox::Standard(Folder::Inbox) && self.manages_folders(id) {
+            entries.push(Entry::Separator);
+            entries.push(entry(
+                "New Folder",
+                "folder-closed",
+                Action::NewRemoteFolder(id.into(), None),
+            ));
+        }
+        if let Mailbox::Remote(name) = mailbox
+            && self.folder_deletable(id, &name)
+        {
+            entries.push(Entry::Separator);
+            entries.push(entry(
+                "Rename…",
+                "compose",
+                Action::RenameRemoteFolder(id.into(), name.clone()),
+            ));
+            if self.folder_nestable(id, &name) {
+                entries.push(Entry::Separator);
+                entries.push(entry(
+                    "New Folder Inside",
+                    "folder-closed",
+                    Action::NewRemoteFolder(id.into(), Some(name.clone())),
+                ));
+            }
+            entries.push(Entry::Separator);
+            entries.push(danger(
+                "Delete Folder…",
+                "trash",
+                Action::DeleteRemoteFolder(id.into(), name),
             ));
         }
         entries
+    }
+    /// Whether the account keeps folders on a server that can make,
+    /// rename and delete them.
+    fn manages_folders(&self, id: &str) -> bool {
+        self.accounts
+            .iter()
+            .any(|a| a.id == id && Backend::can_manage_folders(a))
+    }
+    /// Whether the server allows folders inside one of the account's own.
+    fn folder_nestable(&self, id: &str, name: &str) -> bool {
+        self.folder_deletable(id, name)
+            && self
+                .folders
+                .get(id)
+                .is_some_and(|fs| fs.iter().any(|f| f.name == name && f.nestable))
+    }
+    /// Whether a server folder can be offered for renaming or deleting:
+    /// one of the account's own, on a server that keeps folders. The
+    /// server has the last word (subfolders, access rights).
+    fn folder_deletable(&self, id: &str, name: &str) -> bool {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id) else {
+            return false;
+        };
+        Backend::can_manage_folders(a)
+            && !(a.provider == Provider::Gmail && name.starts_with("[Gmail]"))
+            && self
+                .folders
+                .get(id)
+                .is_some_and(|fs| fs.iter().any(|f| f.name == name))
+    }
+    /// A folder's name as the sidebar shows it.
+    fn folder_label(&self, id: &str, name: &str) -> String {
+        self.folders
+            .get(id)
+            .and_then(|fs| fs.iter().find(|f| f.name == name))
+            .map_or_else(|| name.to_owned(), |f| f.label.clone())
+    }
+    /// The Delete Folder dialog: what deleting does on this account's server.
+    fn delete_folder_modal(&self, id: &str, name: &str) -> AnyElement {
+        let c = self.colors();
+        let label = self.folder_label(id, name);
+        let (email, gmail) = self
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| (a.email.clone(), a.provider == Provider::Gmail))
+            .unwrap_or_default();
+        div()
+            .id("delete-folder")
+            .debug_selector(|| "delete-folder".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(format!("Delete “{label}”?")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if gmail {
+                        format!("The label is removed from {email}. Its messages stay in All Mail.")
+                    } else {
+                        format!(
+                            "The folder and the messages in it are deleted from {email}'s server. This can't be undone."
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+    /// Deletes a folder on the account's server, as confirmed in the dialog,
+    /// and forgets its cached mail. Its view closes if it was open.
+    fn delete_remote_folder(&mut self, id: String, name: String, cx: &mut Context<Self>) {
+        if !self.folder_deletable(&id, &name) || !self.deleting_folders.insert((id.clone(), name.clone())) {
+            return;
+        }
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            self.deleting_folders.remove(&(id, name));
+            return;
+        };
+        let label = self.folder_label(&id, &name);
+        let deleting = name.clone();
+        self.task(
+            cx,
+            move |b| b.delete_remote_folder(&a, &deleting),
+            move |this, result, cx| {
+                this.deleting_folders.remove(&(id.clone(), name.clone()));
+                // The dialog stays up, showing progress, until it is done.
+                if this.modal == Some(Modal::DeleteFolder(id.clone(), name.clone())) {
+                    this.modal = None;
+                }
+                match result {
+                    Ok(folders) => {
+                        this.folders.insert(id.clone(), folders);
+                        this.notice(format!("Deleted “{label}”"), false, cx);
+                        // Its view is gone; show the account's inbox.
+                        if this.account.as_ref() == Some(&id)
+                            && this.mailbox() == Mailbox::Remote(name.clone())
+                        {
+                            this.show_mailbox_instead(Folder::Inbox.into(), cx);
+                        }
+                        this.refresh_counts(cx);
+                    }
+                    Err(e) => this.notice(format!("Couldn't delete “{label}”: {e:#}"), true, cx),
+                }
+                cx.notify();
+            },
+        );
+        cx.notify();
+    }
+    /// Shows another of the open account's mailboxes in place of one that
+    /// was deleted or renamed on the server.
+    fn show_mailbox_instead(&mut self, mailbox: Mailbox, cx: &mut Context<Self>) {
+        self.load_generation += 1;
+        self.subs_open = false;
+        self.folder = mailbox.folder();
+        self.remote = match mailbox {
+            Mailbox::Remote(name) => name,
+            Mailbox::Standard(_) => String::new(),
+        };
+        self.update_scope();
+        self.selected = None;
+        self.messages.clear();
+        self.layout = None;
+        self.filter(cx);
+        self.reload_cached(cx);
+        self.refresh(cx);
+        self.save_place();
+    }
+    /// The sidebar row key of a server folder being named.
+    fn folder_edit_key(account: &str, edit: &FolderEdit) -> String {
+        match edit {
+            FolderEdit::New(parent) => {
+                format!("new-folder\u{1f}{account}\u{1f}{}", parent.as_deref().unwrap_or(""))
+            }
+            FolderEdit::Rename(name) => format!("rename-folder\u{1f}{account}\u{1f}{name}"),
+        }
+    }
+    /// Whether this row of the sidebar is being named now.
+    fn editing_folder(&self, account: &str, edit: &FolderEdit) -> bool {
+        self.tree_ui.renaming.as_deref() == Some(Self::folder_edit_key(account, edit).as_str())
+    }
+    /// A name for a new folder that its neighbours don't have yet: "New
+    /// Folder", else "New Folder 2"…
+    fn new_folder_name(&self, account: &str, parent: Option<&str>) -> String {
+        let depth = parent.map_or(0, |p| {
+            self.folders
+                .get(account)
+                .and_then(|fs| fs.iter().find(|f| f.name == p))
+                .map_or(0, |f| f.depth + 1)
+        });
+        let taken = |label: &str| {
+            self.folders.get(account).is_some_and(|fs| {
+                fs.iter()
+                    .any(|f| f.depth == depth && f.label.eq_ignore_ascii_case(label))
+            })
+        };
+        (1..)
+            .map(|n| if n == 1 { "New Folder".to_owned() } else { format!("New Folder {n}") })
+            .find(|name| !taken(name))
+            .unwrap_or_default()
+    }
+    /// Names a new server folder, or renames one, in place in the sidebar,
+    /// just as top folders are: a new one starts as "New Folder" with its
+    /// name selected; Enter or clicking away saves, Escape keeps the name.
+    fn edit_remote_folder(
+        &mut self,
+        id: String,
+        edit: FolderEdit,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let allowed = match &edit {
+            FolderEdit::New(None) => self.manages_folders(&id),
+            FolderEdit::New(Some(parent)) => self.folder_nestable(&id, parent),
+            FolderEdit::Rename(name) => self.folder_deletable(&id, name),
+        };
+        if !allowed || self.folder_saving.is_some() {
+            return;
+        }
+        // Finish any other name being edited first.
+        if self.tree_ui.renaming.is_some() {
+            self.commit_rename(w, cx);
+        }
+        // The row is in the full sidebar, inside the account's open folders.
+        if self.sidebar_collapsed {
+            self.set_sidebar_collapsed(false, cx);
+        }
+        for key in [id.clone(), format!("folders:{id}")] {
+            if self.collapsed.remove(&key) {
+                self.save_collapsed();
+            }
+        }
+        let value = match &edit {
+            FolderEdit::Rename(name) => self.folder_label(&id, name),
+            FolderEdit::New(parent) => self.new_folder_name(&id, parent.as_deref()),
+        };
+        self.tree_ui.renaming = Some(Self::folder_edit_key(&id, &edit));
+        self.folder_edit = Some((id, edit));
+        self.rename_input.update(cx, |s, cx| {
+            s.set_placeholder("Folder name", w, cx);
+            s.set_value(value, w, cx);
+            s.focus(w, cx);
+        });
+        // Select the whole name once the field has focus, so typing replaces it.
+        w.on_next_frame(|w, cx| w.dispatch_action(Box::new(gpui_component::input::SelectAll), cx));
+        cx.notify();
+    }
+    /// Ends naming a server folder: saves the name typed, or (`cancel`, as
+    /// Escape does for top folders) keeps the old name; a new folder is
+    /// still made, with its starting name.
+    pub(super) fn finish_remote_folder(&mut self, cancel: bool, cx: &mut Context<Self>) -> bool {
+        let Some((id, edit)) = self.folder_edit.take() else {
+            return false;
+        };
+        let typed = Self::value(&self.rename_input, cx).trim().to_owned();
+        let leaf = match &edit {
+            FolderEdit::New(parent) if cancel || typed.is_empty() => {
+                self.new_folder_name(&id, parent.as_deref())
+            }
+            FolderEdit::Rename(_) if cancel || typed.is_empty() => return true,
+            FolderEdit::Rename(name) if typed == self.folder_label(&id, name) => return true,
+            _ => typed,
+        };
+        self.save_remote_folder(id, edit, leaf, cx);
+        true
+    }
+    /// Makes or renames a server folder. Until the server answers, the
+    /// sidebar shows it by its new name; a refusal is said in a notice.
+    fn save_remote_folder(&mut self, id: String, edit: FolderEdit, leaf: String, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        self.folder_saving = Some((id.clone(), edit.clone(), leaf.clone()));
+        let job = edit.clone();
+        self.task(
+            cx,
+            move |b| match &job {
+                FolderEdit::New(parent) => b.create_remote_folder(&a, parent.as_deref(), &leaf),
+                FolderEdit::Rename(name) => b.rename_remote_folder(&a, name, &leaf),
+            },
+            move |this, result, cx| {
+                if this
+                    .folder_saving
+                    .as_ref()
+                    .is_some_and(|(a, e, _)| *a == id && *e == edit)
+                {
+                    this.folder_saving = None;
+                }
+                match result {
+                    Ok(change) => {
+                        // The folder stays where it was shown while it was
+                        // named, rather than moving to where its name sorts.
+                        this.place_folders(&id, &edit, &change);
+                        this.folders.insert(id.clone(), change.folders.clone());
+                        if let FolderEdit::Rename(_) = &edit {
+                            // An open folder that moved is shown by its new name.
+                            let showing = this.mailbox();
+                            let moved = change
+                                .moved
+                                .iter()
+                                .find(|(old, _)| showing == Mailbox::Remote(old.clone()));
+                            if this.account.as_ref() == Some(&id)
+                                && let Some((_, new)) = moved
+                            {
+                                this.show_mailbox_instead(Mailbox::Remote(new.clone()), cx);
+                            }
+                        }
+                        this.refresh_counts(cx);
+                    }
+                    Err(e) => {
+                        let what = match &edit {
+                            FolderEdit::New(_) => "create the folder",
+                            FolderEdit::Rename(_) => "rename the folder",
+                        };
+                        this.notice(format!("Couldn't {what}: {e:#}"), true, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        cx.notify();
     }
     fn mail_entries(&self, id: &str) -> Vec<Entry> {
         if self.folder == Folder::Drafts {
@@ -1717,7 +2384,8 @@ impl MailApp {
             ];
         }
         if self.selection.len() > 1 && self.selection.contains(id) {
-            let n = self.selection.len();
+            let n = fmt_count(self.selection.len());
+            let all_starred = self.selection_all(|m| m.starred);
             return vec![
                 entry(
                     format!("Mark {n} as Read"),
@@ -1729,12 +2397,25 @@ impl MailApp {
                     "mail",
                     Action::ApplySelection(Change::Read(false)),
                 ),
-                entry(
-                    format!("Star {n}"),
-                    "star",
-                    Action::ApplySelection(Change::Star(true)),
-                ),
+                if all_starred {
+                    entry(
+                        format!("Unstar {n}"),
+                        "star",
+                        Action::ApplySelection(Change::Star(false)),
+                    )
+                } else {
+                    entry(
+                        format!("Star {n}"),
+                        "star",
+                        Action::ApplySelection(Change::Star(true)),
+                    )
+                },
                 Entry::Separator,
+                entry(
+                    format!("Move {n} to Inbox"),
+                    "inbox",
+                    Action::ApplySelection(Change::Move(Folder::Inbox)),
+                ),
                 entry(
                     format!("Archive {n}"),
                     "archive",
@@ -1750,7 +2431,26 @@ impl MailApp {
                     "trash",
                     Action::ApplySelection(Change::Move(Folder::Trash)),
                 ),
-            ];
+            ]
+            .into_iter()
+            .chain(self.move_folder_entry(format!("Move {n} to Folder…"), MoveTarget::Selection))
+            .chain(self.label_entry(format!("Label {n}…"), MoveTarget::Selection))
+            .chain(
+                self.selection_all(|m| matches!(m.folder, Folder::Trash | Folder::Junk))
+                    .then(|| {
+                        danger(
+                            format!("Delete {n} Permanently…"),
+                            "trash",
+                            Action::DeleteForever(self.selection.iter().cloned().collect()),
+                        )
+                    }),
+            )
+            .chain([
+                Entry::Separator,
+                entry("Select All", "select", Action::SelectAll),
+                entry("Clear Selection", "close", Action::StopSelecting),
+            ])
+            .collect();
         }
         let Some(m) = self.messages.iter().find(|m| m.id == id) else {
             return vec![];
@@ -1812,7 +2512,16 @@ impl MailApp {
             entries.push(danger(
                 "Move to Trash",
                 "trash",
-                Action::Apply(ids, Change::Move(Folder::Trash)),
+                Action::Apply(ids.clone(), Change::Move(Folder::Trash)),
+            ));
+        }
+        entries.extend(self.move_folder_entry("Move to Folder…", MoveTarget::Mail(ids.clone())));
+        entries.extend(self.label_entry("Labels…", MoveTarget::Mail(ids.clone())));
+        if matches!(m.folder, Folder::Trash | Folder::Junk) {
+            entries.push(danger(
+                "Delete Permanently…",
+                "trash",
+                Action::DeleteForever(ids),
             ));
         }
         entries.push(Entry::Separator);
@@ -1821,6 +2530,36 @@ impl MailApp {
             "select",
             Action::StartSelecting(m.id.clone()),
         ));
+        if !m.from.is_empty() {
+            entries.push(entry(
+                "Select All From Sender",
+                "select",
+                Action::SelectFromSender(m.id.clone()),
+            ));
+            entries.push(Entry::Separator);
+            entries.push(entry(
+                "Show Mail From Sender",
+                "search",
+                Action::SearchFor(search_term("from", &m.from)),
+            ));
+        }
+        // Lists and alias services send from one address and take replies
+        // at another: find everything that replies there.
+        let reply_to = crate::sync::smtp::recipients(&m.reply_to)
+            .ok()
+            .and_then(|list| list.into_iter().next())
+            .map(|(_, email)| email)
+            .filter(|email| !email.eq_ignore_ascii_case(&m.from));
+        if let Some(email) = reply_to {
+            if m.from.is_empty() {
+                entries.push(Entry::Separator);
+            }
+            entries.push(entry(
+                "Show Mail With This Reply-To",
+                "search",
+                Action::SearchFor(search_term("reply-to", &email)),
+            ));
+        }
         entries
     }
     fn filter_entries(&self) -> Vec<Entry> {
@@ -1944,6 +2683,7 @@ impl MailApp {
         };
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
+            self.sync_drafts_soon(&a.id, cx);
             return;
         }
         if self.account_blocked(&a.id) {
@@ -1991,10 +2731,21 @@ impl MailApp {
                     }
                     if inbox {
                         this.note_inbox(&id, &messages);
+                        // Drafts written on other devices appear, and ones
+                        // written here reach them, with the inbox's checks.
+                        let due = this
+                            .draft_synced
+                            .get(&id)
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(120));
+                        if due {
+                            this.sync_drafts_soon(&id, cx);
+                        }
                     }
                     if visible {
                         this.reload_cached(cx);
-                        if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
+                        if !this.subs_open
+                            && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
+                        {
                             this.catalog_mailbox(a, catalog, cx);
                         }
                     }
@@ -2016,6 +2767,8 @@ impl MailApp {
         self.html_view.update(cx, |view, cx| view.clear(cx));
         Self::set(&self.unlock_input, "", w, cx);
         self.subs_open = false;
+        self.subs_sender = None;
+        self.subs_return.set(None);
         self.account = account;
         self.folder = mailbox.folder();
         self.remote = match &mailbox {
@@ -2025,10 +2778,12 @@ impl MailApp {
         self.update_scope();
         self.selected = None;
         self.selecting = false;
+        self.select_mode = false;
         self.selection.clear();
         self.load_generation += 1;
         self.read_generation += 1;
         self.syncing = false;
+        self.cache_loading = false;
         self.messages.clear();
         self.layout = None;
         self.wanted_rows.clear();
@@ -2039,6 +2794,9 @@ impl MailApp {
         self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
+            for id in self.scope.accounts.clone() {
+                self.sync_drafts_soon(&id, cx);
+            }
         } else if self.account.is_none() {
             let folder = self.folder;
             self.messages = self
@@ -2056,10 +2814,12 @@ impl MailApp {
             self.filter(cx);
         } else {
             let gen_ = self.load_generation;
+            self.cache_loading = true;
             self.task(cx, self.list_job(mailbox), move |this, result, cx| {
                 if gen_ != this.load_generation {
                     return;
                 }
+                this.cache_loading = false;
                 if let Ok((ms, layout)) = result {
                     this.layout = layout;
                     this.set_messages(ms, cx);
@@ -2067,12 +2827,18 @@ impl MailApp {
                 this.refresh(cx);
             });
         }
+        self.save_place();
         self.anim += 1;
         cx.notify();
     }
     /// Reload confirmed cache state after a failed or partly applied operation.
     /// A generation check prevents an old request from replacing a newer view.
     fn reload_cached(&mut self, cx: &mut Context<Self>) {
+        if self.subs_open {
+            // Subscriptions list their own mail, not the mailbox under them.
+            self.reload_subscriptions(cx);
+            return;
+        }
         if self.account.is_none() {
             return;
         }
@@ -2148,6 +2914,8 @@ impl MailApp {
                                 one_click: false,
                                 pending: false,
                                 reply_to: String::new(),
+                                labels: vec![],
+                                inline: Default::default(),
                             })
                             .collect();
                         this.filter(cx);
@@ -2167,6 +2935,11 @@ impl MailApp {
             return;
         }
         self.html_view.update(cx, |view, cx| view.clear(cx));
+        // A subscription's mail list gives way to the message; keep its place.
+        if self.subs_open && self.selected.is_none() {
+            self.subs_return
+                .set(Some(self.list_scroll.0.borrow().base_handle.offset()));
+        }
         self.selected = Some(id.clone());
         self.details_open = false;
         self.quotes_open = false;
@@ -2214,27 +2987,32 @@ impl MailApp {
             let account_id = a.id.clone();
             let id2 = id.clone();
             self.reading = Some(id.clone());
+            let mark = a.clone();
+            // Showing the message doesn't wait for the server to mark it
+            // read: that needs the account's connection, which a sync or a
+            // download may be using.
             self.task(
                 cx,
-                move |b| {
-                    let mut m = b.read(&a, &m)?;
-                    if m.unread {
-                        m = b.change(&a, &m, Change::Read(true))?;
-                    }
-                    Ok(m)
-                },
+                move |b| b.read(&a, &m),
                 move |this, result, cx| {
                     if this.reading.as_ref() == Some(&id2) {
                         this.reading = None;
                     }
                     this.account_result(&account_id, IssueSource::Read, &result);
                     match result {
-                        Ok(mail) => {
+                        Ok(mut mail) => {
+                            let unread = mail.unread;
+                            // Shown read already; the server catches up below.
+                            mail.unread = false;
                             if let Some(old) = this.messages.iter_mut().find(|m| m.id == id2) {
-                                *old = mail;
+                                *old = mail.clone();
                             }
                             this.filter(cx);
-                            this.refresh_counts(cx);
+                            if unread {
+                                this.mark_read(mark, mail, cx);
+                            } else {
+                                this.refresh_counts(cx);
+                            }
                         }
                         Err(e) => {
                             if e.downcast_ref::<crate::manage::crypto::Locked>().is_some() {
@@ -2252,6 +3030,30 @@ impl MailApp {
             );
         }
         cx.notify();
+    }
+    /// Marks an opened message read at the server and in the cache. It is
+    /// shown read already; a refusal shows the cache as it is.
+    fn mark_read(&mut self, a: Account, mail: Mail, cx: &mut Context<Self>) {
+        let account_id = a.id.clone();
+        let id = mail.id.clone();
+        self.task(
+            cx,
+            move |b| b.change(&a, &Mail { unread: true, ..mail }, Change::Read(true)),
+            move |this, result, cx| {
+                this.account_result(&account_id, IssueSource::Read, &result);
+                match result {
+                    Ok(changed) => {
+                        if let Some(m) = this.messages.iter_mut().find(|m| m.id == id) {
+                            m.unread = changed.unread;
+                            m.starred = changed.starred;
+                        }
+                        this.filter(cx);
+                        this.refresh_counts(cx);
+                    }
+                    Err(_) => this.reload_cached(cx),
+                }
+            },
+        );
     }
     /// Applies a change to messages immediately and reverts it if the server
     /// rejects it.
@@ -2272,14 +3074,15 @@ impl MailApp {
             .chain(self.demo.iter_mut())
             .filter(|m| ids.contains(&m.id))
         {
-            match change {
-                Change::Read(read) => m.unread = !read,
-                Change::Star(star) => m.starred = star,
-                Change::Move(folder) => m.folder = folder,
-            }
+            change.apply(m);
         }
-        let leaves = matches!(change, Change::Move(_))
-            || (self.folder == Folder::Starred && change == Change::Star(false));
+        // A subscription lists its mail in every folder but Spam and Trash.
+        let leaves = match change {
+            Change::Move(folder) if self.subs_open => matches!(folder, Folder::Junk | Folder::Trash),
+            Change::MoveTo(_) if self.subs_open => false,
+            Change::Move(_) | Change::MoveTo(_) => true,
+            _ => self.folder == Folder::Starred && change == Change::Star(false),
+        };
         if leaves {
             self.messages.retain(|m| !ids.contains(&m.id));
             if self.selected.as_ref().is_some_and(|s| ids.contains(s)) {
@@ -2289,6 +3092,7 @@ impl MailApp {
         self.filter(cx);
         if self.selection.is_empty() {
             self.selecting = false;
+            self.select_mode = false;
         }
         cx.notify();
         // A view can list several mailboxes; each one's server gets its own.
@@ -2307,20 +3111,22 @@ impl MailApp {
             let count = before.len();
             let sent = before.clone();
             let account_id = a.id.clone();
+            let change = change.clone();
+            let sending = change.clone();
             self.task(
                 cx,
-                move |b| b.change_many(&a, &sent, change),
+                move |b| b.change_many(&a, &sent, sending),
                 move |this, result, cx| {
                     this.refresh_counts(cx);
                     this.account_result(&account_id, IssueSource::Change, &result);
                     match result {
                         Ok(()) => {
-                            if let Change::Move(folder) = change {
+                            if let Some(to) = this.destination_label(&account_id, &change) {
                                 this.notice(
                                     if count == 1 {
-                                        format!("Moved to {}", folder.label())
+                                        format!("Moved to {to}")
                                     } else {
-                                        format!("Moved {count} messages to {}", folder.label())
+                                        format!("Moved {count} messages to {to}")
                                     },
                                     false,
                                     cx,
@@ -2344,6 +3150,339 @@ impl MailApp {
                 },
             );
         }
+    }
+    /// Where a move puts an account's mail, as the sidebar names it.
+    pub(super) fn destination_label(&self, account: &str, change: &Change) -> Option<String> {
+        match change {
+            Change::Move(folder) => Some(folder.label().into()),
+            Change::MoveTo(name) => Some(self.folder_label(account, name)),
+            _ => None,
+        }
+    }
+    /// The account whose server folders `target` can move into: the one
+    /// all of its mail is in, when that account keeps folders on its
+    /// server and has some of its own. Also the server folder all of it is
+    /// in already, if any, which isn't offered.
+    fn move_account(&self, target: &MoveTarget) -> Option<(String, Option<String>)> {
+        let (account, mails): (String, Vec<&Mail>) = match target {
+            MoveTarget::Subscription(sub) => (sub.account.clone(), vec![]),
+            MoveTarget::Mail(ids) => {
+                let mails: Vec<&Mail> =
+                    self.messages.iter().filter(|m| ids.contains(&m.id)).collect();
+                (mails.first()?.account.clone(), mails)
+            }
+            MoveTarget::Selection => {
+                let mails: Vec<&Mail> = self
+                    .messages
+                    .iter()
+                    .filter(|m| self.selection.contains(&m.id))
+                    .collect();
+                (mails.first()?.account.clone(), mails)
+            }
+        };
+        if mails.iter().any(|m| m.account != account)
+            || !self.manages_folders(&account)
+            || self.folders.get(&account).is_none_or(|fs| fs.is_empty())
+        {
+            return None;
+        }
+        let first = mails.first();
+        let within = first
+            .filter(|f| {
+                f.folder == Folder::Other
+                    && mails
+                        .iter()
+                        .all(|m| m.folder == Folder::Other && m.remote_folder == f.remote_folder)
+            })
+            .map(|f| f.remote_folder.clone());
+        Some((account, within))
+    }
+    /// The "Move to Folder…" entry for a menu, when there are folders to offer.
+    fn move_folder_entry(&self, label: impl Into<SharedString>, target: MoveTarget) -> Option<Entry> {
+        let (account, within) = self.move_account(&target)?;
+        let others = self.folders.get(&account)?.iter().any(|f| Some(&f.name) != within.as_ref());
+        others.then(|| entry(label, "folder", Action::MoveMenu(target)))
+    }
+    /// The messages a menu's target names (none for a subscription).
+    fn target_ids(&self, target: &MoveTarget) -> Vec<String> {
+        match target {
+            MoveTarget::Mail(ids) => ids.clone(),
+            MoveTarget::Selection => self.selection.iter().cloned().collect(),
+            MoveTarget::Subscription(_) => vec![],
+        }
+    }
+    /// The IMAP account whose labels `target`'s messages can have: the one
+    /// they are all from.
+    fn label_account(&self, target: &MoveTarget) -> Option<&Account> {
+        let ids = self.target_ids(target);
+        let mut mails = self.messages.iter().filter(|m| ids.contains(&m.id));
+        let first = mails.next()?;
+        if mails.any(|m| m.account != first.account) {
+            return None;
+        }
+        self.accounts
+            .iter()
+            .find(|a| a.id == first.account && a.provider != Provider::Pop3)
+    }
+    /// The "Labels…" entry for a message menu.
+    fn label_entry(&self, label: impl Into<SharedString>, target: MoveTarget) -> Option<Entry> {
+        self.label_account(&target)?;
+        Some(entry(label, "tag", Action::LabelMenu(target)))
+    }
+    /// The label picker: labels in use on the account (and Gmail's own
+    /// labels, its folders), checked where every message has one; choosing
+    /// one adds or removes it.
+    fn label_entries(&self, target: &MoveTarget) -> Vec<Entry> {
+        let Some(a) = self.label_account(target) else {
+            return vec![];
+        };
+        let ids = self.target_ids(target);
+        let mails: Vec<&Mail> = self.messages.iter().filter(|m| ids.contains(&m.id)).collect();
+        let gmail = a.provider == Provider::Gmail;
+        let mut known = self.backend.store.labels(&a.id).unwrap_or_default();
+        if gmail {
+            known.extend(
+                self.folders
+                    .get(&a.id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|f| !f.name.starts_with("[Gmail]"))
+                    .map(|f| f.name.clone()),
+            );
+        }
+        known.extend(mails.iter().flat_map(|m| m.labels.iter().cloned()));
+        known.sort_by_key(|l| l.to_lowercase());
+        known.dedup();
+        let mut entries: Vec<Entry> = known
+            .into_iter()
+            .map(|label| {
+                let all = mails.iter().all(|m| m.labels.contains(&label));
+                let shown = if gmail {
+                    crate::sync::transport::decode_name(&label)
+                } else {
+                    label.clone()
+                };
+                let change = Change::Label(label, !all);
+                let action = match target {
+                    MoveTarget::Selection => Action::ApplySelection(change),
+                    _ => Action::Apply(ids.clone(), change),
+                };
+                checked(shown, all, action)
+            })
+            .collect();
+        if !entries.is_empty() {
+            entries.push(Entry::Separator);
+        }
+        entries.push(entry("New Label…", "plus", Action::NewLabel(target.clone())));
+        entries
+    }
+    /// Applies a change to a menu's target.
+    fn apply_target(&mut self, target: MoveTarget, ids: Vec<String>, change: Change, cx: &mut Context<Self>) {
+        match target {
+            MoveTarget::Subscription(sub) => self.change_subscription(*sub, change, cx),
+            _ => self.apply(ids, change, cx),
+        }
+    }
+    /// Deletes mail for good, as confirmed: it leaves the list at once and
+    /// comes back if the server refuses.
+    fn erase(&mut self, erase: Erase, cx: &mut Context<Self>) {
+        self.modal = None;
+        match erase {
+            Erase::Mail(ids) => {
+                let gone: Vec<Mail> = self
+                    .messages
+                    .iter()
+                    .filter(|m| ids.contains(&m.id))
+                    .cloned()
+                    .collect();
+                self.messages.retain(|m| !ids.contains(&m.id));
+                self.selection.retain(|id| !ids.contains(id));
+                if self.selected.as_ref().is_some_and(|s| ids.contains(s)) {
+                    self.selected = None;
+                }
+                self.filter(cx);
+                let mut groups: Vec<(Account, Vec<Mail>)> = vec![];
+                for m in gone {
+                    let Some(a) = self.account_of(&m) else {
+                        continue;
+                    };
+                    match groups.iter_mut().find(|(g, _)| g.id == a.id) {
+                        Some((_, ms)) => ms.push(m),
+                        None => groups.push((a, vec![m])),
+                    }
+                }
+                for (a, mails) in groups {
+                    let count = mails.len();
+                    let id = a.id.clone();
+                    self.task(
+                        cx,
+                        move |b| b.delete_forever(&a, &mails),
+                        move |this, result, cx| {
+                            this.account_result(&id, IssueSource::Change, &result);
+                            this.refresh_counts(cx);
+                            match result {
+                                Ok(()) => this.notice(
+                                    if count == 1 {
+                                        "Deleted permanently".to_owned()
+                                    } else {
+                                        format!("Deleted {count} messages permanently")
+                                    },
+                                    false,
+                                    cx,
+                                ),
+                                Err(e) => {
+                                    this.notice(format!("Couldn't delete: {e:#}"), true, cx);
+                                    this.reload_cached(cx);
+                                }
+                            }
+                        },
+                    );
+                }
+            }
+            Erase::Mailbox(id, folder) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                if self.shows(&id) && self.folder == folder {
+                    self.messages.retain(|m| m.account != id);
+                    self.selected = None;
+                    self.selection.clear();
+                    self.filter(cx);
+                }
+                self.task(
+                    cx,
+                    move |b| b.empty_mailbox(&a, folder),
+                    move |this, result, cx| {
+                        this.account_result(&id, IssueSource::Change, &result);
+                        this.refresh_counts(cx);
+                        match result {
+                            Ok(n) => this.notice(
+                                format!(
+                                    "Emptied {} ({} message{})",
+                                    folder.label(),
+                                    fmt_count(n),
+                                    if n == 1 { "" } else { "s" }
+                                ),
+                                false,
+                                cx,
+                            ),
+                            Err(e) => {
+                                this.notice(format!("Couldn't empty {}: {e:#}", folder.label()), true, cx);
+                                this.reload_cached(cx);
+                            }
+                        }
+                    },
+                );
+            }
+        }
+        cx.notify();
+    }
+    /// The dialog asking before mail is deleted for good.
+    fn erase_modal(&self, erase: &Erase) -> AnyElement {
+        let c = self.colors();
+        let (question, pop) = match erase {
+            Erase::Mail(ids) => {
+                let pop = self
+                    .messages
+                    .iter()
+                    .filter(|m| ids.contains(&m.id))
+                    .any(|m| self.account_of(m).is_some_and(|a| a.provider == Provider::Pop3));
+                (
+                    if ids.len() == 1 {
+                        "Delete this message permanently?".to_owned()
+                    } else {
+                        format!("Delete {} messages permanently?", fmt_count(ids.len()))
+                    },
+                    pop,
+                )
+            }
+            Erase::Mailbox(id, folder) => {
+                let a = self.accounts.iter().find(|a| &a.id == id);
+                (
+                    format!(
+                        "Empty {} in {}?",
+                        folder.label(),
+                        a.map(|a| a.email.as_str()).unwrap_or_default()
+                    ),
+                    a.is_some_and(|a| a.provider == Provider::Pop3),
+                )
+            }
+        };
+        div()
+            .id("erase")
+            .debug_selector(|| "erase".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(question),
+            )
+            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(if pop {
+                "They're deleted from this computer. The server's copies are kept (Picacho never deletes POP mail there) but won't download again."
+            } else {
+                "They're deleted from the server and this computer. This can't be undone."
+            }))
+            .into_any_element()
+    }
+    /// The dialog naming a new label.
+    fn new_label_modal(&self, target: &MoveTarget) -> AnyElement {
+        let c = self.colors();
+        let n = self.target_ids(target).len();
+        div()
+            .id("new-label")
+            .debug_selector(|| "new-label".into())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if n == 1 {
+                        "A label for this message, kept on the server.".to_owned()
+                    } else {
+                        format!("A label for these {} messages, kept on the server.", fmt_count(n))
+                    }),
+            )
+            .child(
+                div()
+                    .id("new-label-name")
+                    .debug_selector(|| "new-label-name".into())
+                    .child(
+                        field(Input::new(&self.label_input), c, false)
+                            .h(px(39.))
+                            .text_size(px(13.)),
+                    ),
+            )
+            .into_any_element()
+    }
+    /// The folder picker: the account's own server folders, nested as in
+    /// the sidebar, each moving `target` there.
+    fn move_folder_entries(&self, target: &MoveTarget) -> Vec<Entry> {
+        let Some((account, within)) = self.move_account(target) else {
+            return vec![];
+        };
+        // In the sidebar's order.
+        self.ordered_folders(&account)
+            .iter()
+            .filter(|f| Some(&f.name) != within.as_ref())
+            .map(|f| {
+                let change = Change::MoveTo(f.name.clone());
+                let action = match target {
+                    MoveTarget::Mail(ids) => Action::Apply(ids.clone(), change),
+                    MoveTarget::Selection => Action::ApplySelection(change),
+                    MoveTarget::Subscription(sub) => {
+                        Action::ChangeSubscription(sub.clone(), change)
+                    }
+                };
+                // Em spaces indent subfolders beneath their parents.
+                let label = format!("{}{}", "\u{2003}".repeat(f.depth), f.label);
+                entry(label, "folder", action)
+            })
+            .collect()
     }
     fn mark_all_read(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
         if fwd::is_view(&id) {
@@ -2381,11 +3520,16 @@ impl MailApp {
             return;
         }
         if self.modal.is_none() {
-            if !self.selection.is_empty() {
+            if self.selecting {
                 self.selection.clear();
+                self.select_mode = false;
                 self.sync_selecting();
             } else if self.search_open {
                 self.close_search(w, cx);
+            } else if self.subs_open && self.selected.is_some() {
+                self.handle(Action::BackToList, w, cx);
+            } else if self.subs_open && self.subs_sender.is_some() {
+                self.close_subscription(w, cx);
             } else if w.viewport_size().width < px(900.) {
                 self.selected = None;
                 self.read_generation += 1;
@@ -2395,6 +3539,8 @@ impl MailApp {
         }
         self.cancel.store(true, Ordering::Relaxed);
         self.connecting = false;
+        self.sign_in_retry = false;
+        self.backend.forget_sign_in();
         self.discovering = false;
         self.setup_generation += 1;
         self.modal = None;
@@ -2408,10 +3554,12 @@ impl MailApp {
         cx.notify();
     }
     fn begin_setup(&mut self, step: Step, w: &mut Window, cx: &mut Context<Self>) {
-        for i in [EMAIL, PASSWORD] {
+        for i in [EMAIL, PASSWORD, LOGIN] {
             Self::set(&self.form[i], "", w, cx);
         }
         self.cancel.store(true, Ordering::Relaxed);
+        self.sign_in_retry = false;
+        self.backend.forget_sign_in();
         self.setup_generation += 1;
         self.step = step;
         self.discovering = false;
@@ -2585,6 +3733,7 @@ impl MailApp {
                     a.incoming_port = value(IMAP_PORT).parse().unwrap_or(0);
                     a.smtp_host = value(SMTP_HOST);
                     a.smtp_port = value(SMTP_PORT).parse().unwrap_or(0);
+                    a.username = value(LOGIN);
                 }
                 a
             }
@@ -2634,16 +3783,52 @@ impl MailApp {
             self.notice("This account is already added.", true, cx);
             return;
         }
+        self.sign_in_step = SignInStep::Browser;
+        self.start_connect(cx, move |b, cancel| b.connect(&a, password, &taken, cancel));
+    }
+    /// Follows the backend's progress on this sign-in until it ends or is
+    /// replaced, so the waiting text moves on once the browser answers.
+    pub(super) fn follow_sign_in(&mut self, cx: &mut Context<Self>) {
+        let cancel = self.cancel.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(150)).await;
+                let running = this.update(cx, |this, cx| {
+                    if !this.connecting || !Arc::ptr_eq(&this.cancel, &cancel) {
+                        return false;
+                    }
+                    let step = this.backend.sign_in_step();
+                    if step != this.sign_in_step {
+                        this.sign_in_step = step;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    /// Runs a new-account sign-in (or its retry) and applies the result.
+    fn start_connect(
+        &mut self,
+        cx: &mut Context<Self>,
+        sign_in: impl FnOnce(&Backend, Arc<AtomicBool>) -> anyhow::Result<Account> + Send + 'static,
+    ) {
         self.connecting = true;
+        self.sign_in_retry = false;
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let cancelled = cancel.clone();
         self.status.clear();
         self.error = false;
+        self.follow_sign_in(cx);
         self.task(
             cx,
             move |b| {
-                let saved = b.connect(&a, password, &taken, cancel)?;
+                let saved = sign_in(&b, cancel)?;
                 let encrypted = saved.service == Service::Pinal && b.encrypted(&saved);
                 Ok((saved, encrypted))
             },
@@ -2679,10 +3864,30 @@ impl MailApp {
                         }
                         this.refresh(cx);
                     }
-                    Err(e) => this.notice(e.to_string(), true, cx),
+                    // The whole chain: a bare "Sign-in needs attention" hides
+                    // whether the token step or the mail server refused.
+                    Err(e) => {
+                        this.sign_in_retry = this.backend.can_retry_sign_in();
+                        this.notice(format!("{e:#}"), true, cx)
+                    }
                 }
             },
         );
+    }
+    /// Repeats the step after the browser that failed, in the open setup or
+    /// sign-in-again form.
+    fn retry_sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.connecting || !self.sign_in_retry {
+            return;
+        }
+        match self.modal.clone() {
+            Some(Modal::Reconnect(id)) => self.retry_reconnect(id, cx),
+            _ if self.step == Step::Credentials => {
+                self.sign_in_step = SignInStep::Finishing;
+                self.start_connect(cx, |b, cancel| b.retry_sign_in(cancel))
+            }
+            _ => {}
+        }
     }
     /// Reads the open message's original source and its details once.
     fn load_details(&mut self, cx: &mut Context<Self>) {
@@ -2958,7 +4163,7 @@ impl MailApp {
             Action::Apply(ids, change) => self.apply(ids, change, cx),
             Action::ApplySelection(change) => {
                 let ids: Vec<String> = self.selection.iter().cloned().collect();
-                if matches!(change, Change::Move(_)) {
+                if change.moves() {
                     self.selection.clear();
                 }
                 self.apply(ids, change, cx);
@@ -2978,9 +4183,13 @@ impl MailApp {
                 self.new_compose(mode, w, cx);
             }
             Action::DeleteDraft(id) => {
-                let _ = self.backend.store.delete_draft(&id);
+                let account = self.drafts.iter().find(|d| d.id == id).map(|d| d.account.clone());
+                let _ = self.backend.discard_draft(&id);
                 self.drop_composer_for_draft(&id, cx);
                 self.load_drafts(cx);
+                if let Some(account) = account {
+                    self.sync_drafts_soon(&account, cx);
+                }
             }
             Action::MarkAllRead(id, mailbox) => self.mark_all_read(id, mailbox, cx),
             Action::RefreshAccount(id) if fwd::is_view(&id) => {
@@ -3009,6 +4218,19 @@ impl MailApp {
             Action::NewSeparator(parent) => self.new_separator(parent, w, cx),
             Action::RenameFolder(id) => self.start_rename(id, w, cx),
             Action::DeleteFolder(id) => self.delete_folder(&id),
+            Action::DeleteRemoteFolder(id, name) => {
+                if self.folder_deletable(&id, &name) {
+                    self.modal = Some(Modal::DeleteFolder(id, name));
+                    self.anim += 1;
+                }
+            }
+            Action::ConfirmDeleteFolder(id, name) => self.delete_remote_folder(id, name, cx),
+            Action::NewRemoteFolder(id, parent) => {
+                self.edit_remote_folder(id, FolderEdit::New(parent), w, cx)
+            }
+            Action::RenameRemoteFolder(id, name) => {
+                self.edit_remote_folder(id, FolderEdit::Rename(name), w, cx)
+            }
             Action::RemoveSeparator(id) => self.remove_separator(&id),
             Action::ToggleSubfolders(id) => {
                 let key = format!("folders:{id}");
@@ -3072,7 +4294,52 @@ impl MailApp {
                     };
                 }
             }
-            Action::StopSelecting => self.selection.clear(),
+            Action::StopSelecting => {
+                self.selection.clear();
+                self.select_mode = false;
+            }
+            Action::ToggleSelectMode => {
+                if self.selecting {
+                    self.selection.clear();
+                    self.select_mode = false;
+                } else if self.folder != Folder::Drafts {
+                    self.select_mode = true;
+                    // The open message is the likely first pick.
+                    if let Some(open) = self.selected.clone() {
+                        self.selection.insert(open.clone());
+                        self.select_anchor = Some(open);
+                    }
+                }
+            }
+            Action::SelectFromSender(id) => {
+                if let Some(from) = self
+                    .messages
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map(|m| m.from.to_lowercase())
+                    .filter(|f| !f.is_empty())
+                {
+                    let ids: Vec<String> = self
+                        .visible
+                        .iter()
+                        .map(|i| &self.messages[*i])
+                        .filter(|m| !m.pending && m.from.to_lowercase() == from)
+                        .map(|m| m.id.clone())
+                        .collect();
+                    self.selection.extend(ids);
+                    self.select_anchor = Some(id);
+                }
+            }
+            Action::SearchFor(query) => {
+                if !self.search_open {
+                    self.search_open = true;
+                    self.search_anim += 1;
+                }
+                Self::set(&self.search, &query, w, cx);
+                self.search.update(cx, |s, cx| s.focus(w, cx));
+                self.apply_filter(cx);
+                self.scroll_list_to_top();
+            }
             Action::OpenSearch => {
                 if !self.search_open {
                     self.search_open = true;
@@ -3087,10 +4354,9 @@ impl MailApp {
             }
             Action::OldestFirst(oldest) => {
                 self.oldest_first = oldest;
-                let _ = self
+                self
                     .backend
-                    .store
-                    .set_preference("sort", if oldest { "oldest" } else { "newest" });
+                    .store.set_preference_soon("sort", if oldest { "oldest" } else { "newest" });
                 self.filter(cx);
                 self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
@@ -3129,7 +4395,93 @@ impl MailApp {
                     self.discover(w, cx);
                 }
             }
+            Action::RetrySignIn => self.retry_sign_in(cx),
+            Action::OpenSubscription(sub) => self.open_subscription(sub, cx),
+            Action::CloseSubscription => self.close_subscription(w, cx),
+            Action::SubscriptionsTab(unsubscribed) => {
+                self.subs_tab = if unsubscribed {
+                    subscriptions::SubsTab::Unsubscribed
+                } else {
+                    subscriptions::SubsTab::Subscribed
+                };
+                self.subs_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+            Action::ChangeSubscription(sub, change) => self.change_subscription(*sub, change, cx),
+            Action::ToggleReadReceipts(id) => {
+                self.edit_account(&id, |a| a.read_receipts = !a.read_receipts, cx)
+            }
+            Action::ToggleDeliveryReceipts(id) => {
+                self.edit_account(&id, |a| a.delivery_receipts = !a.delivery_receipts, cx)
+            }
+            Action::DeleteForever(ids) => {
+                if !ids.is_empty() {
+                    self.modal = Some(Modal::Erase(Erase::Mail(ids)));
+                    self.anim += 1;
+                }
+            }
+            Action::EmptyMailbox(id, folder) => {
+                if self.accounts.iter().any(|a| a.id == id) {
+                    self.modal = Some(Modal::Erase(Erase::Mailbox(id, folder)));
+                    self.anim += 1;
+                }
+            }
+            Action::ConfirmErase(erase) => self.erase(erase, cx),
+            Action::LabelMenu(target) => {
+                let entries = self.label_entries(&target);
+                if !entries.is_empty() {
+                    self.open_menu_here(entries, w, cx);
+                }
+                return;
+            }
+            Action::NewLabel(target) => {
+                self.status.clear();
+                self.error = false;
+                self.modal = Some(Modal::NewLabel(target));
+                self.anim += 1;
+                self.label_input.update(cx, |s, cx| {
+                    s.set_value("", w, cx);
+                    s.focus(w, cx);
+                });
+            }
+            Action::SaveLabel => {
+                if let Some(Modal::NewLabel(target)) = self.modal.clone() {
+                    let label = Self::value(&self.label_input, cx).trim().to_owned();
+                    let ids = self.target_ids(&target);
+                    let gmail = self
+                        .move_account(&target)
+                        .and_then(|(id, _)| self.accounts.iter().find(|a| a.id == id))
+                        .is_some_and(|a| a.provider == Provider::Gmail);
+                    let checked = if gmail {
+                        // Gmail names labels like folders (modified UTF-7).
+                        let label = crate::sync::transport::encode_name(&label);
+                        crate::sync::transport::gmail_label(&label).map(|_| label)
+                    } else {
+                        crate::sync::transport::keyword(&label)
+                    };
+                    match checked {
+                        Err(e) => self.notice(e.to_string(), true, cx),
+                        Ok(label) => {
+                            self.modal = None;
+                            self.focus.focus(w);
+                            self.apply_target(target, ids, Change::Label(label, true), cx);
+                        }
+                    }
+                }
+            }
+            Action::MoveMenu(target) => {
+                let entries = self.move_folder_entries(&target);
+                if !entries.is_empty() {
+                    self.open_menu_here(entries, w, cx);
+                }
+                return;
+            }
+            Action::SubscriptionMenu(sub) => {
+                let entries = self.subscription_entries(&sub);
+                self.open_menu(w.mouse_position(), entries, cx);
+            }
             Action::SetupBack => {
+                self.sign_in_retry = false;
+                self.backend.forget_sign_in();
                 if self.connecting {
                     self.cancel.store(true, Ordering::Relaxed);
                     self.connecting = false;
@@ -3260,6 +4612,8 @@ impl MailApp {
                 }
                 self.cancel.store(true, Ordering::Relaxed);
                 self.connecting = false;
+                self.sign_in_retry = false;
+                self.backend.forget_sign_in();
                 self.status.clear();
                 Self::set(&self.form[PASSWORD], "", w, cx);
                 self.modal = Some(Modal::Reconnect(id));
@@ -3306,25 +4660,37 @@ impl MailApp {
                     a => a == Appearance::Dark,
                 };
                 self.apply_theme(w, cx);
-                let _ = self.backend.store.set_preference("theme", appearance.key());
+                self.backend.store.set_preference_soon("theme", appearance.key());
             }
             Action::SetAccent(accent) => {
                 self.accent = accent;
                 self.apply_theme(w, cx);
-                let _ = self.backend.store.set_preference("accent", accent.key());
+                self.backend.store.set_preference_soon("accent", accent.key());
             }
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
+            Action::SetCleanLinks(on) => {
+                self.clean_links = on;
+                if on {
+                    crate::manage::tracking::warm_up();
+                }
+                self.backend
+                    .store
+                    .set_preference_soon("clean_links", if on { "true" } else { "false" });
+            }
             Action::SetReadingDefaults(options) => {
-                match self.backend.store.set_preference(
+                let before = self.reading_defaults;
+                self.save_preference(
                     "reading_defaults",
                     &serde_json::to_string(&options).unwrap(),
-                ) {
-                    Ok(()) => {
-                        self.reading_defaults = options;
-                        self.options_cache.borrow_mut().take();
-                    }
-                    Err(e) => self.notice(e.to_string(), true, cx),
-                }
+                    cx,
+                    move |this, cx| {
+                        this.reading_defaults = before;
+                        this.options_cache.borrow_mut().take();
+                        this.html_view.update(cx, |view, cx| view.clear(cx));
+                    },
+                );
+                self.reading_defaults = options;
+                self.options_cache.borrow_mut().take();
             }
             Action::ShowHtml(on) => {
                 if let Some(m) = self.selected_mail()
@@ -3382,6 +4748,11 @@ impl MailApp {
                 self.menu = None;
                 // Addresses can come from an email; only web and email links
                 // are handed to the system.
+                let url = if self.clean_links {
+                    crate::manage::tracking::clean_url(&url).unwrap_or(url)
+                } else {
+                    url
+                };
                 match super::html::openable_url(&url) {
                     Some(url) => cx.open_url(url.as_str()),
                     None => self.notice("Picacho only opens web and email links.", true, cx),
@@ -3410,12 +4781,16 @@ impl MailApp {
                         _ => options.block_remote = !options.block_remote,
                     }
                     self.options_cache.borrow_mut().take();
-                    if let Err(e) = self.backend.store.set_preference(
+                    // Unsaved, the message reads its options as saved before.
+                    self.save_preference(
                         &message_key(&m.account, &m.id),
                         &serde_json::to_string(&options).unwrap(),
-                    ) {
-                        self.notice(e.to_string(), true, cx);
-                    }
+                        cx,
+                        |this, cx| {
+                            this.options_cache.borrow_mut().take();
+                            this.html_view.update(cx, |view, cx| view.clear(cx));
+                        },
+                    );
                     self.html_view.update(cx, |view, cx| view.clear(cx));
                 }
             }
@@ -3603,6 +4978,9 @@ impl MailApp {
                 let entries = self.service_entries(&id);
                 self.open_menu_here(entries, w, cx);
             }
+            Action::SetAliasesOnly(id, on) => {
+                self.edit_forwarding(&id, |f| f.aliases_only = on, cx);
+            }
             Action::DeliverMenu(id) => {
                 let entries = self.deliver_entries(&id);
                 self.open_menu_here(entries, w, cx);
@@ -3626,10 +5004,10 @@ impl MailApp {
         self.sync_selecting();
         cx.notify();
     }
-    /// Selection mode is simply "something is selected"; the bulk toolbar
-    /// animates in when the first message is picked.
+    /// Selection mode is "something is selected", or turned on from the
+    /// list's Select button; the bulk toolbar animates in as it starts.
     fn sync_selecting(&mut self) {
-        let now = !self.selection.is_empty();
+        let now = !self.selection.is_empty() || self.select_mode;
         if now && !self.selecting {
             self.select_anim += 1;
         }
@@ -3666,6 +5044,37 @@ impl MailApp {
         self.refresh_counts(cx);
     }
     /// Saves an account's nickname; an empty one goes back to its name.
+    /// Changes an account's settings and saves them.
+    pub(super) fn edit_account(&mut self, id: &str, edit: impl FnOnce(&mut Account), cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter_mut().find(|a| a.id == id) else {
+            return;
+        };
+        edit(a);
+        if let Err(e) = self.backend.store.save_account(a) {
+            self.notice(e.to_string(), true, cx);
+        }
+        cx.notify();
+    }
+    /// Asks the account's server how much of its storage is used.
+    fn load_quota(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        if a.provider == Provider::Pop3 || a.incoming_host.is_empty() || self.account_blocked(id) {
+            return;
+        }
+        let id = id.to_owned();
+        self.task(
+            cx,
+            move |b| b.quota(&a),
+            move |this, result, cx| {
+                if let Ok(quota) = result {
+                    this.quotas.insert(id, quota);
+                    cx.notify();
+                }
+            },
+        );
+    }
     pub(super) fn set_nickname(&mut self, id: &str, nickname: &str, cx: &mut Context<Self>) {
         let nickname = nickname.trim();
         let Some(a) = self.accounts.iter_mut().find(|a| a.id == id) else {
@@ -3682,24 +5091,58 @@ impl MailApp {
     }
     /// Shows the open account page's nickname in its field, also after it
     /// was changed elsewhere, unless the field is being typed in.
+    /// Applies a sign-in name being typed (see `login_pending`): saves it
+    /// and signs the account's connections out, so the next sign in with it.
+    fn apply_login(&mut self, cx: &mut Context<Self>) {
+        let Some((id, value)) = self.login_pending.take() else {
+            return;
+        };
+        if self.accounts.iter().any(|a| a.id == id && a.username != value) {
+            self.edit_account(&id, |a| a.username = value, cx);
+            self.backend.reconnect_later(&id);
+        }
+    }
     pub(super) fn sync_nickname_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let shown = match &self.page {
             Page::Account(id) => self.accounts.iter().find(|a| &a.id == id),
             _ => None,
         };
-        let Some((id, nickname)) = shown.map(|a| (a.id.clone(), a.nickname.clone())) else {
+        let shown = shown.map(|a| {
+            (
+                a.id.clone(),
+                [a.nickname.clone(), a.username.clone(), a.reply_to.clone()],
+            )
+        });
+        // Leaving the page, or another account's: a name being typed for
+        // the one shown before applies now.
+        if self.login_pending.as_ref().map(|(id, _)| id) != shown.as_ref().map(|(id, _)| id) {
+            self.apply_login(cx);
+        }
+        let Some((id, mut values)) = shown else {
             self.nickname_for = None;
             return;
         };
         let same = self.nickname_for.as_ref() == Some(&id);
-        if same
-            && (Self::value(&self.nickname_input, cx).trim() == nickname
-                || self.nickname_input.read(cx).focus_handle(cx).is_focused(w))
-        {
-            return;
+        // What is being typed stays in its field until it applies.
+        if same && let Some((_, typed)) = &self.login_pending {
+            values[1] = typed.clone();
         }
-        self.nickname_for = Some(id);
-        Self::set(&self.nickname_input, nickname, w, cx);
+        if !same {
+            self.nickname_for = Some(id.clone());
+            self.load_quota(&id, cx);
+        }
+        let inputs = [
+            self.nickname_input.clone(),
+            self.login_input.clone(),
+            self.reply_to_input.clone(),
+        ];
+        for (input, value) in inputs.iter().zip(values) {
+            let current = Self::value(input, cx);
+            let typing = input.read(cx).focus_handle(cx).is_focused(w);
+            if !same || (current.trim() != value && !typing) {
+                Self::set(input, value, w, cx);
+            }
+        }
     }
     fn close_search(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         self.search_open = false;
@@ -3862,6 +5305,44 @@ impl MailApp {
         let entries = self.mailbox_entries(account, mailbox.clone());
         let action = Action::OpenMailbox(account.to_owned(), mailbox.clone());
         let selector = format!("nav-{account}-{}", mailbox.key());
+        // A server folder is renamed in place, as top folders are.
+        let rename = match &mailbox {
+            Mailbox::Remote(name) => Some(FolderEdit::Rename(name.clone())),
+            Mailbox::Standard(_) => None,
+        };
+        let editing = rename
+            .as_ref()
+            .is_some_and(|edit| self.editing_folder(account, edit));
+        let saving = rename.as_ref().and_then(|edit| {
+            self.folder_saving
+                .as_ref()
+                .filter(|(a, e, _)| a == account && e == edit)
+                .map(|(_, _, name)| name.clone())
+        });
+        let label_el = if editing {
+            self.rename_field()
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.))
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .when(saving.is_some(), |d| d.opacity(0.6))
+                .child(saving.unwrap_or(label))
+                .into_any_element()
+        };
+        let renamable = matches!(&mailbox, Mailbox::Remote(name) if self.folder_deletable(account, name));
+        let double = match &mailbox {
+            Mailbox::Remote(name) if renamable => {
+                Some(Action::RenameRemoteFolder(account.to_owned(), name.clone()))
+            }
+            _ => None,
+        };
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(|| selector)
@@ -3877,19 +5358,7 @@ impl MailApp {
             .hover(move |s| s.bg(rgb(if active { c.soft } else { c.surface })))
             .text_color(rgb(if active { c.text } else { c.muted }))
             .child(icon_el(icon, 16., if active { c.accent } else { c.muted }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(13.))
-                    .font_weight(if active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .child(label),
-            )
+            .child(label_el)
             .when(count > 0, |d| {
                 d.child(
                     div()
@@ -3899,7 +5368,16 @@ impl MailApp {
                         .child(fmt_count(count)),
                 )
             })
-            .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
+            .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
+                if editing {
+                    return;
+                }
+                // Double-clicking a server folder renames it, as with top folders.
+                match &double {
+                    Some(rename) if e.click_count() >= 2 => this.handle(rename.clone(), w, cx),
+                    _ => this.handle(action.clone(), w, cx),
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -4241,45 +5719,7 @@ impl MailApp {
             .border_color(rgb(c.border))
             .child(self.list_header(count, cx))
             .child(if count == 0 {
-                let searching = !Self::value(&self.search, cx).trim().is_empty();
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .p_8()
-                    .text_size(px(13.))
-                    .text_color(rgb(c.muted))
-                    .child(if self.syncing && !searching {
-                        spinner(20., c.muted).into_any_element()
-                    } else {
-                        icon_el(
-                            if self.folder == Folder::Drafts {
-                                "compose"
-                            } else if searching {
-                                "search"
-                            } else {
-                                folder_icon(self.folder)
-                            },
-                            28.,
-                            c.border,
-                        )
-                        .into_any_element()
-                    })
-                    .child(if searching {
-                        "No results"
-                    } else if self.syncing {
-                        "Loading…"
-                    } else if self.filter_by != Filter::All {
-                        "No matching mail"
-                    } else if self.folder == Folder::Drafts {
-                        "No drafts"
-                    } else {
-                        "No mail yet"
-                    })
-                    .into_any_element()
+                self.empty_list(cx)
             } else {
                 uniform_list("message-list", count, move |range, _, cx| {
                     entity.update(cx, |this, cx| {
@@ -4322,6 +5762,179 @@ impl MailApp {
                         }),
                 )
             })
+    }
+    /// Accounts the open mailbox is still being fetched from: a sync, a
+    /// sign-in retry or a listing in flight. A view (All Mail, an alias)
+    /// lists several accounts, each fetched on its own.
+    fn fetching_accounts(&self) -> Vec<&Account> {
+        if self.account.is_none() || self.folder == Folder::Drafts {
+            return vec![];
+        }
+        let key = self.mailbox().key();
+        self.accounts
+            .iter()
+            .filter(|a| self.shows(&a.id))
+            .filter(|a| {
+                self.retrying.contains(&a.id)
+                    || self.sync_requests.contains(&(a.id.clone(), key.clone()))
+                    || self.cataloging.contains(&(a.id.clone(), key.clone()))
+            })
+            .collect()
+    }
+    /// Whether the open mailbox may still get mail: its cache is being read
+    /// or one of its accounts is being fetched.
+    fn mailbox_loading(&self) -> bool {
+        self.syncing || self.cache_loading || !self.fetching_accounts().is_empty()
+    }
+    /// Whether the open mailbox is being synced with a server right now.
+    /// Listing a large mailbox in the background has its own progress bar
+    /// and leaves Refresh available.
+    fn checking_server(&self) -> bool {
+        if self.syncing {
+            return true;
+        }
+        if self.account.is_none() || self.folder == Folder::Drafts {
+            return false;
+        }
+        let key = self.mailbox().key();
+        self.sync_requests
+            .iter()
+            .any(|(id, k)| k == &key && self.shows(id))
+    }
+    /// Shown accounts whose last fetch of the open mailbox failed, or that
+    /// can't sign in.
+    fn unreachable_accounts(&self) -> Vec<&Account> {
+        if self.account.is_none() || self.folder == Folder::Drafts {
+            return vec![];
+        }
+        let source = IssueSource::Sync(self.mailbox().key());
+        self.accounts
+            .iter()
+            .filter(|a| self.shows(&a.id))
+            .filter(|a| {
+                self.account_blocked(&a.id)
+                    || self
+                        .account_issues
+                        .get(&a.id)
+                        .is_some_and(|issues| issues.contains_key(&source))
+            })
+            .collect()
+    }
+    /// What an empty list says: an icon (or a spinner), a title, and a
+    /// line explaining it.
+    fn empty_list(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let searching = !Self::value(&self.search, cx).trim().is_empty();
+        let loading = self.mailbox_loading();
+        let fetching = self.fetching_accounts();
+        let shown = self
+            .accounts
+            .iter()
+            .filter(|a| self.shows(&a.id))
+            .count();
+        let names = |list: &[&Account]| match list {
+            [] => String::new(),
+            [one] => one.label().to_owned(),
+            [first, second] => format!("{} and {}", first.label(), second.label()),
+            [first, rest @ ..] => format!("{} and {} more", first.label(), rest.len()),
+        };
+        let unreachable = if loading { vec![] } else { self.unreachable_accounts() };
+        let (icon, title, detail): (Option<&str>, String, Option<String>) = if searching {
+            if loading {
+                (
+                    Some("search"),
+                    "No results yet".into(),
+                    Some("Still fetching mail; more may match.".into()),
+                )
+            } else {
+                (Some("search"), "No results".into(), None)
+            }
+        } else if loading {
+            let detail = if self.cache_loading && fetching.is_empty() {
+                "Reading mail saved on this computer…".to_owned()
+            } else if let Some(p) = self.catalog_progress().filter(|p| p.total > 0) {
+                format!(
+                    "Listed {} of {} messages",
+                    fmt_count(p.cataloged),
+                    fmt_count(p.total)
+                )
+            } else if shown > 1 && !fetching.is_empty() {
+                format!(
+                    "Checking {} of {} accounts: {}",
+                    fetching.len(),
+                    shown,
+                    names(&fetching)
+                )
+            } else if !fetching.is_empty() {
+                format!("Checking {} for mail", names(&fetching))
+            } else {
+                "Checking the server for mail".to_owned()
+            };
+            (None, "Fetching mail…".into(), Some(detail))
+        } else if !unreachable.is_empty() && self.filter_by == Filter::All {
+            (
+                Some("warning"),
+                "Couldn't fetch mail".into(),
+                Some(format!(
+                    "{} couldn't be reached. Refresh to try again.",
+                    names(&unreachable)
+                )),
+            )
+        } else if self.filter_by != Filter::All {
+            (Some("filter"), "No matching mail".into(), None)
+        } else if self.folder == Folder::Drafts {
+            (Some("compose"), "No drafts".into(), None)
+        } else {
+            (Some(folder_icon(self.folder)), "No mail here".into(), None)
+        };
+        let failed = icon == Some("warning");
+        div()
+            .id("empty-list")
+            .debug_selector(|| "empty-list".into())
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_8()
+            .text_size(px(13.))
+            .text_color(rgb(c.muted))
+            .child(match icon {
+                None => spinner(20., c.accent).into_any_element(),
+                Some(icon) => icon_el(icon, 28., c.border).into_any_element(),
+            })
+            .child(
+                div()
+                    .id("empty-list-title")
+                    .debug_selector(|| "empty-list-title".into())
+                    .text_color(rgb(if loading { c.text } else { c.muted }))
+                    .font_weight(if loading {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .child(title),
+            )
+            .when_some(detail, |d, detail| {
+                d.child(
+                    div()
+                        .id("empty-list-detail")
+                        .debug_selector(|| "empty-list-detail".into())
+                        .max_w(px(280.))
+                        .text_center()
+                        .text_size(px(12.))
+                        .child(detail),
+                )
+            })
+            .when(failed, |d| {
+                d.child(
+                    self.button("empty-list-retry", "Refresh", "refresh", Action::Refresh, false, cx)
+                        .h(px(30.))
+                        .mt_1(),
+                )
+            })
+            .into_any_element()
     }
     /// Unread messages in the open mailbox: exact from the loaded list when it
     /// holds the whole mailbox, otherwise from the cache's counts.
@@ -4427,6 +6040,23 @@ impl MailApp {
                         ))
                         .when(self.search_open, |d| d.bg(rgb(c.soft))),
                     )
+                    .when(self.folder != Folder::Drafts, |d| {
+                        d.child(
+                            small(self.button(
+                                "select-toggle",
+                                if self.selecting {
+                                    "@Done selecting · Esc"
+                                } else {
+                                    "@Select messages · ⌘A selects all"
+                                },
+                                "select",
+                                Action::ToggleSelectMode,
+                                false,
+                                cx,
+                            ))
+                            .when(self.selecting, |d| d.bg(rgb(c.soft))),
+                        )
+                    })
                     .child(
                         small(self.button(
                             "filter",
@@ -4444,7 +6074,7 @@ impl MailApp {
                                 .size_full(),
                         ),
                     )
-                    .child(if self.syncing {
+                    .child(if self.checking_server() {
                         div()
                             .size(px(28.))
                             .flex()
@@ -4502,6 +6132,10 @@ impl MailApp {
                         |d, t| d.h(px(40. * t)).opacity(t),
                     ),
             );
+            // Until something is typed, the fields it can search by.
+            if Self::value(&self.search, cx).trim().is_empty() {
+                header = header.child(self.search_hints(cx));
+            }
         }
         if self.selecting {
             header = header.child(
@@ -4518,10 +6152,51 @@ impl MailApp {
         }
         header
     }
+    /// Chips that start a search by sender, Reply-To, state and so on.
+    fn search_hints(&self, cx: &Context<Self>) -> impl IntoElement {
+        let c = self.colors();
+        div()
+            .id("search-hints")
+            .debug_selector(|| "search-hints".into())
+            .pt_2()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .children(crate::manage::search::OPERATORS.iter().map(|(op, what)| {
+                let op = *op;
+                let what = *what;
+                div()
+                    .id(SharedString::from(format!("search-hint-{op}")))
+                    .debug_selector(move || format!("search-hint-{op}"))
+                    .px_2()
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .text_size(px(11.))
+                    .text_color(rgb(c.muted))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(c.bg)).text_color(rgb(c.accent)))
+                    .child(op)
+                    .tooltip(move |w, cx| Tooltip::new(what).build(w, cx))
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        // Operators that take a value wait for it; flags
+                        // search straight away and leave room for more.
+                        let query = if op.ends_with(':') {
+                            op.to_owned()
+                        } else {
+                            format!("{op} ")
+                        };
+                        this.handle(Action::SearchFor(query), w, cx)
+                    }))
+            }))
+    }
     fn selection_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
         let n = self.selection.len();
-        let all = n == self.visible.len();
+        let all = n > 0 && n >= self.selectable_count();
         let tool = |id: &str, label: &str, icon: &str, change: Change| {
             self.button(
                 id.to_owned(),
@@ -4558,14 +6233,27 @@ impl MailApp {
             .gap(px(2.))
             .child(
                 div()
+                    .id("selection-count")
+                    .debug_selector(|| "selection-count".into())
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.accent))
-                    .child(format!("{} selected", fmt_count(n))),
+                    .child(if n == 0 {
+                        "Pick messages".to_owned()
+                    } else {
+                        format!("{} selected", fmt_count(n))
+                    })
+                    .when(n == 0, |d| {
+                        d.tooltip(|w, cx| {
+                            Tooltip::new("Click messages to select them; Shift-click selects a range")
+                                .build(w, cx)
+                        })
+                    }),
             )
             .child(
                 div()
                     .id("select-all")
+                    .debug_selector(|| "select-all".into())
                     .ml_2()
                     .text_size(px(12.))
                     .text_color(rgb(c.accent))
@@ -4575,48 +6263,50 @@ impl MailApp {
                     .on_click(cx.listener(|this, _, w, cx| this.handle(Action::SelectAll, w, cx))),
             )
             .child(div().flex_1())
-            .child(if any_unread {
-                tool(
-                    "bulk-read",
-                    "@Mark as read",
-                    "mail-open",
-                    Change::Read(true),
+            .when(n > 0, |d| {
+                d.child(if any_unread {
+                    tool(
+                        "bulk-read",
+                        "@Mark as read",
+                        "mail-open",
+                        Change::Read(true),
+                    )
+                } else {
+                    tool(
+                        "bulk-unread",
+                        "@Mark as unread",
+                        "mail",
+                        Change::Read(false),
+                    )
+                })
+                .child(tool(
+                    "bulk-star",
+                    if all_starred { "@Unstar" } else { "@Star" },
+                    if all_starred { "star-filled" } else { "star" },
+                    Change::Star(!all_starred),
+                ))
+                .child(
+                    tool(
+                        "bulk-archive",
+                        "@Archive",
+                        "archive",
+                        Change::Move(Folder::Archive),
+                    )
+                    .debug_selector(|| "bulk-archive".into()),
                 )
-            } else {
-                tool(
-                    "bulk-unread",
-                    "@Mark as unread",
-                    "mail",
-                    Change::Read(false),
-                )
+                .child(tool(
+                    "bulk-spam",
+                    "@Move to spam",
+                    "spam",
+                    Change::Move(Folder::Junk),
+                ))
+                .child(tool(
+                    "bulk-trash",
+                    "@Move to trash",
+                    "trash",
+                    Change::Move(Folder::Trash),
+                ))
             })
-            .child(tool(
-                "bulk-star",
-                if all_starred { "@Unstar" } else { "@Star" },
-                if all_starred { "star-filled" } else { "star" },
-                Change::Star(!all_starred),
-            ))
-            .child(
-                tool(
-                    "bulk-archive",
-                    "@Archive",
-                    "archive",
-                    Change::Move(Folder::Archive),
-                )
-                .debug_selector(|| "bulk-archive".into()),
-            )
-            .child(tool(
-                "bulk-spam",
-                "@Move to spam",
-                "spam",
-                Change::Move(Folder::Junk),
-            ))
-            .child(tool(
-                "bulk-trash",
-                "@Move to trash",
-                "trash",
-                Change::Move(Folder::Trash),
-            ))
             .child(
                 self.button(
                     "select-done",
@@ -4699,8 +6389,17 @@ impl MailApp {
                 }))
             });
         let star_id = m.id.clone();
-        let address =
-            (!m.from.is_empty() && !m.from.eq_ignore_ascii_case(&m.sender)).then(|| m.from.clone());
+        // Sent mail names the alias it went out as, in place of the address.
+        let sent_alias = self.sent_alias(m);
+        // A mailbox kept to its aliases sent it as the alias.
+        let sender = match self.mask_for(m) {
+            Some(k) if k.sent => k.sender(),
+            _ => m.sender.clone(),
+        };
+        let address = (sent_alias.is_none()
+            && !m.from.is_empty()
+            && !m.from.eq_ignore_ascii_case(&m.sender))
+        .then(|| m.from.clone());
         div()
             .id(SharedString::from(format!("row-{id}")))
             .debug_selector(|| format!("row-{id}"))
@@ -4756,7 +6455,7 @@ impl MailApp {
                                     } else {
                                         FontWeight::MEDIUM
                                     })
-                                    .child(m.sender.clone()),
+                                    .child(sender),
                             )
                             .child(
                                 div()
@@ -4765,7 +6464,10 @@ impl MailApp {
                                     .truncate()
                                     .text_size(px(11.))
                                     .text_color(rgb(c.muted))
-                                    .children(address),
+                                    .children(address)
+                                    .when_some(sent_alias, |d, alias| {
+                                        d.child(alias_tag(&format!("sent-alias-{id}"), alias, c))
+                                    }),
                             )
                             .child(
                                 div()
@@ -4877,6 +6579,24 @@ impl MailApp {
                 }
             }))
             .into_any_element()
+    }
+    /// Whether every selected message is `test`; false when none is selected.
+    fn selection_all(&self, test: impl Fn(&Mail) -> bool) -> bool {
+        let mut any = false;
+        for m in self.messages.iter().filter(|m| self.selection.contains(&m.id)) {
+            if !test(m) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+    /// Listed messages that can be selected (not placeholders).
+    fn selectable_count(&self) -> usize {
+        self.visible
+            .iter()
+            .filter(|i| !self.messages[**i].pending)
+            .count()
     }
     fn select_range(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let position = |id: &str| self.visible.iter().position(|i| self.messages[*i].id == id);
@@ -5146,7 +6866,8 @@ impl MailApp {
                         .gap_3()
                         .child(self.field("SMTP server", SMTP_HOST))
                         .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
-                );
+                )
+                .child(self.field("Sign-in name, if not the email address", LOGIN));
         }
         if let Some(why) = self.service.browser_unavailable() {
             content = content.child(notice_box(why, c));
@@ -5290,7 +7011,9 @@ impl MailApp {
             ),
             Step::Credentials if browser => (
                 format!("Sign in to {label}"),
-                if self.connecting {
+                if self.connecting && self.sign_in_step != SignInStep::Browser {
+                    "Picacho has your sign-in and is setting up the account.".into()
+                } else if self.connecting {
                     "Continue in the browser window that just opened.".into()
                 } else {
                     "Sign in with your browser. Picacho never sees your password.".into()
@@ -5399,7 +7122,7 @@ impl MailApp {
                         .text_size(px(13.))
                         .text_color(rgb(c.muted))
                         .child(spinner(16., c.accent))
-                        .child("Waiting for your browser…"),
+                        .child(self.sign_in_step.label()),
                 )
             }
             _ => {}
@@ -5425,6 +7148,11 @@ impl MailApp {
             ),
             Step::Provider => None,
             Step::Credentials if browser && self.connecting => None,
+            Step::Credentials if self.sign_in_retry => Some(
+                self.button("setup-retry", "Retry", "", Action::RetrySignIn, true, cx)
+                    .min_w(px(120.))
+                    .into_any_element(),
+            ),
             _ => Some(self.setup_submit(cx)),
         };
         let mut actions = div()
@@ -5444,6 +7172,19 @@ impl MailApp {
             }),
             _ => None,
         };
+        if self.step == Step::Credentials && self.sign_in_retry && !self.connecting {
+            // Retry reuses what the browser returned; this starts over.
+            actions = actions.child(self.link(
+                "setup-start-over",
+                if browser {
+                    "Open Browser Again"
+                } else {
+                    "Connect Again"
+                },
+                Action::SubmitAccount,
+                cx,
+            ));
+        }
         if let Some(back) = back {
             actions = actions.child(self.link("onboard-back", back, Action::SetupBack, cx));
         }
@@ -5565,7 +7306,11 @@ impl MailApp {
             return div().into_any_element();
         };
         let mut panel = div()
+            .id("menu-panel")
             .min_w(px(200.))
+            // A long folder list scrolls rather than run off the window.
+            .max_h(px(520.))
+            .overflow_y_scroll()
             // Long addresses end in an ellipsis rather than widen the menu.
             .max_w(px(380.))
             .p_1()
@@ -5587,7 +7332,14 @@ impl MailApp {
         for (i, e) in menu.entries.iter().enumerate() {
             match e {
                 Entry::Separator => {
-                    panel = panel.child(div().h(px(1.)).mx_2().my_1().bg(rgb(c.border)));
+                    panel = panel.child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(1.))
+                            .mx_2()
+                            .my_1()
+                            .bg(rgb(c.border)),
+                    );
                 }
                 Entry::Item {
                     label,
@@ -5602,6 +7354,7 @@ impl MailApp {
                         div()
                             .id(("menu-item", i))
                             .debug_selector(|| format!("menu-item-{i}"))
+                            .flex_shrink_0()
                             .h(px(28.))
                             .px_2()
                             .flex()
@@ -5783,6 +7536,11 @@ impl MailApp {
             Modal::About => "About Picacho",
             Modal::Help => "Keyboard Shortcuts",
             Modal::RemoveAccount(_) => "Remove Account",
+            Modal::DeleteFolder(..) => "Delete Folder",
+            Modal::Erase(Erase::Mail(_)) => "Delete Permanently",
+            Modal::Erase(Erase::Mailbox(_, Folder::Junk)) => "Empty Spam",
+            Modal::Erase(Erase::Mailbox(..)) => "Empty Trash",
+            Modal::NewLabel(_) => "New Label",
             Modal::Original => match self.source_view {
                 SourceView::Headers => "Message Headers",
                 SourceView::Html => "Message HTML",
@@ -5798,6 +7556,9 @@ impl MailApp {
             Modal::About => self.about_modal(),
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
+            Modal::DeleteFolder(id, name) => self.delete_folder_modal(id, name),
+            Modal::Erase(erase) => self.erase_modal(erase),
+            Modal::NewLabel(target) => self.new_label_modal(target),
             Modal::Original => self.original_modal(cx),
             Modal::AvatarPresets(id) => self.presets_modal(id, cx),
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
@@ -5814,6 +7575,9 @@ impl MailApp {
                 Modal::Help => 460.,
                 Modal::AvatarPresets(_) => 560.,
                 Modal::RemoveAccount(_)
+                | Modal::DeleteFolder(..)
+                | Modal::Erase(_)
+                | Modal::NewLabel(_)
                 | Modal::Reconnect(_)
                 | Modal::About
                 | Modal::AliasGone(..) => 400.,
@@ -5949,13 +7713,67 @@ impl MailApp {
                     )
                     .bg(rgb(c.danger)),
                 );
+        } else if let Modal::DeleteFolder(id, name) = modal {
+            let deleting = self.deleting_folders.contains(&(id.clone(), name.clone()));
+            footer = footer
+                .child(div().flex_1())
+                .child(self.button("delete-folder-cancel", "Cancel", "", Action::Close, false, cx))
+                .child(
+                    self.button(
+                        "delete-folder-confirm",
+                        if deleting { "Deleting…" } else { "Delete" },
+                        "",
+                        Action::ConfirmDeleteFolder(id.clone(), name.clone()),
+                        true,
+                        cx,
+                    )
+                    .bg(rgb(c.danger))
+                    .when(deleting, |d| d.opacity(0.7)),
+                );
+        } else if let Modal::Erase(erase) = modal {
+            footer = footer
+                .child(div().flex_1())
+                .child(self.button("erase-cancel", "Cancel", "", Action::Close, false, cx))
+                .child(
+                    self.button(
+                        "erase-confirm",
+                        match erase {
+                            Erase::Mail(_) => "Delete",
+                            Erase::Mailbox(_, Folder::Junk) => "Empty Spam",
+                            Erase::Mailbox(..) => "Empty Trash",
+                        },
+                        "",
+                        Action::ConfirmErase(erase.clone()),
+                        true,
+                        cx,
+                    )
+                    .bg(rgb(c.danger)),
+                );
+        } else if matches!(modal, Modal::NewLabel(_)) {
+            footer = footer
+                .child(div().flex_1())
+                .child(self.button("new-label-cancel", "Cancel", "", Action::Close, false, cx))
+                .child(self.button("new-label-save", "Add Label", "", Action::SaveLabel, true, cx));
         } else if let Modal::Reconnect(id) = modal {
-            footer = footer.child(div().flex_1()).child(self.button(
+            footer = footer.child(div().flex_1());
+            if self.sign_in_retry && !self.connecting {
+                footer = footer.child(self.button(
+                    "reconnect-retry",
+                    "Retry",
+                    "",
+                    Action::RetrySignIn,
+                    false,
+                    cx,
+                ));
+            }
+            footer = footer.child(self.button(
                 "reconnect-submit",
-                if self.connecting {
+                if !self.connecting {
+                    "Sign In"
+                } else if self.sign_in_step == SignInStep::Browser {
                     "Signing in…"
                 } else {
-                    "Sign In"
+                    self.sign_in_step.label()
                 },
                 "",
                 Action::SubmitReconnect(id.clone()),
@@ -6031,8 +7849,25 @@ impl Render for MailApp {
 impl MailApp {
     fn root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        // A drag only lasts while the button is held: a move without it
+        // means the release was missed, and the drag would otherwise stay,
+        // swallowing clicks, until the next one.
+        let this = cx.weak_entity();
+        let stray_drags = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture && cx.has_active_drag() && !e.dragging() {
+                        let _ = this.update(cx, |this, cx| this.cancel_stray_drag(window, cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
         div()
             .id("mail-app")
+            .child(stray_drags)
             .key_context("Mail")
             .track_focus(&self.focus)
             .size_full()
@@ -6092,7 +7927,11 @@ impl MailApp {
             }))
             .on_action(cx.listener(|this, _: &Reply, w, cx| this.new_compose(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleStar, w, cx| {
-                if let Some(id) = this.selected.clone() {
+                if this.modal.is_some() {
+                } else if !this.selection.is_empty() {
+                    let star = !this.selection_all(|m| m.starred);
+                    this.handle(Action::ApplySelection(Change::Star(star)), w, cx)
+                } else if let Some(id) = this.selected.clone() {
                     this.handle(Action::Star(id), w, cx)
                 }
             }))
@@ -6116,9 +7955,11 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &ReplyAll, w, cx| this.new_compose(2, w, cx)))
             .on_action(cx.listener(|this, _: &ForwardMail, w, cx| this.new_compose(3, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleRead, w, cx| {
-                if this.modal.is_none()
-                    && let Some(id) = this.selected.clone()
-                {
+                if this.modal.is_some() {
+                } else if !this.selection.is_empty() {
+                    let read = !this.selection_all(|m| !m.unread);
+                    this.handle(Action::ApplySelection(Change::Read(read)), w, cx)
+                } else if let Some(id) = this.selected.clone() {
                     this.handle(Action::Read(id), w, cx)
                 }
             }))
@@ -6188,8 +8029,15 @@ impl MailApp {
         // corners they touch; GPUI clips children only to rectangles.
         let corners = window::window_corners(window);
         let show_sidebar = !(single && self.selected.is_some() && width < px(480.));
-        let show_list = !single || self.selected.is_none();
-        let show_reader = !single || self.selected.is_some();
+        // Subscriptions list senders in the middle and one sender's mail
+        // (or a message of it) on the right.
+        let open = if self.subs_open {
+            self.subs_sender.is_some()
+        } else {
+            self.selected.is_some()
+        };
+        let show_list = !single || !open;
+        let show_reader = !single || open;
         let list_corners = Corners {
             bottom_left: if show_sidebar {
                 px(0.)
@@ -6240,12 +8088,28 @@ impl MailApp {
                         d.child(self.resize_handle(Pane::Reader, cx))
                     })
                     .when(show_reader, |d| {
-                        d.child(self.reader_pane(
-                            resizable.then_some(layout.reader),
-                            reader_corners,
-                            window,
-                            cx,
-                        ))
+                        d.child(if self.subs_open {
+                            // A collapsed reader still gives a sender's mail room.
+                            let room = if self.reader_collapsed {
+                                (f32::from(width) - layout.sidebar - LIST_MIN).max(panes::READER_MIN)
+                            } else {
+                                layout.reader
+                            };
+                            self.subscription_mail_pane(
+                                resizable.then_some(room),
+                                reader_corners,
+                                single,
+                                window,
+                                cx,
+                            )
+                        } else {
+                            self.reader_pane(
+                                resizable.then_some(layout.reader),
+                                reader_corners,
+                                window,
+                                cx,
+                            )
+                        })
                     }),
             )
             .when(self.modal.is_none() && !self.status.is_empty(), |d| {
@@ -6449,6 +8313,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "pin",
         "ban",
         "subscriptions",
+        "tag",
     ]
     .contains(&name)
     {
@@ -6462,6 +8327,22 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
             .size_full()
             .text_color(rgb(color)),
     )
+}
+/// The alias a sent message went out as: its icon and address.
+fn alias_tag(id: &str, alias: String, c: Colors) -> Stateful<Div> {
+    let tip = format!("Sent as {alias}");
+    let selector = id.to_owned();
+    div()
+        .id(SharedString::from(id.to_owned()))
+        .debug_selector(move || selector)
+        .flex()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .text_color(rgb(c.accent))
+        .child(icon_el("alias", 11., c.accent))
+        .child(div().min_w_0().truncate().child(alias))
+        .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
 }
 /// A message the server has that is not listed yet: the row's shape, so the
 /// list keeps its length and scrollbar while headers load.
@@ -7102,6 +8983,7 @@ mod tests {
                         name: "INBOX/Receipts".into(),
                         label: "Receipts".into(),
                         depth: 0,
+                        nestable: true,
                     }],
                 )
                 .unwrap();
@@ -7126,6 +9008,468 @@ mod tests {
         cx.debug_bounds(selector)
             .unwrap_or_else(|| panic!("{selector} was not rendered"))
             .center()
+    }
+
+    #[gpui::test]
+    fn only_server_folders_offer_deleting(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+        let labels = |mailbox: Mailbox, cx: &mut VisualTestContext| {
+            view.read_with(cx, |this, _| {
+                this.mailbox_entries(&id, mailbox)
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        Entry::Item { label, .. } => Some(label.to_string()),
+                        Entry::Separator => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let receipts = labels(Mailbox::Remote("INBOX/Receipts".into()), cx);
+        assert_eq!(receipts.last().map(String::as_str), Some("Delete Folder…"));
+        for standard in [Folder::Inbox, Folder::Sent, Folder::Trash] {
+            assert!(!labels(standard.into(), cx).contains(&"Delete Folder…".to_owned()));
+        }
+        // Choosing it asks in the app's own dialog; Cancel changes nothing.
+        act(&view, Action::DeleteRemoteFolder(id.clone(), "INBOX/Receipts".into()), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert!(
+                this.modal == Some(Modal::DeleteFolder(id.clone(), "INBOX/Receipts".into()))
+            )
+        });
+        for part in ["modal-panel", "delete-folder", "delete-folder-confirm", "delete-folder-cancel"] {
+            assert!(cx.debug_bounds(part).is_some(), "{part}");
+        }
+        act(&view, Action::Close, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.modal.is_none());
+            assert!(this.deleting_folders.is_empty());
+        });
+        // Standard folders don't open it.
+        act(&view, Action::DeleteRemoteFolder(id.clone(), "INBOX".into()), cx);
+        view.read_with(cx, |this, _| assert!(this.modal.is_none()));
+        // POP mailboxes have no folders on the server to delete.
+        view.update(cx, |this, _| this.accounts[0].provider = Provider::Pop3);
+        assert!(!labels(Mailbox::Remote("INBOX/Receipts".into()), cx)
+            .contains(&"Delete Folder…".to_owned()));
+    }
+
+    #[gpui::test]
+    fn server_folders_can_be_made_and_renamed(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+        let labels = |mailbox: Mailbox, cx: &mut VisualTestContext| {
+            view.read_with(cx, |this, _| {
+                this.mailbox_entries(&id, mailbox)
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        Entry::Item { label, .. } => Some(label.to_string()),
+                        Entry::Separator => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let has = |labels: &[String], label: &str| labels.iter().any(|l| l == label);
+        // The same entries as top folders: New Folder, Rename…, New Folder Inside.
+        assert!(has(&labels(Folder::Inbox.into(), cx), "New Folder"));
+        assert!(!has(&labels(Folder::Sent.into(), cx), "New Folder"));
+        let receipts = labels(Mailbox::Remote("INBOX/Receipts".into()), cx);
+        assert!(has(&receipts, "Rename…") && has(&receipts, "New Folder Inside"), "{receipts:?}");
+        // Renaming edits the name in place in the sidebar, with no dialog.
+        act(&view, Action::RenameRemoteFolder(id.clone(), "INBOX/Receipts".into()), cx);
+        frame(cx);
+        let rename = FolderEdit::Rename("INBOX/Receipts".into());
+        view.read_with(cx, |this, cx| {
+            assert!(this.modal.is_none());
+            assert!(this.editing_folder(&id, &rename));
+            assert_eq!(MailApp::value(&this.rename_input, cx), "Receipts");
+        });
+        assert!(cx.debug_bounds(Box::leak(format!("nav-{id}-remote:INBOX/Receipts").into_boxed_str())).is_some());
+        // Escape keeps the name; nothing goes to the server.
+        act(&view, Action::Close, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.folder_edit.is_none() && this.folder_saving.is_none());
+            assert!(this.tree_ui.renaming.is_none());
+        });
+        // A new folder appears in place as "New Folder", its name selected.
+        view.update(cx, |this, _| this.collapsed.insert(format!("folders:{id}")));
+        act(&view, Action::NewRemoteFolder(id.clone(), None), cx);
+        frame(cx);
+        view.read_with(cx, |this, cx| {
+            assert!(this.modal.is_none());
+            assert!(this.editing_folder(&id, &FolderEdit::New(None)));
+            assert_eq!(MailApp::value(&this.rename_input, cx), "New Folder");
+            // Its folders opened to show it.
+            assert!(!this.collapsed.contains(&format!("folders:{id}")));
+        });
+        assert!(cx.debug_bounds(Box::leak(format!("new-folder-{id}").into_boxed_str())).is_some());
+        // Enter makes it on the server; the row shows the name meanwhile.
+        view.update_in(cx, |this, w, cx| {
+            MailApp::set(&this.rename_input, "Travel", w, cx);
+            this.commit_rename(w, cx);
+            assert_eq!(
+                this.folder_saving,
+                Some((id.clone(), FolderEdit::New(None), "Travel".into()))
+            );
+            assert!(this.tree_ui.renaming.is_none());
+        });
+        frame(cx);
+        assert!(cx.debug_bounds(Box::leak(format!("new-folder-{id}").into_boxed_str())).is_some());
+        // This account has no server here: the attempt ends, and says why.
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            assert!(this.folder_saving.is_none());
+            assert!(this.error && this.status.contains("Couldn't create the folder"));
+        });
+        // Escape on a new folder still makes it, with its starting name, as
+        // a top folder made with New Folder stays.
+        view.update_in(cx, |this, w, cx| {
+            this.handle(Action::NewRemoteFolder(id.clone(), Some("INBOX/Receipts".into())), w, cx);
+            assert!(this.editing_folder(&id, &FolderEdit::New(Some("INBOX/Receipts".into()))));
+            this.handle(Action::Close, w, cx);
+            assert_eq!(
+                this.folder_saving,
+                Some((id.clone(), FolderEdit::New(Some("INBOX/Receipts".into())), "New Folder".into()))
+            );
+        });
+        cx.run_until_parked();
+        // A new folder's row is where it stays: at the end of its level,
+        // like a top folder's, not where its name sorts.
+        let names = |this: &MailApp| -> Vec<String> {
+            this.ordered_folders(&id).into_iter().map(|f| f.name).collect()
+        };
+        let folder = |name: &str| RemoteFolder {
+            name: name.into(),
+            label: name.rsplit('/').next().unwrap().into(),
+            depth: 0,
+            nestable: true,
+        };
+        view.update_in(cx, |this, w, cx| {
+            this.folders.get_mut(&id).unwrap().push(folder("INBOX/Zebra"));
+            this.handle(Action::NewRemoteFolder(id.clone(), None), w, cx);
+            let rows = this.folder_rows(&id);
+            assert!(matches!(rows.last(), Some(tree::FolderRow::New { parent: None, depth: 0 })));
+            this.cancel_rename(w, cx);
+            // The server made "Aardvark", which sorts first; it stays last.
+            let change = crate::manage::backend::FolderChange {
+                folders: vec![folder("INBOX/Receipts"), folder("INBOX/Zebra"), folder("INBOX/Aardvark")],
+                moved: vec![],
+            };
+            this.place_folders(&id, &FolderEdit::New(None), &change);
+            this.folders.insert(id.clone(), change.folders);
+            this.folder_saving = None;
+            assert_eq!(names(this), ["INBOX/Receipts", "INBOX/Zebra", "INBOX/Aardvark"]);
+            // Renamed, a folder keeps its place.
+            let change = crate::manage::backend::FolderChange {
+                folders: vec![folder("INBOX/Zzz"), folder("INBOX/Zebra"), folder("INBOX/Aardvark")],
+                moved: vec![("INBOX/Receipts".into(), "INBOX/Zzz".into())],
+            };
+            this.place_folders(&id, &FolderEdit::Rename("INBOX/Receipts".into()), &change);
+            this.folders.insert(id.clone(), change.folders);
+            assert_eq!(names(this), ["INBOX/Zzz", "INBOX/Zebra", "INBOX/Aardvark"]);
+            // And it's remembered.
+            let saved = this.backend.store.preference(&format!("folder_order:{id}")).unwrap();
+            assert_eq!(saved, r#"["INBOX/Zzz","INBOX/Zebra","INBOX/Aardvark"]"#);
+        });
+        // Standard folders can't be renamed.
+        act(&view, Action::RenameRemoteFolder(id.clone(), "INBOX".into()), cx);
+        view.read_with(cx, |this, _| assert!(this.folder_edit.is_none()));
+        // POP mailboxes have no folders on the server.
+        view.update(cx, |this, _| this.accounts[0].provider = Provider::Pop3);
+        assert!(!has(&labels(Folder::Inbox.into(), cx), "New Folder"));
+        assert!(!has(&labels(Mailbox::Remote("INBOX/Receipts".into()), cx), "Rename…"));
+        act(&view, Action::NewRemoteFolder(id.clone(), None), cx);
+        view.read_with(cx, |this, _| assert!(this.folder_edit.is_none()));
+    }
+
+    #[gpui::test]
+    fn mail_moves_into_server_folders_from_menus(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let (work, home) =
+            view.read_with(cx, |this, _| (this.accounts[0].id.clone(), this.accounts[1].id.clone()));
+        let mail = |id: &str, account: &str, mailbox: Mailbox| {
+            let mut m = Mail {
+                id: id.into(),
+                account: account.into(),
+                from: "news@example.com".into(),
+                ..Mail::default()
+            };
+            m.folder = mailbox.folder();
+            if let Mailbox::Remote(name) = mailbox {
+                m.remote_folder = name;
+            }
+            m
+        };
+        view.update(cx, |this, _| {
+            this.folders.get_mut(&work).unwrap().push(RemoteFolder {
+                name: "INBOX/Receipts/2026".into(),
+                label: "2026".into(),
+                depth: 1,
+                nestable: true,
+            });
+            this.messages = vec![
+                mail("w1", &work, Folder::Inbox.into()),
+                mail("w2", &work, Folder::Inbox.into()),
+                mail("w3", &work, Mailbox::Remote("INBOX/Receipts".into())),
+                mail("h1", &home, Folder::Inbox.into()),
+            ];
+        });
+        let labels = |entries: Vec<Entry>| -> Vec<String> {
+            entries
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    Entry::Separator => None,
+                })
+                .collect()
+        };
+        let has = |labels: &[String], label: &str| labels.iter().any(|l| l == label);
+        view.read_with(cx, |this, _| {
+            // One message: its menu offers the folders, nested as in the sidebar.
+            assert!(has(&labels(this.mail_entries("w1")), "Move to Folder…"));
+            let target = MoveTarget::Mail(vec!["w1".into()]);
+            assert_eq!(
+                labels(this.move_folder_entries(&target)),
+                ["Receipts", "\u{2003}2026"]
+            );
+            match &this.move_folder_entries(&target)[0] {
+                Entry::Item {
+                    action: Action::Apply(ids, change),
+                    ..
+                } => {
+                    assert_eq!(ids, &["w1".to_owned()]);
+                    assert_eq!(change, &Change::MoveTo("INBOX/Receipts".into()));
+                }
+                _ => panic!("not a move"),
+            }
+            // Not the folder it is already in.
+            let inside = MoveTarget::Mail(vec!["w3".into()]);
+            assert_eq!(labels(this.move_folder_entries(&inside)), ["\u{2003}2026"]);
+            // The other account has its own folders.
+            assert!(has(&labels(this.mail_entries("h1")), "Move to Folder…"));
+            // A subscription's mail moves all at once.
+            let sub = MailSubscription {
+                account: work.clone(),
+                address: "news@example.com".into(),
+                ..MailSubscription::default()
+            };
+            let entries = labels(this.subscription_entries(&sub));
+            assert_eq!(entries.last().map(String::as_str), Some("Move All to Folder…"));
+            match &this.move_folder_entries(&MoveTarget::Subscription(Box::new(sub.clone())))[0] {
+                Entry::Item {
+                    action: Action::ChangeSubscription(s, change),
+                    ..
+                } => {
+                    assert_eq!(s.as_ref(), &sub);
+                    assert_eq!(change, &Change::MoveTo("INBOX/Receipts".into()));
+                }
+                _ => panic!("not a move"),
+            }
+        });
+        // Several selected messages from one account move together.
+        view.update(cx, |this, _| {
+            this.selection = ["w1".to_owned(), "w2".to_owned()].into_iter().collect();
+        });
+        view.read_with(cx, |this, _| {
+            assert!(has(&labels(this.mail_entries("w1")), "Move 2 to Folder…"));
+            assert!(matches!(
+                &this.move_folder_entries(&MoveTarget::Selection)[0],
+                Entry::Item { action: Action::ApplySelection(Change::MoveTo(_)), .. }
+            ));
+        });
+        // Folders belong to one account: a selection across two has none.
+        view.update(cx, |this, _| {
+            this.selection = ["w1".to_owned(), "h1".to_owned()].into_iter().collect();
+        });
+        view.read_with(cx, |this, _| {
+            assert!(!has(&labels(this.mail_entries("w1")), "Move 2 to Folder…"));
+            assert!(this.move_folder_entries(&MoveTarget::Selection).is_empty());
+        });
+        // Choosing a folder moves the message out of the list at once.
+        view.update(cx, |this, _| this.selection.clear());
+        act(
+            &view,
+            Action::Apply(vec!["w1".into()], Change::MoveTo("INBOX/Receipts".into())),
+            cx,
+        );
+        view.read_with(cx, |this, _| assert!(!this.messages.iter().any(|m| m.id == "w1")));
+        // POP mailboxes have no server folders.
+        view.update(cx, |this, _| this.accounts[0].provider = Provider::Pop3);
+        view.read_with(cx, |this, _| {
+            assert!(!has(&labels(this.mail_entries("w2")), "Move to Folder…"));
+        });
+    }
+
+    #[gpui::test]
+    fn trash_labels_and_account_sending_settings(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let (work, home) =
+            view.read_with(cx, |this, _| (this.accounts[0].id.clone(), this.accounts[1].id.clone()));
+        let mail = |id: &str, account: &str, folder: Folder, labels: &[&str]| Mail {
+            id: id.into(),
+            account: account.into(),
+            folder,
+            labels: labels.iter().map(|l| (*l).into()).collect(),
+            ..Mail::default()
+        };
+        view.update(cx, |this, cx| {
+            // Not this view's mail: nothing reloads it from the cache.
+            this.load_generation += 1;
+            this.messages = vec![
+                mail("t1", &work, Folder::Trash, &["Work"]),
+                mail("t2", &work, Folder::Trash, &[]),
+                mail("i1", &work, Folder::Inbox, &["Work", "Later"]),
+                mail("h1", &home, Folder::Trash, &[]),
+            ];
+            this.filter(cx);
+        });
+        let labels = |entries: Vec<Entry>| -> Vec<(String, bool)> {
+            entries
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, checked, .. } => Some((label.to_string(), checked)),
+                    Entry::Separator => None,
+                })
+                .collect()
+        };
+        let names = |entries: Vec<Entry>| -> Vec<String> {
+            labels(entries).into_iter().map(|(l, _)| l).collect()
+        };
+        view.read_with(cx, |this, _| {
+            // Mail in Trash can be deleted for good; mail elsewhere can't.
+            assert!(names(this.mail_entries("t1")).contains(&"Delete Permanently…".to_owned()));
+            assert!(!names(this.mail_entries("i1")).contains(&"Delete Permanently…".to_owned()));
+            // Trash and Spam can be emptied.
+            assert!(names(this.mailbox_entries(&work, Folder::Trash.into())).contains(&"Empty Trash…".to_owned()));
+            assert!(names(this.mailbox_entries(&work, Folder::Junk.into())).contains(&"Empty Spam…".to_owned()));
+            assert!(!names(this.mailbox_entries(&work, Folder::Inbox.into())).iter().any(|l| l.starts_with("Empty")));
+            // Labels in use are offered, checked where the message has them.
+            assert!(names(this.mail_entries("i1")).contains(&"Labels…".to_owned()));
+            let picker = labels(this.label_entries(&MoveTarget::Mail(vec!["t1".into()])));
+            assert!(picker.contains(&("Work".to_owned(), true)), "{picker:?}");
+            assert!(picker.contains(&("New Label…".to_owned(), false)));
+        });
+        // Several selected messages in Trash.
+        view.update(cx, |this, _| {
+            this.selection = ["t1".to_owned(), "t2".to_owned()].into_iter().collect();
+        });
+        view.read_with(cx, |this, _| {
+            let menu = names(this.mail_entries("t1"));
+            assert!(menu.contains(&"Delete 2 Permanently…".to_owned()), "{menu:?}");
+            assert!(menu.contains(&"Label 2…".to_owned()));
+        });
+        // Deleting asks first, in the app's own dialog.
+        act(&view, Action::DeleteForever(vec!["t1".into()]), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.modal == Some(Modal::Erase(Erase::Mail(vec!["t1".into()]))));
+        });
+        for part in ["erase", "erase-confirm", "erase-cancel"] {
+            assert!(cx.debug_bounds(part).is_some(), "{part}");
+        }
+        act(&view, Action::Close, cx);
+        act(&view, Action::EmptyMailbox(work.clone(), Folder::Trash), cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.modal == Some(Modal::Erase(Erase::Mailbox(work.clone(), Folder::Trash))));
+        });
+        act(&view, Action::Close, cx);
+        // A new label is named in a dialog; names keywords can't hold are refused there.
+        view.update(cx, |this, _| this.selection.clear());
+        act(&view, Action::NewLabel(MoveTarget::Mail(vec!["i1".into()])), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("new-label-name").is_some());
+        view.update_in(cx, |this, w, cx| {
+            MailApp::set(&this.label_input, "two words", w, cx);
+            this.handle(Action::SaveLabel, w, cx);
+            assert!(this.error);
+            assert!(matches!(this.modal, Some(Modal::NewLabel(_))));
+            MailApp::set(&this.label_input, "Urgent", w, cx);
+            this.handle(Action::SaveLabel, w, cx);
+            assert!(this.modal.is_none());
+            let m = this.messages.iter().find(|m| m.id == "i1").unwrap();
+            assert!(m.labels.contains(&"Urgent".to_owned()));
+        });
+        // The account page has the sign-in name, Reply-To and receipts.
+        act(&view, Action::AccountSettings(work.clone()), cx);
+        frame(cx);
+        for part in ["account-login", "account-reply-to", "account-storage"] {
+            assert!(cx.debug_bounds(part).is_some(), "{part}");
+        }
+        // The receipts switches sit inside the page, their captions wrapping.
+        let page = cx.debug_bounds("settings-page").unwrap();
+        for kind in ["read", "delivery"] {
+            let selector: &'static str = Box::leak(format!("{kind}-receipts-{work}").into_boxed_str());
+            let switch = cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector}"));
+            assert!(
+                switch.left() >= page.left() && switch.right() <= page.right(),
+                "{kind} receipts switch {switch:?} outside the page {page:?}"
+            );
+            assert!(switch.size.width >= px(38.), "{switch:?}");
+        }
+        view.update_in(cx, |this, w, cx| {
+            // Typed, so the field has focus.
+            this.login_input.read(cx).focus_handle(cx).focus(w);
+            MailApp::set(&this.login_input, "work-user", w, cx);
+        });
+        frame(cx);
+        // Typing alone changes nothing: each change would sign out.
+        view.read_with(cx, |this, _| {
+            let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+            assert_ne!(a.login(), "work-user");
+        });
+        // Enter applies it.
+        view.update(cx, |this, cx| {
+            this.login_input
+                .update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
+        });
+        view.update_in(cx, |this, w, cx| {
+            MailApp::set(&this.reply_to_input, "desk@example.com", w, cx);
+            this.handle(Action::ToggleReadReceipts(work.clone()), w, cx);
+        });
+        view.read_with(cx, |this, _| {
+            let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+            assert_eq!(a.login(), "work-user");
+            assert_eq!(a.reply_to, "desk@example.com");
+            assert!(a.read_receipts && !a.delivery_receipts);
+            let saved = this.backend.store.accounts().unwrap();
+            let saved = saved.iter().find(|s| s.id == work).unwrap();
+            assert_eq!(saved.username, "work-user");
+            assert!(saved.read_receipts);
+        });
+        // Left unfinished, what was typed stays in the field (the page
+        // refreshes fields from the account it shows), and applies once
+        // typing has paused.
+        view.update_in(cx, |this, w, cx| {
+            this.login_input.read(cx).focus_handle(cx).focus(w);
+            MailApp::set(&this.login_input, "work-user2", w, cx);
+        });
+        frame(cx);
+        view.update_in(cx, |this, w, _| this.focus.focus(w));
+        frame(cx);
+        view.read_with(cx, |this, cx| {
+            assert_eq!(MailApp::value(&this.login_input, cx), "work-user2");
+            let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+            assert_eq!(a.login(), "work-user");
+        });
+        cx.executor().advance_clock(LOGIN_PAUSE);
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+            assert_eq!(a.login(), "work-user2");
+        });
+        // POP mailboxes: deleting for good, but no labels.
+        view.update(cx, |this, cx| {
+            this.accounts[0].provider = Provider::Pop3;
+            this.load_generation += 1;
+            this.messages = vec![mail("t2", &work, Folder::Trash, &[])];
+            this.filter(cx);
+        });
+        view.read_with(cx, |this, _| {
+            let menu = names(this.mail_entries("t2"));
+            assert!(menu.contains(&"Delete Permanently…".to_owned()));
+            assert!(!menu.contains(&"Labels…".to_owned()));
+        });
     }
 
     #[gpui::test]
@@ -7226,6 +9570,48 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_setting_that_cannot_be_saved_says_so_and_is_put_back(cx: &mut TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        store.fail_preference_writes_for_test();
+        let before = view.read_with(cx, |this, _| this.reading_defaults);
+        let changed = ReadingOptions {
+            html: !before.html,
+            ..before
+        };
+        act(&view, Action::SetReadingDefaults(changed), cx);
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            assert!(this.error, "an error is shown: {}", this.status);
+            assert!(this.status.contains("Couldn't save"), "{}", this.status);
+            assert_eq!(this.reading_defaults, before, "the old setting is back");
+        });
+    }
+
+    #[gpui::test]
+    fn a_drag_whose_release_was_missed_ends_on_the_next_move(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let first = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+        let from = center(cx, Box::leak(format!("account-{first}").into_boxed_str()));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        for i in 1..=4 {
+            let at = point(from.x, from.y + px(10. * i as f32));
+            cx.simulate_mouse_move(at, MouseButton::Left, Modifiers::none());
+        }
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "dragging while held"));
+        // The release never arrives; the pointer moves on with no button.
+        cx.simulate_event(MouseMoveEvent {
+            position: point(from.x + px(40.), from.y + px(60.)),
+            pressed_button: None,
+            modifiers: Modifiers::none(),
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!cx.has_active_drag(), "the drag ended"));
+        view.read_with(cx, |this, _| {
+            assert!(this.tree_ui.dragging.is_none() && this.tree_ui.drop_at.is_none());
+        });
+    }
+
+    #[gpui::test]
     fn sidebar_folders_hold_dragged_accounts(cx: &mut TestAppContext) {
         let (view, cx, store) = two_accounts(cx);
         let (first, second) = view.read_with(cx, |this, _| {
@@ -7301,8 +9687,204 @@ mod tests {
         act(&view, Action::DeleteFolder(folder.clone()), cx);
         view.read_with(cx, |this, _| {
             assert!(tree::find(&this.tree, &folder).is_none());
-            assert_eq!(tree::account_order(&this.tree), [second, first]);
+            assert_eq!(tree::account_order(&this.tree), [second.clone(), first.clone()]);
         });
+        // Settings lists the mailboxes in the sidebar's order, though they
+        // were added the other way round.
+        act(&view, Action::Settings, cx);
+        frame(cx);
+        frame(cx);
+        let top = |cx: &mut VisualTestContext, id: &str| {
+            cx.debug_bounds(Box::leak(format!("settings-account-{id}").into_boxed_str()))
+                .expect("listed in Settings")
+                .top()
+        };
+        assert!(top(cx, &second) < top(cx, &first));
+    }
+
+    #[gpui::test]
+    fn links_lose_their_tracking_until_turned_off(cx: &mut TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        let id = view.update(cx, |this, _| {
+            assert!(this.clean_links, "on by default");
+            let m = &mut this.messages[0];
+            m.html = None;
+            m.body = Some("Order: https://shop.example/o?id=7&utm_source=mail&fbclid=x".into());
+            m.id.clone()
+        });
+        act(&view, Action::Select(id.clone()), cx);
+        let body = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |this, _| {
+                let m = this.messages.iter().find(|m| m.id == id).unwrap();
+                this.plain_body(m).0.to_string()
+            })
+        };
+        let shown = body(&view, cx);
+        assert!(shown.contains("/o?id=7"), "{shown}");
+        assert!(!shown.contains("utm_source") && !shown.contains("fbclid"), "{shown}");
+        // Settings → Reading turns it off, and it stays off.
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Reading), cx);
+        frame(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("clean-links").is_some());
+        act(&view, Action::SetCleanLinks(false), cx);
+        assert!(body(&view, cx).contains("utm"));
+        cx.run_until_parked();
+        store.flush();
+        assert_eq!(store.preference("clean_links").as_deref(), Some("false"));
+    }
+
+    #[gpui::test]
+    fn an_empty_all_mail_says_it_is_still_fetching(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        // A test window alternates between two frames; draw both.
+        let redraw = |cx: &mut VisualTestContext| {
+            frame(cx);
+            frame(cx);
+        };
+        // All Mail's spam is empty in the cache; both accounts are asked.
+        view.update_in(cx, |this, w, cx| {
+            this.open_mailbox(Some(ALL_MAIL.into()), Folder::Junk.into(), w, cx)
+        });
+        // Let the real syncs it starts (on other threads) finish first, so
+        // none lands in the middle of the states set below.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let idle = view.read_with(cx, |this, _| {
+                !this.cache_loading
+                    && this.sync_requests.is_empty()
+                    && this.retrying.is_empty()
+                    && this.cataloging.is_empty()
+                    && this.busy == 0
+            });
+            if idle {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (ids, key) = view.read_with(cx, |this, _| {
+            assert!(this.visible.is_empty());
+            let ids: Vec<String> = this.accounts.iter().map(|a| a.id.clone()).collect();
+            (ids, this.mailbox().key())
+        });
+        // One account still being fetched: the list says so, not "No mail".
+        view.update(cx, |this, cx| {
+            this.account_issues.clear();
+            this.sync_requests.insert((ids[1].clone(), key.clone()));
+            cx.notify();
+        });
+        redraw(cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.mailbox_loading());
+            assert_eq!(this.fetching_accounts().len(), 1);
+            assert!(this.checking_server());
+        });
+        assert!(cx.debug_bounds("empty-list-detail").is_some());
+        // (Test frames keep the bounds of elements drawn before, as the
+        // Refresh button may have been while the real syncs failed.)
+        // Done, but that account failed: it says which, with a way to retry.
+        view.update(cx, |this, cx| {
+            this.sync_requests.clear();
+            this.account_result::<()>(
+                &ids[1],
+                IssueSource::Sync(key.clone()),
+                &Err(anyhow::anyhow!("connection reset")),
+            );
+            cx.notify();
+        });
+        redraw(cx);
+        view.read_with(cx, |this, _| {
+            assert!(!this.mailbox_loading());
+            assert_eq!(this.unreachable_accounts().len(), 1);
+        });
+        assert!(cx.debug_bounds("empty-list-retry").is_some());
+        // Every account answered with nothing: it is simply empty.
+        view.update(cx, |this, cx| {
+            this.account_issues.clear();
+            cx.notify();
+        });
+        // (Test frames keep the bounds of elements drawn before, so this
+        // checks the state the list is drawn from.)
+        view.read_with(cx, |this, _| {
+            assert!(!this.mailbox_loading());
+            assert!(this.unreachable_accounts().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn select_button_summary_and_sender_searches(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        // The list's Select button shows the checkboxes before anything is picked.
+        frame(cx);
+        assert!(cx.debug_bounds("select-toggle").is_some());
+        act(&view, Action::ToggleSelectMode, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.selecting);
+            assert!(this.selection.is_empty());
+        });
+        frame(cx);
+        assert!(cx.debug_bounds("select-all").is_some());
+        assert!(cx.debug_bounds("bulk-archive").is_none(), "no tools for nothing");
+        // A plain click picks rather than opens.
+        let (a, b) = view.read_with(cx, |this, _| {
+            (this.messages[1].id.clone(), this.messages[2].id.clone())
+        });
+        for id in [&a, &b] {
+            let at = center(cx, Box::leak(format!("row-{id}").into_boxed_str()));
+            cx.simulate_click(at, Modifiers::none());
+        }
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.selection.len(), 2);
+            assert!(this.selected.is_none());
+        });
+        // The reader sums the selection up and acts on all of it.
+        frame(cx);
+        assert!(cx.debug_bounds("selection-summary").is_some());
+        assert!(cx.debug_bounds("summary-star").is_some());
+        act(&view, Action::ToggleSelectMode, cx);
+        view.read_with(cx, |this, _| {
+            assert!(!this.selecting);
+            assert!(this.selection.is_empty());
+        });
+        // Every listed message from one sender, at once.
+        let (row, from, total) = view.read_with(cx, |this, _| {
+            let m = &this.messages[0];
+            let total = this.messages.iter().filter(|o| o.from == m.from).count();
+            (m.id.clone(), m.from.clone(), total)
+        });
+        act(&view, Action::SelectFromSender(row.clone()), cx);
+        view.read_with(cx, |this, _| assert_eq!(this.selection.len(), total));
+        act(&view, Action::StopSelecting, cx);
+        // The menu searches by sender, and by Reply-To where it differs.
+        view.update(cx, |this, cx| {
+            this.messages[0].reply_to = "List <replies@lists.example>".into();
+            this.apply_filter(cx);
+        });
+        let labels = view.read_with(cx, |this, _| {
+            this.mail_entries(&row)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(labels.iter().any(|l| l == "Show Mail From Sender"));
+        assert!(labels.iter().any(|l| l == "Show Mail With This Reply-To"));
+        act(&view, Action::SearchFor("reply-to:replies@lists.example".into()), cx);
+        view.read_with(cx, |this, cx| {
+            assert!(this.search_open);
+            assert_eq!(MailApp::value(&this.search, cx), "reply-to:replies@lists.example");
+            assert_eq!(this.visible.len(), 1);
+            assert_eq!(this.messages[this.visible[0]].id, row);
+        });
+        act(&view, Action::SearchFor(format!("from:{from}")), cx);
+        view.read_with(cx, |this, _| assert_eq!(this.visible.len(), total));
+        // Hints show while the search is empty.
+        act(&view, Action::SearchFor(String::new()), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("search-hint-reply-to:").is_some());
     }
 
     #[gpui::test]

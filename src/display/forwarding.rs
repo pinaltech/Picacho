@@ -4,7 +4,7 @@
 //! toolbar (where its mail goes, search, New Alias) above its aliases.
 //! An alias row shows its address, a few status pills and its switch; the
 //! rest is in its menu. SimpleLogin aliases can list their reverse
-//! aliases, which are shown partly hidden.
+//! aliases, which are shown fully hidden, with how much mail each has had.
 use super::*;
 use crate::manage::forwarding::{Alias, ReverseAlias};
 
@@ -48,6 +48,10 @@ pub(super) struct ContactRow {
     title: SharedString,
     hidden: SharedString,
     when: SharedString,
+    /// "Received 3 (14d) · 12 total" and the same for sent; empty when
+    /// the alias's activity couldn't be read.
+    received: SharedString,
+    sent: SharedString,
     /// The contact's address, lowercase. The reverse alias is not
     /// searched, so a search can't reveal it either.
     search: String,
@@ -66,9 +70,27 @@ impl ContactRow {
                 .map(|ts| format!("Last written {}", date_short(ts)))
                 .unwrap_or_default()
                 .into(),
+            received: Self::count("Received", contact.stats.map(|s| {
+                (s.received_recent, s.received, s.partial)
+            })),
+            sent: Self::count("Sent", contact.stats.map(|s| (s.sent_recent, s.sent, s.partial))),
             search: contact.contact.to_lowercase(),
             contact,
         }
+    }
+    /// "Received 3 (14d) · 12 total", with a "+" when not all of the
+    /// alias's activity could be read.
+    fn count(what: &str, counts: Option<(u64, u64, bool)>) -> SharedString {
+        counts
+            .map(|(recent, total, partial)| {
+                format!(
+                    "{what} {recent} ({}d) · {total}{} total",
+                    fwd::CONTACT_RECENT_DAYS,
+                    if partial { "+" } else { "" }
+                )
+            })
+            .unwrap_or_default()
+            .into()
     }
 }
 /// An alias's reverse aliases: most recently written first, and which of
@@ -98,7 +120,15 @@ impl Contacts {
             .collect();
     }
     /// A contact just made (or found), listed first.
-    fn add(&mut self, contact: ReverseAlias, query: &str) {
+    fn add(&mut self, mut contact: ReverseAlias, query: &str) {
+        // One found rather than made keeps the mail already counted.
+        if contact.stats.is_none() {
+            contact.stats = self
+                .rows
+                .iter()
+                .find(|r| r.contact.id == contact.id || r.contact.address == contact.address)
+                .and_then(|r| r.contact.stats);
+        }
         self.rows
             .retain(|r| r.contact.id != contact.id && r.contact.address != contact.address);
         self.rows.insert(0, ContactRow::new(contact));
@@ -674,6 +704,62 @@ impl MailApp {
                 )
                 .h(px(28.))
             });
+        // Keeping the mailboxes to their aliases: they don't write as
+        // themselves, and show the alias used where their address was.
+        let protected: Vec<String> = fwd::forwards_to(f, &self.accounts)
+            .iter()
+            .filter_map(|id| self.accounts.iter().find(|a| &a.id == id))
+            .map(|a| a.email.clone())
+            .collect();
+        let aliases_only = f.service.can_send().then(|| {
+            let mailboxes = if protected.is_empty() {
+                "No mailbox here receives its aliases yet; choose one in Forwards to.".to_owned()
+            } else {
+                format!(
+                    "{} can't write as {}: new mail and replies go out as an alias, and the alias used is shown wherever its address was, in received and sent mail.",
+                    protected.join(", "),
+                    if protected.len() > 1 { "themselves" } else { "itself" }
+                )
+            };
+            div()
+                .px_4()
+                .pb_3()
+                .flex()
+                .items_start()
+                .gap_3()
+                .child(
+                    self.switch(
+                        format!("aliases-only-{}", f.id),
+                        f.aliases_only,
+                        Action::SetAliasesOnly(f.id.clone(), !f.aliases_only),
+                        cx,
+                    )
+                    .debug_selector({
+                        let id = f.id.clone();
+                        move || format!("aliases-only-{id}")
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Send only as aliases"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(mailboxes),
+                        ),
+                )
+        });
         div()
             .border_t_1()
             .border_color(rgb(c.border))
@@ -681,6 +767,7 @@ impl MailApp {
             .flex()
             .flex_col()
             .child(toolbar)
+            .children(aliases_only)
             .when(creating, |d| {
                 d.child(div().px_4().pb_3().child(self.alias_form(f, busy, cx)))
             })
@@ -1413,8 +1500,8 @@ impl MailApp {
             ).px_0())
         })
     }
-    /// One contact, at the list's fixed row height. Its reverse alias is
-    /// never shown in full; it can be copied.
+    /// One contact, at the list's fixed row height, with how much mail it
+    /// has had. Its reverse alias is never shown; it can be copied.
     fn contact_row(
         &self,
         key: &str,
@@ -1467,6 +1554,21 @@ impl MailApp {
                             }),
                     ),
             )
+            .when(!row.received.is_empty(), |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "reverse-stats".into())
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap(px(2.))
+                        .text_size(px(11.))
+                        .text_color(rgb(c.muted))
+                        .child(row.received.clone())
+                        .child(row.sent.clone()),
+                )
+            })
             .child(self.fwd_icon_button(
                 format!("reverse-copy-{key}-{index}"),
                 "copy",
@@ -1522,11 +1624,21 @@ impl MailApp {
         }
         self.task(
             cx,
-            move |_| fwd::reverse_aliases(&account, &a),
+            move |b| {
+                let list = fwd::reverse_aliases(&account, &a)?;
+                // Mail sent to these went out as the alias.
+                let _ = fwd::remember_routes(
+                    &b.store,
+                    &a.email,
+                    list.iter().map(|r| r.address.clone()),
+                );
+                Ok(list)
+            },
             move |this, result, cx| {
                 this.fwd_busy.remove(&busy);
                 match result {
                     Ok(list) => {
+                        this.alias_routes = fwd::routes(&this.backend.store);
                         let query = if this.fwd_reverse.as_deref() == Some(key.as_str()) {
                             Self::value(&this.fwd_contact_search, cx)
                         } else {
@@ -1973,7 +2085,7 @@ impl MailApp {
             ),
             Entry::Separator,
         ];
-        entries.extend(self.accounts.iter().map(|a| {
+        entries.extend(tree::sidebar_ordered(&self.tree, &self.accounts).into_iter().map(|(_, a)| {
             checked(
                 a.email.clone(),
                 current.as_deref() == Some(a.id.as_str()),

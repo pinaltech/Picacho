@@ -4,11 +4,20 @@ How to bring Pinal's zero-access storage (the Zero-Access Storage and Access Spe
 "the spec") to Pinal Mail: Picacho Server (`Pinal Technologies/Picacho Mail/`,
 crate `picacho-server`) and this app (the GPUI mail client).
 
-**Status (2026-11-25):** not implemented in Picacho yet, by design: Pinal
-Accounts, Pinal Photos and Mitten have it. Pinal Mail is listed in the
-Privacy tab of accounts.pinal.tech as *coming soon* and stays readable by the
-server until the work below ships. Everything Picacho needs from Pinal
-Accounts already exists and is in production (see [What's already there](#whats-already-there)).
+**Status (2026-11-26):** Picacho **Server** has it (`Picacho Mail/src/za.rs`,
+pinaltech/Picacho-Server): sealing on arrival, migration of existing mail,
+Private-mode refusals, Open mode with app passwords (§4.1–4.5, §4.7). Still to
+do on the server: the ciphertext REST routes for the app (§4.3 table),
+`/za/send` (§4.6) and calendars/contacts. **This app** (§5) is not started:
+until it is, a person with Mail in Private mode reads mail nowhere, which the
+Privacy tab says before they choose it. Mail is opt-in (`ZA_AUTO_SERVICES`
+leaves it out), so nobody is switched over without choosing.
+
+Differences from the plan below, as built: content keys are sealed to the
+mail **service** key (no per-mailbox folder keys yet), bound to the blob key;
+the sealed key is in both the blob header (`PZM1`) and the row
+(`za1:<account>:<version>:<ek>:<index>` in `envelope`), so copies and moves
+need no resealing.
 
 ---
 

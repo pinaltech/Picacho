@@ -158,7 +158,9 @@ fn capable_server_extensions_are_used() -> Result<()> {
                     compressed += 1;
                     continue;
                 } else if upper.starts_with("LIST") {
-                    assert_eq!(command, "LIST \"\" \"*\" RETURN (SPECIAL-USE)");
+                    // SPECIAL-USE's attributes come in the plain listing;
+                    // RETURN needs LIST-EXTENDED, which this server lacks.
+                    assert_eq!(command, "LIST \"\" *");
                     p.send("* LIST (\\HasChildren) \".\" INBOX\r\n");
                     p.send("* LIST (\\Sent) \".\" \"INBOX.Sent\"\r\n");
                     p.send("* LIST () \".\" \"INBOX.Receipts\"\r\n");
@@ -173,6 +175,13 @@ fn capable_server_extensions_are_used() -> Result<()> {
                 } else if upper.starts_with("CREATE") || upper.starts_with("SUBSCRIBE") {
                 } else if upper == "GETQUOTAROOT INBOX" {
                     p.send("* QUOTAROOT INBOX \"\"\r\n* QUOTA \"\" (STORAGE 512 2048)\r\n");
+                } else if upper == "GETQUOTAROOT \"ARCHIVE\"" {
+                    // The archive has a root of its own, fuller than the
+                    // inbox's: that one shows.
+                    p.send("* QUOTAROOT Archive \"archive\"\r\n* QUOTA \"archive\" (STORAGE 900 1000)\r\n");
+                } else if upper == "GETQUOTAROOT \"INBOX.SENT\"" {
+                    p.send(&format!("{tag} NO no quota root\r\n"));
+                    continue;
                 } else if upper == "LOGOUT" {
                     p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
                     break 'connections;
@@ -201,8 +210,9 @@ fn capable_server_extensions_are_used() -> Result<()> {
     assert_eq!(
         b.quota(&a)?,
         Some(Quota {
-            used_kib: 512,
-            limit_kib: 2048
+            used_kib: 900,
+            limit_kib: 1000,
+            ..Quota::default()
         })
     );
     b.disconnect(&a.id);
@@ -630,6 +640,45 @@ fn drafts_sync_with_the_drafts_folder() -> Result<()> {
     assert_eq!(copies.len(), 1);
     assert!(copies[0].contains("Second version"));
     assert_eq!(racer_uid(&drafts), Some(raced), "another app's draft stays");
+    // Marked Encrypt: the server's copy is replaced by one sealed to your
+    // OpenPGP key, its subject hidden too; it reads back on another device.
+    let me = crate::manage::openpgp::test_key("QA <qa@example.com>", "");
+    let mut ring = crate::manage::openpgp::Keyring::default();
+    ring.import(&me.to_armored_string(Default::default())?, "")?;
+    b.set_keyring(ring)?;
+    let mut sealed = b.store.draft("draft-here")?.unwrap();
+    sealed.encrypt = true;
+    sealed.encrypt_subject = true;
+    sealed.body = "Secret plans".into();
+    b.store.save_draft(&sealed)?;
+    b.sync_drafts(&a)?;
+    let copies = uploaded(&drafts);
+    assert_eq!(copies.len(), 1, "the readable copy is replaced");
+    assert!(copies[0].contains("multipart/encrypted") && copies[0].contains("Subject: ..."));
+    assert!(!copies[0].contains("Secret plans") && !copies[0].contains("Written here"));
+    let sealed_uid = b.store.draft("draft-here")?.unwrap().remote.unwrap().uid;
+    // Another device (here: this one, without its copy) opens it.
+    b.store.delete_draft("draft-here")?;
+    b.sync_drafts(&a)?;
+    let back = b.store.drafts(&a.id)?.into_iter().find(|d| d.subject == "Written here").expect("the sealed draft opens");
+    assert!(back.body.contains("Secret plans") && back.encrypt && back.encrypt_subject, "{back:?}");
+    assert_eq!(back.remote.as_ref().unwrap().uid, sealed_uid);
+    // With S/MIME instead: sealed to your certificate, and read back.
+    let mut certs = crate::manage::smime::Certificates::default();
+    certs.import_identity(&crate::manage::smime::test_identity("qa@example.com", ""), "")?;
+    b.set_certificates(certs)?;
+    let mut smime = back.clone();
+    smime.smime = true;
+    smime.body = "Certificate secret".into();
+    b.store.save_draft(&smime)?;
+    b.sync_drafts(&a)?;
+    let copies = uploaded(&drafts);
+    assert_eq!(copies.len(), 1);
+    assert!(copies[0].contains("enveloped-data") && !copies[0].contains("Certificate secret"));
+    b.store.delete_draft(&back.id)?;
+    b.sync_drafts(&a)?;
+    let back = b.store.drafts(&a.id)?.into_iter().find(|d| d.subject == "Written here").expect("the S/MIME draft opens");
+    assert!(back.smime && back.encrypt && back.body.contains("Certificate secret"), "{back:?}");
     // Deleted here: gone from the server.
     b.discard_draft(&phone.id)?;
     let saved_elsewhere = b
@@ -923,6 +972,17 @@ fn scripted_smtp(
     a: impl FnOnce(&mut Account),
     draft: Draft,
 ) -> Result<(Result<Vec<String>>, SmtpSeen)> {
+    scripted_smtp_with(ehlo, recipients, a, draft, |b, a, d| b.send_noting(a, d))
+}
+
+/// As `scripted_smtp`, sending with `send` (the draft is saved first).
+fn scripted_smtp_with<T>(
+    ehlo: &'static str,
+    recipients: usize,
+    a: impl FnOnce(&mut Account),
+    draft: Draft,
+    send: impl FnOnce(&Backend, &Account, &Draft) -> Result<T>,
+) -> Result<(Result<T>, SmtpSeen)> {
     let (cert, acceptor) = tls_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -1049,7 +1109,8 @@ fn scripted_smtp(
         account: account.id.clone(),
         ..draft
     };
-    let result = b.send_noting(&account, &draft);
+    b.store.save_draft(&draft)?;
+    let result = send(&b, &account, &draft);
     let seen = server.join().unwrap();
     drop(b);
     std::fs::remove_dir_all(path)?;
@@ -1245,6 +1306,7 @@ fn other_addresses_send_through_their_own_server() -> Result<()> {
                     host: "localhost".into(),
                     port: a.smtp_port,
                     username: "desk-login".into(),
+                    tls: None,
                 }),
             }];
             // Nothing listens here: the mailbox's server mustn't be used.
@@ -1329,6 +1391,1700 @@ fn sending_addresses_are_saved_and_removed() -> Result<()> {
         assert!(b.save_identity(&a.id, wrong, None).is_err());
     }
     assert!(b.remove_identity(&a.id, "desk")?.identities.is_empty());
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A server listing MOVE, UIDPLUS, ESEARCH, NAMESPACE, SPECIAL-USE and
+/// LIST-STATUS: searches go by ESEARCH; the listing brings each folder's
+/// counters, subscriptions and a shared namespace's folders; moved and
+/// saved mail is placed under the UIDs the server gave it (COPYUID,
+/// APPENDUID).
+#[test]
+fn listing_subscriptions_shared_folders_and_new_uids() -> Result<()> {
+    listing_fixture(
+        "* CAPABILITY IMAP4rev1 CONDSTORE MOVE UIDPLUS ESEARCH ENABLE NAMESPACE SPECIAL-USE LIST-STATUS\r\n",
+    )
+}
+
+/// The same from a server speaking only IMAP4rev2, whose base protocol has
+/// all of those without listing them.
+#[test]
+fn imap4rev2_only_servers_get_the_same() -> Result<()> {
+    listing_fixture("* CAPABILITY IMAP4rev2 CONDSTORE\r\n")
+}
+
+fn listing_fixture(capabilities: &'static str) -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+            return seen;
+        };
+        while let Some((tag, command, literal)) = p.command() {
+            let upper = command.to_ascii_uppercase();
+            seen.push(command.clone());
+            if upper == "CAPABILITY" {
+                p.send(capabilities);
+            } else if upper == "NAMESPACE" {
+                // RFC 2342 §5.4: a second personal namespace, with its
+                // own delimiter, listed apart.
+                p.send("* NAMESPACE ((\"\" \"/\")(\"#mh/\" \".\")) ((\"Other Users/\" \"/\")) ((\"Shared/\" \"/\"))\r\n");
+            } else if upper.starts_with("LIST \"\" \"*\"") {
+                assert_eq!(
+                    command,
+                    "LIST \"\" \"*\" RETURN (SPECIAL-USE SUBSCRIBED STATUS (UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ))"
+                );
+                p.send("* LIST (\\Subscribed) \"/\" INBOX\r\n");
+                p.send("* STATUS INBOX (UIDVALIDITY 77 UIDNEXT 9 MESSAGES 3 HIGHESTMODSEQ 40)\r\n");
+                p.send("* LIST (\\Sent \\Subscribed) \"/\" Sent\r\n");
+                p.send("* LIST (\\Subscribed) \"/\" Receipts\r\n");
+                p.send("* STATUS Receipts (UIDVALIDITY 77 UIDNEXT 101 MESSAGES 4 HIGHESTMODSEQ 12)\r\n");
+                p.send("* LIST () \"/\" Old\r\n");
+            } else if upper.starts_with("LIST \"\" \"SHARED/*\"") {
+                p.send("* LIST (\\Noselect) \"/\" Shared\r\n");
+                p.send("* LIST (\\Noselect) \"/\" Shared/team\r\n");
+                p.send("* LIST (\\Subscribed) \"/\" Shared/team/Projects\r\n");
+            } else if upper.starts_with("LIST \"\" \"#MH/*\"") {
+                p.send("* LIST (\\Subscribed) \".\" \"#mh/inbox.drafts\"\r\n");
+            } else if upper.starts_with("LIST \"\" \"OTHER USERS/*\"") {
+            } else if upper.starts_with("SELECT") {
+                p.send("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n* OK [HIGHESTMODSEQ 40] ok\r\n");
+            } else if upper.starts_with("UID MOVE") {
+                p.send("* OK [COPYUID 77 7 101] Moved\r\n* 1 EXPUNGE\r\n");
+            } else if upper.starts_with("UID SEARCH") {
+                assert!(upper.starts_with("UID SEARCH RETURN (ALL) "), "{command}");
+                p.send(&format!("* ESEARCH (TAG \"{tag}\") UID\r\n"));
+            } else if upper.starts_with("APPEND") {
+                assert!(!literal.is_empty());
+                p.send(&format!("{tag} OK [APPENDUID 77 55] Saved\r\n"));
+                continue;
+            } else if upper == "LOGOUT" {
+                p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                break;
+            } else if !upper.starts_with("LOGIN") && !upper.starts_with("NOOP") {
+                panic!("Unexpected IMAP command: {command}");
+            }
+            p.ok(&tag);
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    a.sync.subscribed_only = true;
+    let folders = b.with_imap(&a, |c| Ok(custom_folders(c.names(true)?)))?;
+    let shown: Vec<(&str, &str, usize)> = folders
+        .iter()
+        .map(|f| (f.name.as_str(), f.label.as_str(), f.depth))
+        .collect();
+    // "Old" isn't subscribed; the shared folder sits at the top, naming
+    // the path to it, its parents being placeholders.
+    assert_eq!(
+        shown,
+        [
+            // Shown with "/" between levels, whatever the delimiter.
+            ("#mh/inbox.drafts", "#mh/inbox/drafts", 0),
+            ("Receipts", "Receipts", 0),
+            ("Shared/team/Projects", "Shared/team/Projects", 0)
+        ]
+    );
+    // The listing's counters tell an unchanged folder from a changed one.
+    b.store.save_mailbox_state(
+        &a.id,
+        "Receipts",
+        Some(&crate::manage::store::MailboxState {
+            validity: 77,
+            uid_next: 101,
+            exists: 4,
+            modseq: Some(12),
+            days: a.sync.days,
+            ..Default::default()
+        }),
+    )?;
+    assert!(b.with_imap(&a, |c| Ok(b.unchanged(c, &a, "Receipts")))?);
+    assert!(!b.with_imap(&a, |c| Ok(b.unchanged(c, &a, "INBOX")))?);
+    // A moved message shows in its new folder under its new UID.
+    let moved = Mail {
+        id: format!("{}:INBOX:77:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: 7,
+        subject: "Receipt".into(),
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&moved))?;
+    b.change(&a, &moved, Change::MoveTo("Receipts".into()))?;
+    assert!(b.store.message(&moved.id)?.is_none());
+    let placed = b
+        .store
+        .message(&format!("{}:Receipts:77:101", a.id))?
+        .expect("placed under its new UID");
+    assert_eq!((placed.uid, placed.remote_folder.as_str()), (101, "Receipts"));
+    assert_eq!(placed.subject, "Receipt");
+    // A sent copy saved in Sent is there at once, searched for by ESEARCH.
+    let raw = b"From: qa@example.com\r\nTo: r@example.com\r\nSubject: Sent copy\r\nMessage-ID: <sent@example.com>\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\n\r\nHello.\r\n";
+    b.with_imap(&a, |c| b.file_sent_copy(c, &a, raw))?;
+    let sent = b
+        .store
+        .message(&format!("{}:Sent:77:55", a.id))?
+        .expect("saved under its new UID");
+    assert_eq!(sent.folder, Folder::Sent);
+    assert!(!sent.unread);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|c| c == "UID MOVE 7 \"Receipts\""), "{seen:?}");
+    assert!(!seen.iter().any(|c| c.starts_with("ENABLE")), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A server offering UIDONLY (RFC 9586) has it turned on where the IMAP
+/// parser reads its UIDFETCH replies (Picacho-Patches' imap-proto patch
+/// 0006), and not otherwise: sync, flag changes and deletion work either
+/// way, never naming a message by sequence number.
+#[test]
+fn uidonly_is_enabled_only_where_uidfetch_is_read() -> Result<()> {
+    uidonly_fixture(crate::sync::transport::reads_uidfetch())
+}
+
+/// With UIDONLY on, messages come back as UIDFETCH (numbered by UID,
+/// without a UID item) and removals as VANISHED.
+#[test]
+fn uidonly_servers_report_messages_by_uid() -> Result<()> {
+    assert!(crate::sync::transport::reads_uidfetch());
+    uidonly_fixture(true)
+}
+
+fn uidonly_fixture(expect_uidonly: bool) -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut uidonly = false;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                // UIDONLY refuses anything numbered by sequence (RFC 9586 §3).
+                let numbered = ["FETCH ", "STORE ", "SEARCH ", "COPY ", "MOVE "]
+                    .iter()
+                    .any(|c| upper.starts_with(c));
+                if uidonly && numbered {
+                    p.send(&format!("{tag} BAD [UIDREQUIRED] Use UIDs\r\n"));
+                    continue;
+                }
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 ENABLE UIDONLY UIDPLUS\r\n");
+                } else if upper.starts_with("ENABLE ") {
+                    if upper.split_ascii_whitespace().any(|w| w == "UIDONLY") {
+                        uidonly = true;
+                        p.send("* ENABLED UIDONLY\r\n");
+                    }
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send(
+                        "* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 8] next\r\n",
+                    );
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH 7\r\n");
+                } else if upper.starts_with("UID FETCH") {
+                    let header = if upper.contains("HEADER") {
+                        format!(
+                            " RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{HEADER}",
+                            HEADER.len()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    p.send(&if uidonly {
+                        format!("* 7 UIDFETCH (FLAGS (\\Seen){header})\r\n")
+                    } else {
+                        format!("* 1 FETCH (UID 7 FLAGS (\\Seen){header})\r\n")
+                    });
+                } else if upper.starts_with("UID STORE") {
+                    // Reported back although SILENT, as another app's
+                    // change could be.
+                    p.send(if uidonly {
+                        "* 7 UIDFETCH (FLAGS ())\r\n"
+                    } else {
+                        "* 1 FETCH (UID 7 FLAGS ())\r\n"
+                    });
+                } else if upper.starts_with("UID EXPUNGE") {
+                    p.send(if uidonly {
+                        "* VANISHED 7\r\n"
+                    } else {
+                        "* 1 EXPUNGE\r\n"
+                    });
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else if !upper.starts_with("NOOP") {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        (seen, uidonly)
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let synced = b.sync(&a, Folder::Inbox, 300)?;
+    assert_eq!(synced.len(), 1);
+    let m = &synced[0];
+    assert_eq!((m.uid, m.subject.as_str(), m.unread), (7, "Receipt", false));
+    let m = b.change(&a, m, Change::Read(false))?;
+    assert!(m.unread);
+    b.delete_forever(&a, std::slice::from_ref(&m))?;
+    assert!(b.store.message(&m.id)?.is_none());
+    b.disconnect(&a.id);
+    let (seen, uidonly) = server.join().unwrap();
+    assert_eq!(uidonly, expect_uidonly, "{seen:?}");
+    assert!(seen.iter().any(|c| c == "UID EXPUNGE 7"), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A scheduled message handed to a server with FUTURERELEASE goes now,
+/// held for its time (HOLDFOR); one the server can't hold that long stays
+/// scheduled here, with nothing sent.
+#[test]
+fn scheduled_mail_is_handed_to_a_server_that_holds_it() -> Result<()> {
+    let at = chrono::Utc::now().timestamp() + 3600;
+    let draft = Draft {
+        id: "later".into(),
+        to: "ana@example.com".into(),
+        subject: "Tomorrow".into(),
+        body: "Hello.".into(),
+        send_at: Some(at),
+        ..Default::default()
+    };
+    let (handed, seen) = scripted_smtp_with(
+        "250-fixture\r\n250-FUTURERELEASE 604800 2030-01-01T00:00:00Z\r\n250 AUTH PLAIN\r\n",
+        1,
+        |a| a.server_send_later = true,
+        draft.clone(),
+        |b, a, d| {
+            let handed = b.hand_to_server(a, &d.id)?;
+            // Sent as far as Picacho is concerned: no longer a draft.
+            assert!(b.store.draft(&d.id)?.is_none());
+            Ok(handed)
+        },
+    )?;
+    assert!(handed?);
+    let mail = seen.commands.iter().find(|c| c.starts_with("MAIL")).unwrap();
+    let seconds: u64 = mail
+        .split("HOLDFOR=")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .unwrap()
+        .parse()?;
+    assert!((3590..=3600).contains(&seconds), "{mail}");
+
+    // Not that far ahead: left at once, the draft still scheduled.
+    let (handed, seen) = scripted_smtp_with(
+        "250-fixture\r\n250-FUTURERELEASE 600\r\n250 AUTH PLAIN\r\n",
+        1,
+        |a| a.server_send_later = true,
+        draft,
+        |b, a, d| {
+            let handed = b.hand_to_server(a, &d.id)?;
+            assert!(b.store.draft(&d.id)?.is_some());
+            Ok(handed)
+        },
+    )?;
+    assert!(!handed?);
+    assert!(!seen.commands.iter().any(|c| c.starts_with("MAIL")), "{:?}", seen.commands);
+    Ok(())
+}
+
+/// The server's answers, written and read whole: commands with any number
+/// of literals (`{n}` at a line's end), each given a go-ahead.
+fn command_with_literals(p: &mut Peer) -> Option<(String, String, Vec<Vec<u8>>)> {
+    let first = p.line()?;
+    let (tag, rest) = first.trim_end().split_once(' ')?;
+    let tag = tag.to_owned();
+    let mut command = String::new();
+    let mut literals = Vec::new();
+    let mut line = rest.to_owned();
+    loop {
+        let size = line
+            .rfind('{')
+            .filter(|_| line.ends_with('}'))
+            .and_then(|open| Some((open, line[open + 1..line.len() - 1].parse::<usize>().ok()?)));
+        let Some((open, n)) = size else {
+            command.push_str(&line);
+            return Some((tag, command, literals));
+        };
+        // literal8 (`~{n}`, RFC 3516) is read the same, its `~` kept.
+        command.push_str(&line[..open]);
+        command.push_str("{}");
+        p.send("+ go ahead\r\n");
+        literals.push(p.bytes(n));
+        line = p.line()?.trim_end().to_owned();
+    }
+}
+
+/// A server with SASL-IR, REPLACE, MULTIAPPEND, CREATE-SPECIAL-USE and
+/// STATUS=SIZE: sign-in takes one round trip, a new draft version replaces
+/// the old in one command, imported mail goes in one APPEND, a missing
+/// Sent folder is made marked as Sent, and storage used is added up.
+#[test]
+fn newer_extensions_save_round_trips() -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let drafts: FixtureFolder = Arc::default();
+    let (log, folder) = (seen.clone(), drafts.clone());
+    let server = std::thread::spawn(move || {
+        let mut next = 10;
+        let mut sent_made = false;
+        let mut imported = 0;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literals)) = command_with_literals(&mut p) {
+                let upper = command.to_ascii_uppercase();
+                log.lock().unwrap().push(command.clone());
+                let mut drafts = folder.lock().unwrap();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN LOGINDISABLED UIDPLUS REPLACE MULTIAPPEND CREATE-SPECIAL-USE STATUS=SIZE SPECIAL-USE\r\n");
+                } else if let Some(initial) = command.strip_prefix("AUTHENTICATE PLAIN ") {
+                    // The credentials came with the command: no go-ahead.
+                    assert_eq!(
+                        crate::sync::sasl::decode(initial).unwrap(),
+                        b"\0qa@example.com\0fixture-password"
+                    );
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST (\\Drafts) \"/\" Drafts\r\n* LIST () \"/\" Work\r\n");
+                    if sent_made {
+                        p.send("* LIST (\\Sent) \"/\" Sent\r\n");
+                    }
+                } else if upper == "CREATE \"SENT\" (USE (\\SENT))" {
+                    sent_made = true;
+                } else if upper.starts_with("SUBSCRIBE") {
+                } else if upper.starts_with("STATUS") {
+                    let size = if upper.contains("WORK") { 2048 } else { 1024 };
+                    let name = command.split('"').nth(1).unwrap_or("INBOX").to_owned();
+                    p.send(&format!("* STATUS \"{name}\" (SIZE {size})\r\n"));
+                } else if upper.starts_with("SELECT") {
+                    p.send(&format!(
+                        "* {} EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n",
+                        drafts.len()
+                    ));
+                } else if upper.starts_with("UID SEARCH HEADER X-PICACHO-DRAFT ") {
+                    let uids: String = drafts.iter().map(|(u, _)| format!(" {u}")).collect();
+                    p.send(&format!("* SEARCH{uids}\r\n"));
+                } else if upper.starts_with("UID SEARCH") {
+                    let uids: String = drafts.iter().map(|(u, _)| format!(" {u}")).collect();
+                    p.send(&format!("* SEARCH{uids}\r\n"));
+                } else if upper.starts_with("UID FETCH") {
+                    let set = command.split(' ').nth(2).unwrap();
+                    let wanted = super::protocol_tests::expand(set);
+                    for (uid, raw) in drafts.iter().filter(|(u, _)| wanted.contains(u)) {
+                        let text = String::from_utf8_lossy(raw);
+                        let header: String = text
+                            .lines()
+                            .filter(|l| l.starts_with("X-Picacho-Draft"))
+                            .map(|l| format!("{l}\r\n"))
+                            .collect();
+                        let data = format!("{header}\r\n");
+                        p.send(&format!(
+                            "* {uid} FETCH (UID {uid} RFC822.SIZE {} BODY[HEADER.FIELDS (X-PICACHO-DRAFT)] {{{}}}\r\n{data})\r\n",
+                            raw.len(),
+                            data.len()
+                        ));
+                    }
+                } else if let Some(rest) = upper.strip_prefix("UID REPLACE ") {
+                    let old: u32 = rest.split(' ').next().unwrap().parse().unwrap();
+                    assert!(command.contains("\\Draft"), "{command}");
+                    drafts.retain(|(u, _)| *u != old);
+                    drafts.push((next, literals[0].clone()));
+                    p.send(&format!("{tag} OK [APPENDUID 42 {next}] Replaced\r\n"));
+                    next += 1;
+                    continue;
+                } else if upper.starts_with("APPEND \"DRAFTS\"") {
+                    drafts.push((next, literals[0].clone()));
+                    p.send(&format!("{tag} OK [APPENDUID 42 {next}] Saved\r\n"));
+                    next += 1;
+                    continue;
+                } else if upper.starts_with("APPEND \"WORK\"") {
+                    // Every message in the one command.
+                    imported += literals.len();
+                    let first = 100 + imported - literals.len();
+                    p.send(&format!(
+                        "{tag} OK [APPENDUID 9 {first}:{}] Saved\r\n",
+                        100 + imported - 1
+                    ));
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        imported
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    // Drafts: uploaded, then replaced in one step.
+    let mut d = Draft {
+        id: "replaced-draft".into(),
+        account: a.id.clone(),
+        to: "ana@example.com".into(),
+        subject: "Plans".into(),
+        body: "First".into(),
+        ..Draft::default()
+    };
+    b.store.save_draft(&d)?;
+    b.sync_drafts(&a)?;
+    let first = b.store.draft(&d.id)?.unwrap().remote.unwrap().uid;
+    d = b.store.draft(&d.id)?.unwrap();
+    d.body = "Second".into();
+    b.store.save_draft(&d)?;
+    b.sync_drafts(&a)?;
+    let second = b.store.draft(&d.id)?.unwrap().remote.unwrap().uid;
+    assert_ne!(first, second);
+    {
+        let drafts = drafts.lock().unwrap();
+        assert_eq!(drafts.len(), 1, "replaced, not added");
+        assert!(String::from_utf8_lossy(&drafts[0].1).contains("Second"));
+    }
+    // Import: three messages, one APPEND, listed at once.
+    let dir = std::env::temp_dir().join(format!("picacho-import-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let mbox = dir.join("mail.mbox");
+    // Marks from the file (Status, X-Status) go with each; without a
+    // Date, the `From ` line's time is the message's date.
+    let one = |n: u32| {
+        let status = match n {
+            2 => "Status: O\n",
+            3 => "Status: RO\nX-Status: FD\n",
+            _ => "",
+        };
+        format!("From qa@example.com Sat Nov 21 10:00:00 2026\nFrom: Ana <ana@example.com>\nSubject: Note {n}\nMessage-ID: <n{n}@example.com>\n{status}\nBody {n}\n\n")
+    };
+    std::fs::write(&mbox, format!("{}{}{}", one(1), one(2), one(3)))?;
+    let moved = b.import_messages(
+        &a,
+        &Mailbox::Remote("Work".into()),
+        &[mbox],
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    assert_eq!((moved.done, moved.skipped, moved.marked_deleted), (3, 0, 1));
+    // No QUOTA: the space every mailbox takes, without a limit, where the
+    // IMAP parser reads STATUS=SIZE (Picacho-Patches imap-proto 0007).
+    // Before it, nothing is shown, and nothing else fails.
+    match b.quota(&a)? {
+        Some(q) => assert_eq!((q.used_kib, q.limit_kib), (4, 0), "1 + 1 + 2 KiB"),
+        None => assert!(!crate::sync::transport::reads_status_size()),
+    }
+    // No Sent folder: one is made, marked for its use.
+    let made = b.with_imap(&a, |c| c.standard_folder(a.provider, Folder::Sent))?;
+    assert_eq!(made, "Sent");
+    b.disconnect(&a.id);
+    let imported = server.join().unwrap();
+    assert_eq!(imported, 3);
+    let seen = seen.lock().unwrap();
+    let appends: Vec<&String> = seen.iter().filter(|c| c.starts_with("APPEND \"Work\"")).collect();
+    assert_eq!(appends.len(), 1, "{seen:?}");
+    assert_eq!(
+        appends[0],
+        "APPEND \"Work\" (\\Seen) \"21-Nov-2026 10:00:00 +0000\" {} () \"21-Nov-2026 10:00:00 +0000\" {} (\\Seen \\Flagged) \"21-Nov-2026 10:00:00 +0000\" {}"
+    );
+    assert!(seen.iter().any(|c| c.starts_with("UID REPLACE")), "{seen:?}");
+    assert!(!seen.iter().any(|c| c.starts_with("UID EXPUNGE")), "nothing to remove: {seen:?}");
+    assert!(!seen.iter().any(|c| c == "AUTHENTICATE PLAIN"), "SASL-IR: {seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+
+/// A high-priority message goes with MT-PRIORITY (RFC 6710) and the
+/// headers recipients' apps read; a delivery time limit with DELIVERBY
+/// (RFC 2852), at least the server's minimum.
+#[test]
+fn smtp_priority_and_delivery_time_limit() -> Result<()> {
+    let draft = Draft {
+        id: "urgent".into(),
+        to: "ana@example.com".into(),
+        subject: "Urgent".into(),
+        body: "Now".into(),
+        priority: crate::manage::model::Priority::High,
+        ..Draft::default()
+    };
+    let (result, commands, message) = smtp_exchange(
+        "250-fixture\r\n250-MT-PRIORITY MIXER\r\n250-DELIVERBY 7200\r\n250 AUTH PLAIN\r\n",
+        |a| a.deliver_within_hours = 1,
+        draft.clone(),
+    )?;
+    assert!(result?.is_empty());
+    let mail = commands.iter().find(|c| c.starts_with("MAIL FROM")).unwrap();
+    assert!(mail.contains(" MT-PRIORITY=4"), "{mail}");
+    // One hour asked; the server takes no less than two.
+    assert!(mail.contains(" BY=7200;R"), "{mail}");
+    assert!(message.contains("Importance: high") && message.contains("X-Priority: 1"), "{message}");
+    // A server without them is told neither; the headers still go.
+    let (result, commands, message) =
+        smtp_exchange("250-fixture\r\n250 AUTH PLAIN\r\n", |a| a.deliver_within_hours = 1, draft)?;
+    assert!(result?.is_empty());
+    let mail = commands.iter().find(|c| c.starts_with("MAIL FROM")).unwrap();
+    assert!(!mail.contains("MT-PRIORITY") && !mail.contains("BY="), "{mail}");
+    assert!(message.contains("Importance: high"), "{message}");
+    Ok(())
+}
+
+/// A server offering IMAP4rev2 beside rev1 is switched to rev2 (ENABLE),
+/// and an All Mail search goes as one MULTISEARCH with WITHIN's YOUNGER
+/// and FUZZY words, its results named by each mailbox's UIDVALIDITY.
+#[test]
+fn rev2_multisearch_within_and_fuzzy() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 IMAP4rev2 ENABLE SPECIAL-USE ESEARCH MULTISEARCH WITHIN SEARCH=FUZZY\r\n");
+                } else if upper.starts_with("ENABLE") {
+                    p.send("* ENABLED IMAP4rev2\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                    p.send("* LIST (\\Archive) \"/\" \"Archive\"\r\n");
+                } else if upper == "NAMESPACE" {
+                    // rev2 has it: asked once ENABLEd.
+                    p.send("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
+                } else if upper.starts_with("ESEARCH IN") {
+                    p.send("* ESEARCH (TAG \"x\" MAILBOX \"INBOX\" UIDVALIDITY 7) UID COUNT 2 ALL 3:4\r\n");
+                    p.send("* ESEARCH (TAG \"x\" MAILBOX \"Archive\" UIDVALIDITY 9) UID COUNT 1 ALL 5\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    // What the search finds is already cached, so nothing is fetched.
+    for (remote, validity, uid) in [("INBOX", 7, 3), ("INBOX", 7, 4), ("Archive", 9, 5)] {
+        let id = format!("{}:{remote}:{validity}:{uid}", a.id);
+        let mut m = parse_message(b"Subject: Report\r\n\r\nBody", &a, &id, Folder::Inbox, remote, uid)?;
+        m.date = 1_700_000_000 + i64::from(uid);
+        b.store.save_messages(&[m])?;
+    }
+    let found = b.search_server(&a, &Folder::All.into(), "newer:2d report", 10)?;
+    assert_eq!(found.total, 3);
+    assert_eq!(found.mails.len(), 3);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    let enable = seen.iter().find(|c| c.starts_with("ENABLE")).unwrap();
+    assert!(enable.contains("IMAP4rev2"), "{enable}");
+    let search = seen.iter().find(|c| c.starts_with("ESEARCH IN")).unwrap();
+    assert!(search.contains("(mailboxes (\"INBOX\" \"Archive\"))"), "{search}");
+    assert!(search.contains("YOUNGER 172800") && search.contains("FUZZY (TEXT \"report\")"), "{search}");
+    assert!(!seen.iter().any(|c| c.starts_with("SELECT") || c.starts_with("EXAMINE")), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// Extension replies with literals (RFC 9051 §4.3) are read through the
+/// stream's framing: a NAMESPACE prefix sent as a literal is used; one
+/// that can't be read (a line break inside) fails NAMESPACE alone, and the
+/// session goes on with LIST "" "" and folders at the top. A METADATA
+/// value with a line break, which its own parser reads, comes through.
+#[test]
+fn extension_replies_with_literals_are_read() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for readable in [true, false] {
+            let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+                break;
+            };
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") || upper.starts_with("CREATE") || upper.starts_with("SUBSCRIBE") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 NAMESPACE METADATA\r\n");
+                } else if upper == "LIST \"\" \"\"" {
+                    p.send("* LIST (\\Noselect) \".\" \"\"\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \".\" INBOX\r\n* LIST () \".\" \"Archive\"\r\n");
+                } else if upper == "NAMESPACE" {
+                    if readable {
+                        p.send("* NAMESPACE (({6}\r\nINBOX. \".\")) NIL NIL\r\n");
+                    } else {
+                        p.send("* NAMESPACE (({7}\r\nINB\r\nOX \".\")) NIL NIL\r\n");
+                    }
+                } else if upper.starts_with("GETMETADATA") {
+                    p.send("* METADATA \"\" (/shared/comment {14}\r\nLine 1\r\nLine 2 /shared/admin {18}\r\nmailto:a@b.example)\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.create_remote_folder(&a, None, "Travel")?;
+    let notes = b.server_notes(&a)?;
+    assert_eq!(notes.comment.as_deref(), Some("Line 1\r\nLine 2"));
+    assert_eq!(notes.admin.as_deref(), Some("mailto:a@b.example"));
+    b.disconnect(&a.id);
+    b.create_remote_folder(&a, None, "Trips")?;
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    let creates: Vec<_> = seen.iter().filter(|c| c.starts_with("CREATE")).collect();
+    assert_eq!(creates, ["CREATE \"INBOX.Travel\"", "CREATE \"Trips\""]);
+    assert_eq!(seen.iter().filter(|c| *c == "LIST \"\" \"\"").count(), 1, "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 9051 §4.3 (RFC 3501 §4.3): 8-bit search text is never quoted. On a
+/// server without LITERAL+ or UTF8=ACCEPT it goes as a synchronizing
+/// literal, sent once the server says to go ahead, with CHARSET UTF-8.
+#[test]
+fn eight_bit_search_text_goes_as_a_synchronizing_literal() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut searches = Vec::new();
+        let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+            return searches;
+        };
+        while let Some((tag, command, literals)) = command_with_literals(&mut p) {
+            let upper = command.to_ascii_uppercase();
+            if upper.starts_with("LOGIN") {
+            } else if upper == "CAPABILITY" {
+                p.send("* CAPABILITY IMAP4rev1\r\n");
+            } else if upper.starts_with("LIST") {
+                p.send("* LIST () \"/\" INBOX\r\n");
+            } else if upper.starts_with("SELECT") {
+                p.send("* 2 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 9] ok\r\n");
+            } else if upper.starts_with("UID SEARCH") {
+                searches.push((command.clone(), literals));
+                p.send("* SEARCH\r\n");
+            } else if upper == "LOGOUT" {
+                p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                break;
+            } else {
+                panic!("Unexpected IMAP command: {command}");
+            }
+            p.ok(&tag);
+        }
+        searches
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let found = b.search_server(&a, &Folder::Inbox.into(), "café", 10)?;
+    assert_eq!(found.total, 0);
+    b.disconnect(&a.id);
+    let searches = server.join().unwrap();
+    assert_eq!(
+        searches,
+        [(
+            "UID SEARCH CHARSET UTF-8 TEXT {}".to_owned(),
+            vec!["café".as_bytes().to_vec()]
+        )]
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 9051 §6.3.2: a mailbox the server opens `[READ-ONLY]` isn't
+/// changed. Marking, moving and deleting are refused with a plain reason
+/// before any STORE, MOVE or EXPUNGE is sent; reading still works.
+#[test]
+fn read_only_mailboxes_are_not_changed() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        // A refused change drops its connection: each of the four signs in.
+        'connections: for _ in 0..4 {
+            let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+                break;
+            };
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 UIDPLUS MOVE\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST () \"/\" Shared\r\n* LIST (\\Trash) \"/\" Trash\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                    p.send(&format!("{tag} OK [READ-ONLY] opened for reading\r\n"));
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else if !upper.starts_with("LOGIN") {
+                    seen.push(command);
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let m = Mail {
+        id: format!("{}:Shared:42:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Other,
+        remote_folder: "Shared".into(),
+        uid: 7,
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&m))?;
+    for change in [Change::Read(true), Change::Star(true), Change::Move(Folder::Trash)] {
+        let refused = b.change(&a, &m, change).unwrap_err();
+        assert!(format!("{refused:#}").contains("can only be read"), "{refused:#}");
+    }
+    let refused = b.delete_forever(&a, std::slice::from_ref(&m)).unwrap_err();
+    assert!(format!("{refused:#}").contains("can only be read"), "{refused:#}");
+    assert!(b.store.message(&m.id)?.is_some());
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(
+        !seen.iter().any(|c| {
+            let c = c.to_ascii_uppercase();
+            c.contains("STORE") || c.contains("MOVE") || c.contains("EXPUNGE") || c.contains("COPY")
+        }),
+        "{seen:?}"
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 3503 §3.1: where a mailbox can't keep $MDNSent (PERMANENTFLAGS
+/// without `\*`), a declined (or sent) read receipt is remembered here
+/// without a STORE, and a later flag check doesn't ask again.
+#[test]
+fn mdn_sent_is_kept_locally_where_the_server_cannot() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut stores = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 8] next\r\n");
+                    p.send("* OK [PERMANENTFLAGS (\\Seen \\Flagged)] no keywords\r\n");
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH 7\r\n");
+                } else if upper.starts_with("UID FETCH") {
+                    if upper.contains("HEADER") {
+                        let header = "From: Ana <ana@example.com>\r\nDisposition-Notification-To: ana@example.com, bo@example.com\r\nSubject: Read?\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\nMessage-ID: <r@example.com>\r\n\r\n";
+                        p.send(&format!(
+                            "* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{header})\r\n",
+                            header.len()
+                        ));
+                    } else {
+                        p.send("* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n");
+                    }
+                } else if upper.starts_with("UID STORE") {
+                    stores.push(command);
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        stores
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let synced = b.sync(&a, Folder::Inbox, 300)?;
+    let m = &synced[0];
+    assert_eq!(m.receipt_to(), "ana@example.com, bo@example.com");
+    assert!(!m.mdn_sent);
+    b.decline_receipt(&a, m)?;
+    assert!(b.store.message(&m.id)?.unwrap().mdn_sent);
+    // The server still shows no $MDNSent: it stays handled here.
+    let again = b.sync(&a, Folder::Inbox, 300)?;
+    assert!(again[0].mdn_sent);
+    assert!(b.store.message(&m.id)?.unwrap().mdn_sent);
+    b.disconnect(&a.id);
+    let stores = server.join().unwrap();
+    assert!(stores.is_empty(), "{stores:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 9051 §6.2.2: an IMAP4rev2 server takes AUTHENTICATE's initial
+/// response (RFC 4959) without listing SASL-IR, so sign-in is one round trip.
+#[test]
+fn imap4rev2_sign_in_sends_the_initial_response() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+            return seen;
+        };
+        while let Some((tag, command, _)) = p.command() {
+            let upper = command.to_ascii_uppercase();
+            seen.push(command.clone());
+            if upper == "CAPABILITY" {
+                p.send("* CAPABILITY IMAP4rev2 AUTH=PLAIN LOGINDISABLED\r\n");
+            } else if let Some(initial) = command.strip_prefix("AUTHENTICATE PLAIN ") {
+                assert_eq!(
+                    crate::sync::sasl::decode(initial).unwrap(),
+                    b"\0qa@example.com\0fixture-password"
+                );
+            } else if upper == "AUTHENTICATE PLAIN" {
+                panic!("The initial response was held back: {command}");
+            } else if upper.starts_with("LIST") {
+                p.send("* LIST () \"/\" INBOX\r\n");
+            } else if upper == "NAMESPACE" {
+                p.send("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
+            } else if upper.starts_with("CREATE") || upper.starts_with("SUBSCRIBE") {
+            } else if upper == "LOGOUT" {
+                p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                break;
+            } else {
+                panic!("Unexpected IMAP command: {command}");
+            }
+            p.ok(&tag);
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.create_remote_folder(&a, None, "Travel")?;
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|c| c.starts_with("AUTHENTICATE PLAIN ")), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 8474 §5.1: one message in two mailboxes (the same EMAILID) is
+/// downloaded once; the other copy shares its source.
+#[test]
+fn objectid_copies_download_once() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let body = "From: Ana <ana@example.com>\r\nSubject: Shared\r\nMessage-ID: <s@example.com>\r\n\r\nOne message, two mailboxes.\r\n";
+    let server = std::thread::spawn(move || {
+        let mut fetches = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 OBJECTID UIDPLUS\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST () \"/\" Work\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if upper.starts_with("UID FETCH") && upper.contains("BODY.PEEK[]") {
+                    fetches.push(command.clone());
+                    p.send(&format!("* 1 FETCH (UID 7 BODY[] {{{}}}\r\n{body})\r\n", body.len()));
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        fetches
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    a.sync.offline_days = 0;
+    let copy = |remote: &str, folder: Folder| {
+        let mut m = Mail {
+            id: format!("{}:{remote}:42:7", a.id),
+            account: a.id.clone(),
+            folder,
+            remote_folder: remote.into(),
+            uid: 7,
+            size: 100,
+            date: 1_700_000_000,
+            ..Mail::default()
+        };
+        m.set_email_id("M7f3a");
+        m
+    };
+    let (inbox, work) = (copy("INBOX", Folder::Inbox), copy("Work", Folder::Other));
+    b.store.save_messages(&[inbox.clone(), work.clone()])?;
+    let mut stored = b.download_batch(&a, 10)?;
+    stored += b.download_batch(&a, 10)?;
+    assert_eq!(stored, 2);
+    for m in [&inbox, &work] {
+        let raw = b.store.raw(&m.id)?.expect("downloaded");
+        assert!(String::from_utf8_lossy(&raw).contains("two mailboxes"));
+    }
+    b.disconnect(&a.id);
+    let fetches = server.join().unwrap();
+    assert_eq!(fetches.len(), 1, "{fetches:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A message too large to keep is read from its parts (BODYSTRUCTURE,
+/// BINARY), and its attachment's size is the decoded one the server gives
+/// (BINARY.SIZE, RFC 3516 §4.2), not an estimate from its encoded size.
+#[test]
+fn large_messages_list_attachments_by_their_decoded_size() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 BINARY\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if upper.contains("BODY.PEEK[HEADER]") {
+                    let header = "From: Ana <ana@example.com>\r\nSubject: Big\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n";
+                    p.send(&format!("* 1 FETCH (UID 7 BODY[HEADER] {{{}}}\r\n{header})\r\n", header.len()));
+                } else if upper.contains("BODYSTRUCTURE") {
+                    p.send("* 1 FETCH (UID 7 BODYSTRUCTURE ((\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"7bit\" 5 1 NIL NIL NIL NIL)(\"application\" \"pdf\" (\"name\" \"big.pdf\") NIL NIL \"base64\" 400000000 NIL (\"attachment\" (\"filename\" \"big.pdf\")) NIL NIL) \"mixed\" (\"boundary\" \"b\") NIL NIL NIL))\r\n");
+                } else if upper.contains("BINARY.PEEK[1]") {
+                    p.send("* 1 FETCH (UID 7 BINARY[1] ~{5}\r\nHello)\r\n");
+                } else if upper.contains("BINARY.SIZE[2]") {
+                    p.send("* 1 FETCH (UID 7 BINARY.SIZE[2] 291234567)\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let m = Mail {
+        id: format!("{}:INBOX:42:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: 7,
+        size: 400_001_000,
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&m))?;
+    let read = b.read(&a, &m)?;
+    assert_eq!(read.body.as_deref(), Some("Hello"));
+    let attachments = read.attachments();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!((attachments[0].name.as_str(), attachments[0].size), ("big.pdf", 291_234_567));
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|c| c == "UID FETCH 7 (UID BINARY.SIZE[2])"), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A large attachment of a message too large to keep downloads in pieces
+/// (`BODY.PEEK[2]<offset.length>`), each decoded and written to the file as
+/// it arrives: base64 split anywhere, and quoted-printable, come out whole.
+#[test]
+fn large_attachments_download_in_pieces_to_their_file() -> Result<()> {
+    use base64::Engine as _;
+    let data: Vec<u8> = (0..17_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let encoded: Vec<u8> = base64::engine::general_purpose::STANDARD
+        .encode(&data)
+        .as_bytes()
+        .chunks(76)
+        .flat_map(|l| l.iter().copied().chain(*b"\r\n"))
+        .collect();
+    // Quoted-printable text with escapes and soft line breaks, as long.
+    let line = "Caf=C3=A9 cr=C3=A8me =3D one soft break here =\r\nand the rest of the line.\r\n";
+    let qp_source: Vec<u8> = line.repeat(26_000_000 / line.len() + 1).into_bytes();
+    let qp_plain = crate::sync::transport::decode_part(&qp_source, "quoted-printable")?;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let parts = [encoded.clone(), qp_source.clone()];
+    let server = std::thread::spawn(move || {
+        let mut pieces = 0;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") || upper.starts_with("EXAMINE") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if let Some(rest) = upper.split("BODY.PEEK[").nth(1) {
+                    let section: usize = rest[..1].parse().unwrap();
+                    let (offset, length) = rest[3..].trim_end_matches(">)").split_once('.').unwrap();
+                    let (offset, length): (usize, usize) = (offset.parse().unwrap(), length.parse().unwrap());
+                    let part = &parts[section - 2];
+                    let piece = &part[offset.min(part.len())..(offset + length).min(part.len())];
+                    pieces += 1;
+                    p.send(&format!("* 1 FETCH (UID 7 BODY[{section}]<{offset}> {{{}}}\r\n", piece.len()));
+                    p.send_bytes(piece);
+                    p.send(")\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        pieces
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let mut m = Mail {
+        id: format!("{}:INBOX:42:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: 7,
+        size: 60_000_000,
+        partial: true,
+        ..Mail::default()
+    };
+    let attachment = |part: usize, name: &str, size: usize, encoding: &str| Attachment {
+        name: name.into(),
+        size,
+        mime: "application/octet-stream".into(),
+        part,
+        section: part.to_string(),
+        encoding: encoding.into(),
+    };
+    m.set_attachments(vec![
+        attachment(2, "data.bin", data.len(), "base64"),
+        attachment(3, "notes.txt", qp_plain.len(), "quoted-printable"),
+    ]);
+    b.store.save_messages(std::slice::from_ref(&m))?;
+    let file = path.join("data.bin");
+    let written = b.attachment_to(&a, &m, 2, &file)?;
+    assert_eq!(written.size, data.len() as u64);
+    assert!(std::fs::read(&file)? == data, "base64 decoded whole");
+    let notes = path.join("notes.txt");
+    b.attachment_to(&a, &m, 3, &notes)?;
+    assert!(std::fs::read(&notes)? == qp_plain, "quoted-printable decoded whole");
+    b.disconnect(&a.id);
+    let pieces = server.join().unwrap();
+    assert!(pieces >= 6, "fetched in pieces: {pieces}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 4314 §3: a mailbox's access list is read (GETACL), changed (SETACL,
+/// DELETEACL) and its grantable rights listed (LISTRIGHTS); rights that
+/// aren't letters are refused before anything is sent.
+#[test]
+fn mailbox_access_lists() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 ACL RIGHTS=texk\r\n");
+                } else if upper.starts_with("GETACL") {
+                    seen.push(command.clone());
+                    p.send("* ACL \"Team\" qa@example.com lrswipkxtecda \"-guest\" w anyone lr\r\n");
+                } else if upper.starts_with("LISTRIGHTS") {
+                    seen.push(command.clone());
+                    p.send("* LISTRIGHTS \"Team\" \"bo@example.com\" \"\" l r s w i p k x t e c d a\r\n");
+                } else if upper.starts_with("SETACL") || upper.starts_with("DELETEACL") {
+                    seen.push(command.clone());
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let acl = b.mailbox_acl(&a, "Team")?;
+    assert_eq!(
+        acl,
+        [
+            ("qa@example.com".to_owned(), "lrswipkxtecda".to_owned()),
+            ("-guest".to_owned(), "w".to_owned()),
+            ("anyone".to_owned(), "lr".to_owned()),
+        ]
+    );
+    b.set_mailbox_acl(&a, "Team", "bo@example.com", Some("+lrs"))?;
+    b.set_mailbox_acl(&a, "Team", "guest", None)?;
+    assert!(b.set_mailbox_acl(&a, "Team", "bo@example.com", Some("all")).is_ok());
+    assert!(b.set_mailbox_acl(&a, "Team", "bo@example.com", Some("l r")).is_err());
+    let (required, optional) = b.mailbox_listrights(&a, "Team", "bo@example.com")?.unwrap();
+    assert_eq!(required, "");
+    assert_eq!(optional.len(), 13);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert_eq!(
+        seen,
+        [
+            "GETACL \"Team\"",
+            "SETACL \"Team\" \"bo@example.com\" \"+lrs\"",
+            "DELETEACL \"Team\" \"guest\"",
+            "SETACL \"Team\" \"bo@example.com\" \"all\"",
+            "LISTRIGHTS \"Team\" \"bo@example.com\"",
+        ]
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 5465 §5.4–5.5: the inbox's watch asks to hear of folders made,
+/// renamed, deleted or (un)subscribed elsewhere (asking again without them
+/// where the server can't, [BADEVENT]). A burst of LIST lines, its own
+/// mailbox's among them, asks for one check, and that check lists the
+/// folders again: a folder deleted elsewhere is gone from those kept here.
+#[test]
+fn folder_changes_heard_while_idle_relist_the_folders() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let renamed = Arc::new(AtomicBool::new(false));
+    let gone = renamed.clone();
+    // Two connections: the watch's, then the check's (which logs out last).
+    let mut logouts = 0;
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut idles = 0;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 IDLE NOTIFY\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST () \"/\" Work\r\n");
+                    if !gone.load(std::sync::atomic::Ordering::SeqCst) {
+                        p.send("* LIST () \"/\" Old\r\n");
+                    }
+                } else if upper.starts_with("EXAMINE") || upper.starts_with("SELECT") {
+                    p.send("* 0 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 1] next\r\n");
+                } else if upper.starts_with("NOTIFY SET") && upper.contains("MAILBOXNAME") {
+                    p.send(&format!("{tag} NO [BADEVENT (MessageNew MessageExpunge FlagChange MailboxName)] not that\r\n"));
+                    continue;
+                } else if upper.starts_with("NOTIFY SET") {
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH\r\n");
+                } else if upper == "IDLE" {
+                    p.send("+ idling\r\n");
+                    idles += 1;
+                    if idles == 1 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        // Elsewhere: Old deleted, Work renamed and back, and
+                        // a LIST about the watched mailbox itself.
+                        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+                        p.send("* LIST (\\NonExistent) \"/\" Old\r\n* LIST () \"/\" Work\r\n* LIST () \"/\" INBOX\r\n");
+                    }
+                    match p.line() {
+                        Some(done) => {
+                            seen.push(done.trim_end().to_owned());
+                            p.ok(&tag);
+                        }
+                        // The watch stopped by closing its connection.
+                        None => {
+                            logouts += 1;
+                            if logouts == 2 {
+                                break 'connections;
+                            }
+                            continue 'connections;
+                        }
+                    }
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    logouts += 1;
+                    if logouts == 2 {
+                        break 'connections;
+                    }
+                    continue 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let b = Arc::new(b);
+    // Folders as an earlier check kept them.
+    b.store.save_folders(&a.id, &custom_folders(&[
+        crate::sync::transport::Name::for_test("Work", "/", &[]),
+        crate::sync::transport::Name::for_test("Old", "/", &[]),
+    ]))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    b.watch_inbox(&a, move |m| {
+        let _ = tx.send(m);
+    });
+    let asked = rx.recv_timeout(Duration::from_secs(10)).expect("a check was asked for");
+    assert_eq!(asked, Mailbox::Standard(Folder::Inbox));
+    // One burst, one check.
+    std::thread::sleep(Duration::from_millis(300));
+    let more: Vec<Mailbox> = rx.try_iter().collect();
+    assert!(more.is_empty(), "the burst asked for one check: {more:?}");
+    // That check lists the folders again: Old is gone. (The fixture
+    // serves one connection at a time: the watch's ends first.)
+    b.stop_watching(&a.id);
+    b.sync(&a, asked, 50)?;
+    let kept: Vec<String> = b.store.folders(&a.id).into_iter().map(|f| f.name).collect();
+    assert_eq!(kept, ["Work"]);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    let notify: Vec<&String> = seen.iter().filter(|c| c.starts_with("NOTIFY SET")).collect();
+    assert_eq!(notify.len(), 2, "{seen:?}");
+    assert!(notify[0].contains("MailboxName SubscriptionChange"), "{notify:?}");
+    assert!(!notify[1].contains("MailboxName"), "{notify:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 6855 §4: with UTF8=ACCEPT on, a message whose headers are UTF-8
+/// itself is appended with APPEND's UTF8 form and a literal8; an ASCII one
+/// with plain APPEND.
+#[test]
+fn utf8_messages_are_appended_as_utf8() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut appends = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literals)) = command_with_literals(&mut p) {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 ENABLE UTF8=ACCEPT UIDPLUS\r\n");
+                } else if upper.starts_with("ENABLE") {
+                    p.send("* ENABLED UTF8=ACCEPT\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST (\\Sent) \"/\" Sent\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 0 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH\r\n");
+                } else if upper.starts_with("APPEND") {
+                    appends.push((command.clone(), literals));
+                    p.send(&format!("{tag} OK [APPENDUID 42 {}] Saved\r\n", appends.len()));
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        appends
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let international = "From: José <josé@example.com>\r\nSubject: Olá\r\nMessage-ID: <u@example.com>\r\n\r\nCorpo.\r\n";
+    let ascii = "From: Ana <ana@example.com>\r\nSubject: Hi\r\nMessage-ID: <a@example.com>\r\n\r\nBody.\r\n";
+    b.with_imap(&a, |c| b.file_sent_copy(c, &a, international.as_bytes()))?;
+    b.with_imap(&a, |c| b.file_sent_copy(c, &a, ascii.as_bytes()))?;
+    b.disconnect(&a.id);
+    let appends = server.join().unwrap();
+    assert_eq!(appends.len(), 2, "{appends:?}");
+    assert_eq!(appends[0].0, "APPEND \"Sent\" (\\Seen) UTF8 (~{})");
+    assert_eq!(appends[0].1, [international.as_bytes().to_vec()]);
+    assert!(!appends[1].0.contains("UTF8"), "{:?}", appends[1].0);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// Follow-up reminders on a server with METADATA: the list merges with what
+/// another computer shared there (its new wait kept, a wait it stopped
+/// stopped here too) and goes back merged; and before reminding, the
+/// server is asked whether the overdue message was answered, so a reply
+/// not downloaded still ends the wait.
+#[test]
+fn follow_ups_are_shared_and_replies_found_on_the_server() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let now = chrono::Utc::now().timestamp();
+    let ms = chrono::Utc::now().timestamp_millis();
+    let waiting = |id: &str, due: i64, changed: i64| FollowUp {
+        message_id: id.into(),
+        subject: format!("About {id}"),
+        to: "ana@example.org".into(),
+        sent: now - 3 * 86400,
+        due,
+        reminded: false,
+        changed,
+    };
+    // Shared by another computer: a new wait, and one it stopped since this
+    // computer last saw it.
+    let theirs = serde_json::json!({
+        "waiting": [waiting("<theirs@me>", now + 86400, ms - 1000)],
+        "gone": [{ "message_id": "<stopped@me>", "at": ms + 60_000 }],
+    })
+    .to_string();
+    let server = std::thread::spawn(move || {
+        let mut stored = Some(theirs);
+        let mut searches = Vec::new();
+        while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literal)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 METADATA\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n");
+                } else if upper.starts_with("GETMETADATA") {
+                    match &stored {
+                        Some(v) => p.send(&format!(
+                            "* METADATA \"INBOX\" (/private/vendor/tech.pinal.picacho/follow-ups {{{}}}\r\n{v})\r\n",
+                            v.len()
+                        )),
+                        None => p.send("* METADATA \"INBOX\" (/private/vendor/tech.pinal.picacho/follow-ups NIL)\r\n"),
+                    }
+                } else if upper.starts_with("SETMETADATA") {
+                    stored = if !literal.is_empty() {
+                        Some(String::from_utf8_lossy(&literal).into_owned())
+                    } else if command.trim_end().ends_with("NIL)") {
+                        None
+                    } else {
+                        let start = command.find("follow-ups \"").unwrap() + "follow-ups \"".len();
+                        let end = command.rfind("\")").unwrap();
+                        Some(command[start..end].replace("\\\"", "\"").replace("\\\\", "\\"))
+                    };
+                } else if upper.starts_with("SELECT") || upper.starts_with("EXAMINE") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 6] ok\r\n");
+                } else if upper.starts_with("UID SEARCH") {
+                    searches.push(command.clone());
+                    // Ana's answer to the overdue one is in the inbox.
+                    if command.contains("<overdue@me>") && searches.len() == 1 {
+                        p.send("* SEARCH 5\r\n");
+                    } else {
+                        p.send("* SEARCH\r\n");
+                    }
+                } else if upper.starts_with("UID FETCH") {
+                    let header = "From: Ana Lima <ana@example.org>\r\nSubject: Re: About it\r\n\r\n";
+                    p.send(&format!(
+                        "* 1 FETCH (UID 5 BODY[HEADER.FIELDS (FROM SUBJECT AUTO-SUBMITTED X-AUTOREPLY X-AUTORESPOND PRECEDENCE)] {{{}}}\r\n{header})\r\n",
+                        header.len()
+                    ));
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                }
+                p.ok(&tag);
+            }
+        }
+        (stored, searches)
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.note_follow_up(&a.id, waiting("<overdue@me>", now - 60, 0))?;
+    b.note_follow_up(&a.id, waiting("<stopped@me>", now + 86400, 0))?;
+    let check = b.check_follow_ups_online(&a, true)?;
+    // Answered on the server: not reminded of, no longer waited on.
+    assert!(check.due.is_empty(), "{check:?}");
+    assert_eq!(check.replied.len(), 1);
+    assert_eq!(check.replied[0].0.message_id, "<overdue@me>");
+    assert_eq!(check.replied[0].1, "Ana Lima");
+    let ids: Vec<String> = b.follow_ups(&a.id).into_iter().map(|f| f.message_id).collect();
+    assert_eq!(ids, ["<theirs@me>"]);
+    b.disconnect(&a.id);
+    drop(listener_closer(port));
+    let (stored, searches) = server.join().unwrap();
+    // What went back: the other computer's wait, and both stops.
+    let stored: serde_json::Value = serde_json::from_str(&stored.expect("shared"))?;
+    let waiting: Vec<&str> = stored["entries"].as_array().unwrap().iter().map(|f| f["message_id"].as_str().unwrap()).collect();
+    assert_eq!(waiting, ["<theirs@me>"]);
+    let mut gone: Vec<&str> = stored["gone"].as_array().unwrap().iter().map(|g| g["message_id"].as_str().unwrap()).collect();
+    gone.sort();
+    assert_eq!(gone, ["<overdue@me>", "<stopped@me>"]);
+    // The server's search leaves out mail of the account's own and automatic mail.
+    assert!(searches[0].contains("HEADER In-Reply-To \"<overdue@me>\""), "{searches:?}");
+    assert!(searches[0].contains("NOT FROM \"") && searches[0].contains("NOT HEADER Auto-Submitted auto"));
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// Ends a fixture's accept loop: one last connection that closes at once.
+fn listener_closer(port: u16) -> Option<TcpStream> {
+    TcpStream::connect(("127.0.0.1", port)).ok()
+}
+
+/// Follow-up reminders on an IMAP server without METADATA: the list is
+/// kept in a note appended to a Picacho folder (made for it), replaced as
+/// it changes (one note at a time), and read by another computer.
+#[test]
+fn follow_ups_are_shared_through_a_note_without_metadata() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut folder_made = false;
+        // The Picacho folder's messages: (uid, source, deleted).
+        let mut notes: Vec<(u32, Vec<u8>, bool)> = Vec::new();
+        let mut next = 1;
+        let mut selected = String::new();
+        while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literal)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 UIDPLUS\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                    if folder_made {
+                        p.send("* LIST () \"/\" Picacho\r\n");
+                    }
+                } else if upper.starts_with("CREATE") {
+                    folder_made = command.contains("Picacho");
+                } else if upper.starts_with("SELECT") || upper.starts_with("EXAMINE") {
+                    selected = command.split_whitespace().nth(1).unwrap_or_default().trim_matches('"').to_owned();
+                    let count = if selected == "Picacho" { notes.iter().filter(|n| !n.2).count() } else { 0 };
+                    p.send(&format!("* {count} EXISTS\r\n* OK [UIDVALIDITY 3] ok\r\n* OK [UIDNEXT {next}] ok\r\n"));
+                    p.send(&format!("{tag} OK [READ-WRITE] done\r\n"));
+                    continue;
+                } else if upper.starts_with("APPEND") {
+                    assert!(command.contains("Picacho") && upper.contains("\\SEEN"), "{command}");
+                    notes.push((next, literal, false));
+                    p.send(&format!("{tag} OK [APPENDUID 3 {next}] done\r\n"));
+                    next += 1;
+                    continue;
+                } else if upper.starts_with("UID SEARCH") {
+                    if selected == "Picacho" && command.contains("X-Picacho-Note") {
+                        let uids: Vec<String> = notes.iter().filter(|n| !n.2).map(|n| n.0.to_string()).collect();
+                        p.send(&format!("* SEARCH {}\r\n", uids.join(" ")));
+                    } else {
+                        p.send("* SEARCH\r\n");
+                    }
+                } else if upper.starts_with("UID FETCH") {
+                    for (i, (uid, raw, _)) in notes.iter().filter(|n| !n.2).enumerate() {
+                        if command.contains(&uid.to_string()) {
+                            p.send(&format!("* {} FETCH (UID {uid} BODY[] {{{}}}\r\n", i + 1, raw.len()));
+                            p.send_bytes(raw);
+                            p.send(")\r\n");
+                        }
+                    }
+                } else if upper.starts_with("UID STORE") {
+                    let set = command.split_whitespace().nth(2).unwrap_or_default().to_owned();
+                    for n in &mut notes {
+                        if set.split(',').any(|u| u == n.0.to_string()) {
+                            n.2 = true;
+                        }
+                    }
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                }
+                p.ok(&tag);
+            }
+        }
+        notes.into_iter().filter(|n| !n.2).collect::<Vec<_>>()
+    });
+    let now = chrono::Utc::now().timestamp();
+    let waiting = |id: &str| FollowUp {
+        message_id: id.into(),
+        subject: "Plans".into(),
+        to: "ana@example.org".into(),
+        sent: now - 3600,
+        due: now + 86400,
+        ..Default::default()
+    };
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.note_follow_up(&a.id, waiting("<one@me>"))?;
+    b.sync_follow_ups(&a, true)?;
+    b.note_follow_up(&a.id, waiting("<two@me>"))?;
+    b.sync_follow_ups(&a, true)?;
+    b.disconnect(&a.id);
+    // Another computer.
+    let (b2, mut a2, path2) = backend(&cert)?;
+    a2.incoming_port = port;
+    b2.store.save_account(&a2)?;
+    assert!(b2.sync_follow_ups(&a2, true)?);
+    let mut ids: Vec<String> = b2.follow_ups(&a2.id).into_iter().map(|f| f.message_id).collect();
+    ids.sort();
+    assert_eq!(ids, ["<one@me>", "<two@me>"]);
+    b2.disconnect(&a2.id);
+    drop(listener_closer(port));
+    let left = server.join().unwrap();
+    assert_eq!(left.len(), 1, "one note at a time");
+    drop((b, b2));
+    std::fs::remove_dir_all(path)?;
+    std::fs::remove_dir_all(path2)?;
+    Ok(())
+}
+
+/// Snoozed mail on a server with METADATA, as earlier versions keep it:
+/// their array of snoozed messages (without dates) is merged in and kept
+/// an array, which they still read; messages no longer snoozed go in an
+/// entry of their own beside it.
+#[test]
+fn snoozes_share_through_metadata_as_earlier_versions_read_them() -> Result<()> {
+    use crate::manage::backend::Snoozed;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let until = chrono::Utc::now().timestamp() + 86400;
+    let older = format!(r#"[{{"message_id":"<old@x>","subject":"Old","sender":"Ana","until":{until},"folder":"Picacho/Snoozed"}}]"#);
+    let server = std::thread::spawn(move || {
+        let mut values: Vec<(String, String)> =
+            vec![("/private/vendor/tech.pinal.picacho/snoozed".into(), older)];
+        while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literal)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 METADATA\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("GETMETADATA") {
+                    let asked: Vec<&str> = command.split(['(', ')', ' ']).filter(|w| w.starts_with("/private")).collect();
+                    let parts: Vec<String> = asked
+                        .iter()
+                        .map(|e| match values.iter().find(|(k, _)| k == e) {
+                            Some((_, v)) => format!("{e} {{{}}}\r\n{v}", v.len()),
+                            None => format!("{e} NIL"),
+                        })
+                        .collect();
+                    p.send(&format!("* METADATA \"INBOX\" ({})\r\n", parts.join(" ")));
+                } else if upper.starts_with("SETMETADATA") {
+                    let entry = command.split_whitespace().find(|w| w.starts_with("(/private")).unwrap().trim_start_matches('(').to_owned();
+                    values.retain(|(k, _)| *k != entry);
+                    let value = if !literal.is_empty() {
+                        Some(String::from_utf8_lossy(&literal).into_owned())
+                    } else if command.trim_end().ends_with("NIL)") {
+                        None
+                    } else {
+                        let start = command.find(&format!("{entry} \"")).unwrap() + entry.len() + 2;
+                        let end = command.rfind("\")").unwrap();
+                        Some(command[start..end].replace("\\\"", "\"").replace("\\\\", "\\"))
+                    };
+                    if let Some(v) = value {
+                        values.push((entry, v));
+                    }
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                }
+                p.ok(&tag);
+            }
+        }
+        values
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let snoozed = |id: &str| Snoozed {
+        message_id: id.into(),
+        subject: "Here".into(),
+        sender: "Bo".into(),
+        until,
+        folder: "Picacho/Snoozed".into(),
+        ids: vec![],
+        changed: 0,
+    };
+    // Snoozed here, and one woken here since.
+    b.save_snoozed(None, &a.id, &[snoozed("<here@x>"), snoozed("<woken@x>")])?;
+    b.save_snoozed(None, &a.id, &[snoozed("<here@x>")])?;
+    assert!(b.share_snoozed(&a, true)?);
+    let mut ids: Vec<String> = b.snoozed(&a.id).into_iter().map(|s| s.message_id).collect();
+    ids.sort();
+    assert_eq!(ids, ["<here@x>", "<old@x>"]);
+    b.disconnect(&a.id);
+    drop(listener_closer(port));
+    let values = server.join().unwrap();
+    let value = |e: &str| values.iter().find(|(k, _)| k.ends_with(e)).map(|(_, v)| serde_json::from_str::<serde_json::Value>(v).unwrap());
+    let entries = value("/snoozed").expect("kept");
+    let mut kept: Vec<&str> = entries.as_array().expect("an array, as before").iter().map(|s| s["message_id"].as_str().unwrap()).collect();
+    kept.sort();
+    assert_eq!(kept, ["<here@x>", "<old@x>"]);
+    let gone = value("/snoozed-gone").expect("removals beside it");
+    assert_eq!(gone[0]["message_id"], "<woken@x>");
     drop(b);
     std::fs::remove_dir_all(path)?;
     Ok(())

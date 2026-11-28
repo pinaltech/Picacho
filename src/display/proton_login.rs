@@ -47,14 +47,14 @@ impl MailApp {
                         let taken: Vec<String> =
                             self.accounts.iter().map(|a| a.email.clone()).collect();
                         if taken.iter().any(|e| e.eq_ignore_ascii_case(&a.email)) {
-                            self.notice("This account is already added.", true, cx);
+                            self.notice(t!("proton-login-this-account-is-already-added"), true, cx);
                             return;
                         }
                         (a, taken)
                     }
                 };
                 if password.is_empty() {
-                    self.notice("Enter your Proton password.", true, cx);
+                    self.notice(t!("proton-login-enter-your-proton-password"), true, cx);
                     return;
                 }
                 self.start_proton(reconnect, cx, move |b, cancel| {
@@ -69,9 +69,9 @@ impl MailApp {
                 if typed.trim().is_empty() {
                     self.notice(
                         if key {
-                            "Enter the code from your authenticator app, or use a security key or passkey."
+                            t!("proton-login-enter-the-code-from-your-authenticator")
                         } else {
-                            "Enter the code from your authenticator app."
+                            t!("proton-login-enter-the-code-from-your-authenticator-2")
                         },
                         true,
                         cx,
@@ -83,7 +83,7 @@ impl MailApp {
             Some(ProtonStage::MailboxPassword) => {
                 let password = value(MAILBOX_PASSWORD, cx);
                 if password.is_empty() {
-                    self.notice("Enter the mailbox password.", true, cx);
+                    self.notice(t!("proton-login-enter-the-mailbox-password"), true, cx);
                     return;
                 }
                 self.start_proton(reconnect, cx, move |b, cancel| {
@@ -133,6 +133,10 @@ impl MailApp {
         }
         self.key_method = None;
         self.key_prompt = KeyPrompt::Idle;
+        // A Proton Pass sign-in (Forwarding settings) ends with it.
+        self.fwd_pass_login = None;
+        self.fwd_pass_again = None;
+        self.fwd_pending_extra = Default::default();
         if self.proton_stage.take().is_some() {
             self.task(
                 cx,
@@ -158,7 +162,7 @@ impl MailApp {
             _ => None,
         }
     }
-    fn start_proton(
+    pub(super) fn start_proton(
         &mut self,
         reconnect: Option<String>,
         cx: &mut Context<Self>,
@@ -202,6 +206,14 @@ impl MailApp {
                         this.proton_stage = Some(ProtonStage::MailboxPassword);
                         this.anim += 1;
                     }
+                    Ok(ProtonNext::PassSignedIn) => {
+                        this.proton_stage = None;
+                        this.anim += 1;
+                        match this.fwd_pass_again.take() {
+                            Some(service) => this.pass_signed_in_again(service, cx),
+                            None => this.connect_proton_aliases(cx),
+                        }
+                    }
                     Ok(ProtonNext::Done(account)) => {
                         this.proton_stage = None;
                         match reconnect {
@@ -228,16 +240,16 @@ impl MailApp {
     pub(super) fn proton_submit_label(&self) -> Option<&'static str> {
         if self.connecting {
             return Some(match (self.key_method, self.sign_in_step) {
-                (Some(_), _) => "Waiting for your key…",
-                (None, SignInStep::Verifying) => "Waiting for Proton's check…",
-                _ => "Signing in…",
+                (Some(_), _) => t!("proton-login-waiting-for-your-key"),
+                (None, SignInStep::Verifying) => t!("proton-login-waiting-for-protons-check"),
+                _ => t!("proton-login-signing-in"),
             });
         }
         match self.proton_stage {
-            None => Some("Continue"),
-            Some(ProtonStage::SecondFactor { code: true, .. }) => Some("Verify"),
+            None => Some(t!("proton-login-continue")),
+            Some(ProtonStage::SecondFactor { code: true, .. }) => Some(t!("proton-login-verify")),
             Some(ProtonStage::SecondFactor { code: false, .. }) => None,
-            Some(ProtonStage::MailboxPassword) => Some("Unlock"),
+            Some(ProtonStage::MailboxPassword) => Some(t!("proton-login-unlock")),
         }
     }
     /// The title and explanation of the Proton step on screen.
@@ -248,24 +260,24 @@ impl MailApp {
                 key: true,
                 ..
             } => (
-                "Two-factor authentication",
-                "Enter the code from your authenticator app, or use a security key or passkey.",
+                t!("proton-login-two-factor-authentication"),
+                t!("proton-login-enter-the-code-from-your-authenticator"),
             ),
             ProtonStage::SecondFactor { code: true, .. } => (
-                "Two-factor authentication",
-                "Enter the code from your authenticator app.",
+                t!("proton-login-two-factor-authentication"),
+                t!("proton-login-enter-the-code-from-your-authenticator-2"),
             ),
             ProtonStage::SecondFactor { key: true, .. } => (
-                "Two-factor authentication",
-                "Use the security key or passkey you added to your Proton account.",
+                t!("proton-login-two-factor-authentication"),
+                t!("proton-login-use-the-security-key-or-passkey"),
             ),
             ProtonStage::SecondFactor { .. } => (
-                "Two-factor authentication",
-                "Proton asks for a second factor this app can't use. Add an authenticator app or security key in Proton's security settings.",
+                t!("proton-login-two-factor-authentication"),
+                t!("proton-login-proton-asks-for-a-second-factor"),
             ),
             ProtonStage::MailboxPassword => (
-                "Mailbox password",
-                "This account uses a second password to unlock its mail.",
+                t!("proton-login-mailbox-password"),
+                t!("proton-login-this-account-uses-a-second-password"),
             ),
         })
     }
@@ -275,12 +287,12 @@ impl MailApp {
             "proton-mode",
             vec![
                 (
-                    "Direct".to_owned(),
+                    t!("proton-login-direct").to_owned(),
                     Action::ProtonMode(Service::Proton),
                     self.service == Service::Proton,
                 ),
                 (
-                    "Proton Mail Bridge".to_owned(),
+                    t!("proton-login-proton-mail-bridge").to_owned(),
                     Action::ProtonMode(Service::ProtonBridge),
                     self.service == Service::ProtonBridge,
                 ),
@@ -319,7 +331,7 @@ impl MailApp {
         match stage {
             ProtonStage::SecondFactor { code, key, pin } => {
                 if code {
-                    content = content.child(self.field("Authentication code", TOTP));
+                    content = content.child(self.field(t!("proton-login-authentication-code"), TOTP));
                 }
                 if code && key {
                     content = content.child(
@@ -336,7 +348,7 @@ impl MailApp {
                 }
                 if key {
                     if pin {
-                        content = content.child(self.field("Security key PIN", KEY_PIN));
+                        content = content.child(self.field(t!("proton-login-security-key-pin"), KEY_PIN));
                     }
                     content = content.children(KeyMethod::offered().iter().map(|m| {
                         let busy = self.connecting && self.key_method == Some(*m);
@@ -357,7 +369,7 @@ impl MailApp {
                 }
             }
             ProtonStage::MailboxPassword => {
-                content = content.child(self.field("Mailbox password", MAILBOX_PASSWORD));
+                content = content.child(self.field(t!("proton-login-mailbox-password"), MAILBOX_PASSWORD));
             }
         }
         Some(content.into_any_element())
@@ -395,33 +407,57 @@ impl MailApp {
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
                         .text_center()
-                        .child("Scan this with your phone's camera, and keep Bluetooth on on both devices."),
+                        .child(if cfg!(target_os = "ios") {
+                            t!("proton-login-scan-this-with-the-camera-of")
+                        } else {
+                            t!("proton-login-scan-this-with-your-phones-camera")
+                        }),
                 )
                 .into_any_element(),
-            KeyPrompt::Touch => line("Touch your security key."),
+            KeyPrompt::Touch => line(t!("proton-login-touch-your-security-key")),
             KeyPrompt::Insert if cfg!(target_os = "android") => {
-                line("Hold your security key against the back of your phone, or plug it in…")
+                line(t!("proton-login-hold-your-security-key-against-the"))
             }
-            KeyPrompt::Insert => line("Plug in your security key…"),
+            KeyPrompt::Insert if cfg!(target_os = "ios") => {
+                line(t!("proton-login-hold-your-security-key-near-the"))
+            }
+            KeyPrompt::Insert => line(t!("proton-login-plug-in-your-security-key")),
             KeyPrompt::Phone(status) => line(status),
-            KeyPrompt::Working | KeyPrompt::Idle => line("Waiting for your key…"),
+            KeyPrompt::Working | KeyPrompt::Idle => line(t!("proton-login-waiting-for-your-key")),
         }
     }
 }
 
 /// A QR code, black on white, `size` wide.
-fn qr_code(text: &str, size: f32) -> AnyElement {
-    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+pub(super) fn qr_code(text: &str, size: f32) -> AnyElement {
+    // Made once for its text, not on every frame (encoding a QR code is
+    // the most work a frame of these sheets does).
+    /// A code's width and which of its modules are dark.
+    type Code = (usize, std::rc::Rc<Vec<bool>>);
+    thread_local! {
+        static MADE: std::cell::RefCell<Option<(String, Option<Code>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let made = MADE.with(|made| {
+        let mut made = made.borrow_mut();
+        if made.as_ref().is_none_or(|(t, _)| t != text) {
+            let code = qrcode::QrCode::new(text.as_bytes()).ok().map(|code| {
+                let dark: Vec<bool> = code
+                    .to_colors()
+                    .into_iter()
+                    .map(|c| c == qrcode::Color::Dark)
+                    .collect();
+                (code.width(), std::rc::Rc::new(dark))
+            });
+            *made = Some((text.to_owned(), code));
+        }
+        made.as_ref().and_then(|(_, code)| code.clone())
+    });
+    let Some((width, dark)) = made else {
         return div()
-            .child("The QR code couldn't be made.")
+            .child(t!("proton-login-the-qr-code-couldnt-be-made"))
             .into_any_element();
     };
-    let width = code.width();
-    let dark: Vec<bool> = code
-        .to_colors()
-        .into_iter()
-        .map(|c| c == qrcode::Color::Dark)
-        .collect();
     canvas(
         |_, _, _| {},
         move |bounds, _, w, _| {

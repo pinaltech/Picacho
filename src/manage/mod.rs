@@ -1,23 +1,73 @@
 //! Manage: domain types, persistent cache, encryption, and account coordination.
 //! Display calls Backend and Store; protocol details live in Sync.
+/// The app lock's passcode, biometrics setting and wrong tries.
+pub mod applock;
 pub mod avatar;
+/// Brand logos (BIMI) of checked senders.
+pub mod bimi;
 pub mod backend;
 /// Checking for new mail without a window (desktop background, Android's
 /// service). iOS only reads its preferences.
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 pub mod background;
+/// The inbox's categories (Primary, Promotions, Social…) and sorting mail
+/// into them.
+pub mod categories;
 pub mod composing;
+/// Writing aids: finding text, Markdown shortcuts, emoji and mail merge.
+pub mod authoring;
 pub mod crypto;
 pub mod forwarding;
+/// Security keys: OpenPGP cards and PKCS#11 tokens, and their PINs.
+pub mod hardware;
+/// VIPs, the first-time sender Screener, and which new mail is announced
+/// when (quiet hours, per-category notifications).
+pub mod inbox_control;
+/// Mailing lists' List-Help, -Subscribe, -Post, -Owner, -Archive and
+/// List-Id headers (RFC 2369, RFC 2919).
+pub mod list_headers;
 pub mod local_ai;
+/// The text of attachments, for the local full-text index.
+pub mod attachment_text;
+/// Attachments across mail (the attachment browser) and what is shared
+/// with one person (the reader's contact panel).
+pub mod attachments;
+pub mod mail_kinds;
 /// Keeping memory small in the background (desktop).
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 pub mod memory;
 pub mod model;
+pub mod openpgp;
+/// Pinned and muted mail, saved searches, blocked senders and rules kept here.
+pub mod organize;
+/// What a message's attachments become as it is sent: pictures made
+/// smaller, files too large shared as links.
+pub mod outgoing;
+pub mod protected_reply;
+pub mod smime;
+/// Tracking numbers in mail, for the reader and each account's Summary.
+pub mod parcels;
+pub mod receipts;
+/// The formatted composer's document, read from and written as HTML.
+pub mod richtext;
+/// Spelling for the formatted composer.
+pub mod spelling;
 pub mod search;
 pub mod status;
 pub mod store;
 pub mod subscriptions;
+/// Mail in the system's search: Spotlight (macOS) and Windows Search.
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+pub mod system_search;
 pub mod tracking;
+/// Home-screen widget snapshots and deep-link actions (Android and iOS).
+pub mod widgets;
+/// The optional encrypted database: its key and the keychain entry it's in.
+pub mod vault;
+/// Workspaces: named sets of accounts and calendars shown together, which
+/// notifications they let through, and when they turn on.
+pub mod workspaces;
+/// Files beside the database kept encrypted while it is (drafts' attachments).
+pub mod sealed_files;
 
 pub mod reading;

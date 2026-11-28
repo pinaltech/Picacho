@@ -67,7 +67,7 @@ pub struct KeyBundle {
 pub struct Locked;
 impl std::fmt::Display for Locked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("This mail is encrypted. Enter your Pinal password to read it on this device.")
+        f.write_str(t!("manage-crypto-this-mail-is-encrypted-enter-your"))
     }
 }
 impl std::error::Error for Locked {}
@@ -78,8 +78,7 @@ pub struct WrongSecret;
 impl std::fmt::Display for WrongSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "That does not unlock your mail. If you changed your Pinal password recently, \
-             use your previous password or your recovery key.",
+            t!("manage-crypto-that-does-not-unlock-your-mail"),
         )
     }
 }
@@ -100,7 +99,7 @@ pub fn argon2(password: &str, salt: &[u8], kdf: &KdfParams) -> Result<Zeroizing<
             && (FLOOR.0..=CEILING.0).contains(&kdf.memory_kib)
             && (FLOOR.1..=CEILING.1).contains(&kdf.iterations)
             && (FLOOR.2..=CEILING.2).contains(&kdf.parallelism),
-        "These key settings are not allowed."
+        t!("manage-crypto-these-key-settings-are-not-allowed")
     );
     let params = argon2::Params::new(kdf.memory_kib, kdf.iterations, kdf.parallelism, Some(32))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -162,9 +161,9 @@ pub fn unlock_with_password(bundle: &KeyBundle, password: &str) -> Result<Zeroiz
     let kdf = slot
         .kdf
         .as_ref()
-        .context("The password slot has no key settings.")?;
+        .with_context(|| t!("manage-crypto-the-password-slot-has-no-key"))?;
     let salt = B64.decode(&kdf.salt).map_err(|_| WrongSecret)?;
-    ensure!(salt.len() == 16, "Bad salt.");
+    ensure!(salt.len() == 16, t!("manage-crypto-bad-salt"));
     let stretched = argon2(password, &salt, kdf)?;
     let kek = hkdf(stretched.as_ref(), "pinal-mail/v1/password-kek");
     let aad = context(&["pinal-mail/v1/slot", &bundle.user_id, &slot.id, "password"]);
@@ -186,7 +185,7 @@ pub fn parse_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
         .collect();
     ensure!(
         clean.len() == 56,
-        "Check the recovery key. It has 56 letters and numbers."
+        t!("manage-crypto-check-the-recovery-key-it-has")
     );
     let mut bytes = Zeroizing::new(Vec::with_capacity(35));
     let (mut bits, mut value) = (0u32, 0u32);
@@ -194,7 +193,7 @@ pub fn parse_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
         let digit = ALPHABET
             .iter()
             .position(|a| *a == c)
-            .context("Check the recovery key. It has 56 letters and numbers.")?;
+            .with_context(|| t!("manage-crypto-check-the-recovery-key-it-has"))?;
         value = (value << 5) | digit as u32;
         bits += 5;
         if bits >= 8 {
@@ -207,11 +206,11 @@ pub fn parse_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
     key.copy_from_slice(&bytes[..32]);
     let sum = Sha256::new()
         .chain_update(b"pinal-mail/v1/recovery-checksum")
-        .chain_update(key.as_ref())
+        .chain_update(&key[..])
         .finalize();
     ensure!(
         sum[..3] == bytes[32..35],
-        "Check the recovery key. It has 56 letters and numbers."
+        t!("manage-crypto-check-the-recovery-key-it-has")
     );
     Ok(key)
 }
@@ -248,9 +247,9 @@ pub fn open_keys(bundle: &KeyBundle, mk: &[u8; 32]) -> Result<Vec<SignedSecretKe
         ]);
         let binary = open(&k, &record.nonce, &record.sealed_private_key, &aad)?;
         let key = SignedSecretKey::from_bytes(Cursor::new(binary.as_slice()))
-            .context("A mail key could not be read.")?;
+            .with_context(|| t!("manage-crypto-a-mail-key-could-not-be"))?;
         let (listed, _) = SignedPublicKey::from_string(&record.public_key)
-            .context("A mail key's public half could not be read.")?;
+            .with_context(|| t!("manage-crypto-a-mail-keys-public-half-could"))?;
         let hex = |f: pgp::types::Fingerprint| hex(f.as_bytes());
         let subkeys = |k: &[String]| {
             let mut v = k.to_vec();
@@ -271,7 +270,7 @@ pub fn open_keys(bundle: &KeyBundle, mk: &[u8; 32]) -> Result<Vec<SignedSecretKe
             hex(key.fingerprint()) == record.fingerprint
                 && hex(listed.fingerprint()) == record.fingerprint
                 && subkeys(&secret_subs) == subkeys(&public_subs),
-            "A mail key does not match its public key."
+            t!("manage-crypto-a-mail-key-does-not-match")
         );
         keys.push(key);
     }
@@ -400,6 +399,18 @@ fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// The armored payload of a PGP/MIME message, and the headers kept outside it.
 pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
+    // Its type is read from the headers alone first: nearly all mail isn't
+    // PGP/MIME, and turning a whole source (attachments and all) into text
+    // only to find that cost a copy of it, on every message read.
+    let end = memchr::memmem::find(raw, b"\n\n")
+        .into_iter()
+        .chain(memchr::memmem::find(raw, b"\r\n\r\n"))
+        .min()
+        .map_or(raw.len(), |at| (at + 4).min(raw.len()));
+    let (kind, _) = content_type(&parse_headers(split_message(&latin1(&raw[..end])).0));
+    if kind != "multipart/encrypted" {
+        return None;
+    }
     let text = latin1(raw);
     let (head, body) = split_message(&text);
     let headers = parse_headers(head);
@@ -413,11 +424,12 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
         return None;
     }
     let delimiter = format!("--{boundary}");
+    let closing = format!("{delimiter}--");
     let mut parts: Vec<Vec<&str>> = Vec::new();
     for line in body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) {
         if line.trim_end() == delimiter {
             parts.push(Vec::new());
-        } else if line.trim_end() == format!("{delimiter}--") {
+        } else if line.trim_end() == closing {
             break;
         } else if let Some(part) = parts.last_mut() {
             part.push(line);
@@ -431,9 +443,16 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
         let (head, body) = split_message(&joined);
         (content_type(&parse_headers(head)).0, body.to_owned())
     });
-    let (control, _) = decoded.next()?;
+    let (control, version) = decoded.next()?;
     let (payload, armored) = decoded.next()?;
     if control != "application/pgp-encrypted" || payload != "application/octet-stream" {
+        return None;
+    }
+    // RFC 3156 §4: the control part says `Version: 1`.
+    if !version
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("version: 1") || l.trim().eq_ignore_ascii_case("version:1"))
+    {
         return None;
     }
     let armored = armored.trim().to_owned();
@@ -442,7 +461,10 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
     }
     let outer = headers
         .iter()
-        .filter(|h| h.name != "content-type")
+        // All Content-* headers stay with the encrypted part: the outer
+        // Content-Transfer-Encoding came first in the decrypted message and
+        // was used to decode its inner part's body.
+        .filter(|h| !h.name.starts_with("content-"))
         .map(|h| {
             if h.raw.ends_with('\n') {
                 h.raw.clone()
@@ -452,6 +474,33 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
         })
         .collect::<String>();
     Some((armored, outer))
+}
+
+/// Whether `raw` is encrypted in any form Picacho knows (PGP/MIME, S/MIME,
+/// inline PGP): its text is ciphertext, read only when opened.
+pub fn is_encrypted(raw: &[u8]) -> bool {
+    sender_encrypted(raw) || encrypted_part(raw).is_some() || inline_pgp_in_parts(raw)
+}
+
+/// Whether `raw` is inline PGP with files: a multipart message whose first
+/// plain-text part is an armored encrypted message (its files `.pgp` beside
+/// it). `sender_encrypted` reads the top-level body alone, which here is
+/// the multipart's preamble: a reply to such mail went out unencrypted.
+pub fn inline_pgp_in_parts(raw: &[u8]) -> bool {
+    let raw = &raw[..raw.len().min(MAX_MESSAGE)];
+    let Ok(parsed) = mailparse::parse_mail(raw) else {
+        return false;
+    };
+    if !parsed.ctype.mimetype.to_ascii_lowercase().starts_with("multipart/") {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    crate::sync::mime::collect_leaves(&parsed, &mut leaves);
+    leaves
+        .into_iter()
+        .find(|p| p.ctype.mimetype.eq_ignore_ascii_case("text/plain"))
+        .and_then(|p| p.get_body().ok())
+        .is_some_and(|body| body.trim_start().starts_with("-----BEGIN PGP MESSAGE-----"))
 }
 
 /// Mirrors Stalwart's test for mail its sender already encrypted.
@@ -481,11 +530,10 @@ pub const MAX_MESSAGE: usize = 40 * 1024 * 1024;
 /// without a modification detection code, and compressed data (which
 /// Stalwart never writes) is refused rather than inflated.
 pub fn open_message(raw: &[u8], keys: &[SignedSecretKey]) -> Result<(Protection, Vec<u8>)> {
-    ensure!(
-        raw.len() <= MAX_MESSAGE,
-        "This message is too large to open."
-    );
     let Some((armored, outer)) = encrypted_part(raw) else {
+        // Nothing to decrypt: as large as a download may be, which the
+        // cache read it back at (a limit of its own here refused mail
+        // that downloaded and saved).
         let p = if sender_encrypted(raw) {
             Protection::Foreign
         } else {
@@ -493,6 +541,10 @@ pub fn open_message(raw: &[u8], keys: &[SignedSecretKey]) -> Result<(Protection,
         };
         return Ok((p, raw.to_vec()));
     };
+    ensure!(
+        raw.len() <= MAX_MESSAGE,
+        t!("manage-crypto-this-message-is-too-large-to")
+    );
     let decrypt = || -> Result<Vec<u8>> {
         let (message, _) = Message::from_string(&armored)?;
         let passwords: Vec<Password> = keys.iter().map(|_| Password::empty()).collect();

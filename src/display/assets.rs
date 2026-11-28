@@ -28,6 +28,10 @@ impl AssetSource for Assets {
             "mail/snooze.svg" => Some(
                 "<circle cx='12' cy='13' r='8'/><path d='M12 9v4l2 2M5 3 2 6M19 3l3 3M10 2h4'/>",
             ),
+            // Waiting for a reply: an hourglass.
+            "mail/waiting.svg" => Some(
+                "<path d='M6 2h12M6 22h12M7 2v4a5 5 0 0 0 5 5 5 5 0 0 0 5-5V2M7 22v-4a5 5 0 0 1 5-5 5 5 0 0 1 5 5v4'/>",
+            ),
             "mail/answered.svg" => Some("<path d='m9 6-6 6 6 6M3 12h11a7 7 0 0 1 7 7'/>"),
             "mail/forwarded.svg" => Some("<path d='m15 6 6 6-6 6M21 12H10a7 7 0 0 0-7 7'/>"),
             "mail/archive.svg" => Some(
@@ -80,6 +84,13 @@ impl AssetSource for Assets {
             }
             "mail/lock.svg" => Some(
                 "<rect x='4' y='10' width='16' height='11' rx='2'/><path d='M8 10V7a4 4 0 0 1 8 0v3'/>",
+            ),
+            // The app lock's biometric unlock (display/applock.rs).
+            "mail/fingerprint.svg" => Some(
+                "<path d='M6.5 6.5a8 8 0 0 1 13.4 5.8M4.2 10.5A8 8 0 0 0 4 12.5c0 2 .4 3.6 1.2 5M8 18.5c-.7-1.8-1-3.8-1-6a5 5 0 0 1 10 0v1M12 12.5c0 3.5.7 6 2 8M17 16.5c-.2 1.4-.6 2.7-1 3.8M9.5 8.8A5 5 0 0 1 12 8'/>",
+            ),
+            "mail/face-id.svg" => Some(
+                "<path d='M3 8V5a2 2 0 0 1 2-2h3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M8 21H5a2 2 0 0 1-2-2v-3M9 9v1.5M15 9v1.5M12 9v4.5h-1M9 16a4.5 4.5 0 0 0 6 0'/>",
             ),
             "mail/filter.svg" => Some(
                 "<path d='M4 5h16M7 12h10M10 19h4'/><circle cx='8' cy='5' r='2'/><circle cx='16' cy='12' r='2'/>",
@@ -153,11 +164,67 @@ impl AssetSource for Assets {
             "mail/subscriptions.svg" => Some(
                 "<path d='M4 4h12v15a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2Z'/><path d='M16 8h4v11a2 2 0 0 1-4 0M8 8h4M8 12h4M8 16h3'/>",
             ),
+            // An account's Summary: a page of lines with a bar chart.
+            "mail/summary.svg" => Some(
+                "<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M8 16v-4M12 16V8M16 16v-6'/>",
+            ),
+            // A parcel, and one delivered.
+            "mail/package.svg" => Some(
+                "<path d='m21 8-9-5-9 5v8l9 5 9-5Z'/><path d='m3 8 9 5 9-5M12 13v8M7.5 5.5l9 5'/>",
+            ),
+            "mail/package-check.svg" => Some(
+                "<path d='M21 11V8l-9-5-9 5v8l9 5 1-.6'/><path d='m3 8 9 5 9-5M12 13v8M16 19l2 2 4-4'/>",
+            ),
+            "mail/receipt.svg" => Some(
+                "<path d='M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z'/><path d='M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 0 0 4H8M12 17.5v-11'/>",
+            ),
             // Sorting handles (the phone's account list): two columns of dots.
             "mail/grip.svg" => Some(
                 "<g fill='currentColor' stroke='none'><circle cx='9' cy='6' r='1.6'/><circle cx='15' cy='6' r='1.6'/><circle cx='9' cy='12' r='1.6'/><circle cx='15' cy='12' r='1.6'/><circle cx='9' cy='18' r='1.6'/><circle cx='15' cy='18' r='1.6'/></g>",
             ),
+            "mail/bell-off.svg" => Some(
+                "<path d='M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5M17 17H3s3-2 3-9a4.7 4.7 0 0 1 .3-1.7M10.3 21a1.9 1.9 0 0 0 3.4 0M2 2l20 20'/>",
+            ),
+            "mail/print.svg" => Some(
+                "<path d='M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2'/><rect x='6' y='14' width='12' height='8'/>",
+            ),
+            "mail/external.svg" => Some(
+                "<path d='M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'/>",
+            ),
+            "mail/template.svg" => Some(
+                "<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M3 9h18M9 21V9'/>",
+            ),
             "mail/ban.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='m5.6 5.6 12.8 12.8'/>"),
+            // The composer's tables: a grid.
+            "mail/table.svg" => Some(
+                "<rect x='3' y='4' width='18' height='16' rx='2'/><path d='M3 10h18M3 15h18M9 4v16M15 4v16'/>",
+            ),
+            // The emoji picker: a smiling face.
+            "mail/smile.svg" => Some(
+                "<circle cx='12' cy='12' r='9'/><path d='M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01'/>",
+            ),
+            // A VIP: a crown.
+            "mail/vip.svg" => Some(
+                "<path d='M11.6 3.3a.5.5 0 0 1 .8 0l3 5.6a1 1 0 0 0 1.5.3l4.3-3.7a.5.5 0 0 1 .8.5l-2.8 10.3a1 1 0 0 1-1 .7H5.8a1 1 0 0 1-1-.7L2 6a.5.5 0 0 1 .8-.5l4.3 3.7a1 1 0 0 0 1.5-.3Z M5 21h14'/>",
+            ),
+            // Workspaces: stacked layers.
+            "mail/workspace.svg" => Some(
+                "<path d='M12.8 2.2a2 2 0 0 0-1.6 0L2.6 6.1a1 1 0 0 0 0 1.8l8.6 3.9a2 2 0 0 0 1.6 0l8.6-3.9a1 1 0 0 0 0-1.8Z'/><path d='m2 12.6 9.2 4.2a2 2 0 0 0 1.6 0l9.2-4.2'/><path d='m2 17.6 9.2 4.2a2 2 0 0 0 1.6 0l9.2-4.2'/>",
+            ),
+            // The Screener: a person, checked.
+            "mail/screener.svg" => Some(
+                "<path d='m16 11 2 2 4-4M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2'/><circle cx='9' cy='7' r='4'/>",
+            ),
+            // Travel: a plane.
+            "mail/plane.svg" => Some(PLANE),
+            // Finance: a bank.
+            "mail/bank.svg" => Some(BANK),
+            // Social: two people.
+            "mail/people.svg" => Some(
+                "<circle cx='9' cy='8' r='3.5'/><path d='M2.5 20a6.5 6.5 0 0 1 13 0'/><path d='M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14a6.5 6.5 0 0 1 3.5 6'/>",
+            ),
+            // Tasks: a checklist.
+            "mail/tasks.svg" => Some("<path d='m3 6 2 2 4-4M3 14l2 2 4-4M13 6h8M13 14h8M13 20h8'/>"),
             "mail/tag.svg" => Some(
                 "<path d='M12.6 2.6A2 2 0 0 0 11.2 2H4a2 2 0 0 0-2 2v7.2a2 2 0 0 0 .6 1.4l8.7 8.7a2.4 2.4 0 0 0 3.4 0l6.6-6.6a2.4 2.4 0 0 0 0-3.4Z'/><circle cx='7.5' cy='7.5' r='.5'/>",
             ),
@@ -193,6 +260,10 @@ fn brand(name: &str) -> Option<&'static [u8]> {
         }
         "zoho.svg" => {
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'><rect width='48' height='48' rx='12' fill='#fff'/><rect x='.5' y='.5' width='47' height='47' rx='11.5' fill='none' stroke='#dadce0'/><rect x='9' y='17' width='7' height='14' rx='1.5' fill='#E42527'/><rect x='17.5' y='15' width='7' height='14' rx='1.5' fill='#089949' transform='rotate(-8 21 22)'/><rect x='26' y='17' width='7' height='14' rx='1.5' fill='#226DB4'/><rect x='34' y='17' width='6' height='14' rx='1.5' fill='#F9B21D'/></svg>"
+        }
+        // An organization's own server: a server with an envelope.
+        "exchange.svg" => {
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'><rect width='48' height='48' rx='12' fill='#1E3A5F'/><rect x='10' y='10' width='20' height='8' rx='2' fill='#9FC2E7'/><rect x='10' y='20' width='20' height='8' rx='2' fill='#9FC2E7'/><rect x='10' y='30' width='20' height='8' rx='2' fill='#9FC2E7'/><circle cx='26' cy='14' r='1.4' fill='#1E3A5F'/><circle cx='26' cy='24' r='1.4' fill='#1E3A5F'/><rect x='24' y='26' width='16' height='12' rx='2' fill='#fff'/><path d='M25 27.5l7 5 7-5' fill='none' stroke='#1E3A5F' stroke-width='1.8' stroke-linejoin='round'/></svg>"
         }
         "proton.svg" => {
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'><rect width='48' height='48' rx='12' fill='#6D4AFF'/><path d='M15 36V12h11a8 8 0 0 1 0 16h-5v8Z' fill='#fff'/><path d='M21 17h5a3 3 0 0 1 0 6h-5Z' fill='#6D4AFF'/></svg>"
@@ -266,3 +337,8 @@ pub fn preset(name: &str) -> Option<&'static [u8]> {
         .find(|(n, ..)| *n == name)
         .map(|(_, _, b)| *b)
 }
+
+/// Travel's icon: a plane.
+const PLANE: &str = "<path d='M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2Z'/>";
+/// Finance's icon: a bank.
+const BANK: &str = "<path d='M3 10 12 4l9 6M5 10v8M9.5 10v8M14.5 10v8M19 10v8M3 21h18M3 18h18'/>";

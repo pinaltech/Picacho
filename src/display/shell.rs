@@ -61,6 +61,22 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
         let commands = commands.clone();
         listener.serve(move || commands.unbounded_send(TrayCommand::Open).is_ok())
     });
+    // The login item follows the app should it have moved (an update, an
+    // AppImage elsewhere).
+    if background::starts_at_login(&backend.store) {
+        let dir = backend.store.path.clone();
+        cx.background_executor()
+            .spawn(async move { crate::display::autostart::refresh(&dir) })
+            .detach();
+    }
+    // The tray's counts follow the widget snapshots.
+    tray::follow(&backend.store);
+    // Mail in Spotlight or Windows Search, when turned on (Settings → Privacy).
+    crate::manage::system_search::start(backend.store.clone(), |link| {
+        if let Some(request) = crate::display::launch::request(&link) {
+            crate::display::launch::push(request);
+        }
+    });
     cx.set_global(Shell {
         backend,
         main: None,
@@ -76,6 +92,11 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
         while let Some(command) = requests.next().await {
             cx.update(|cx| match command {
                 TrayCommand::Open => open(cx),
+                TrayCommand::Widget => {
+                    crate::display::launch::push("picacho://widget/panel".to_owned());
+                    open(cx);
+                }
+                TrayCommand::Workspace(id) => switch_workspace(id, cx),
                 TrayCommand::Quit => quit(cx),
             });
         }
@@ -90,6 +111,22 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
     open(cx);
 }
 
+/// Turns a workspace on from the tray: in the window, where one is open.
+fn switch_workspace(id: Option<String>, cx: &mut App) {
+    let shell = cx.global::<Shell>();
+    match shell.view.as_ref().and_then(|v| v.upgrade()) {
+        Some(view) => view.update(cx, |this, cx| this.switch_workspace(id, cx)),
+        None => crate::manage::workspaces::Workspaces::switch_in(&shell.backend.store, id),
+    }
+}
+
+/// Whether closing the last window leaves Picacho running in the
+/// background (as `window_closed` decides) rather than quitting.
+pub(super) fn hands_over(cx: &App) -> bool {
+    cx.try_global::<Shell>()
+        .is_some_and(|shell| background::enabled(&shell.backend.store) && shell.instance.is_some())
+}
+
 /// Brings Picacho's window forward, opening the main window if none is.
 pub(super) fn open(cx: &mut App) {
     let windows = cx.windows();
@@ -100,6 +137,10 @@ pub(super) fn open(cx: &mut App) {
     if let Some(window) = shown {
         let _ = window.update(cx, |_, w, _| w.activate_window());
         cx.activate(true);
+        // Drawn again, it takes what a later launch asked to open.
+        if let Some(view) = cx.global::<Shell>().view.as_ref().and_then(|v| v.upgrade()) {
+            view.update(cx, |_, cx| cx.notify());
+        }
         return;
     }
     let backend = cx.global::<Shell>().backend.clone();
@@ -152,8 +193,26 @@ fn window_closed(cx: &mut App) {
     if let Some(view) = shell.view.take().and_then(|view| view.upgrade()) {
         view.update(cx, |this, _| this.retire());
     }
-    cx.quit();
+    // Quitting at once left the window on screen, frozen, until the process
+    // had ended: on Wayland its removal is only sent to the compositor as
+    // the event loop next goes to sleep, which a loop told to stop never
+    // does. A moment's wait lets it go first; the saving and handing over
+    // that quitting does then happen with nothing showing.
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(QUIT_AFTER_CLOSE).await;
+        cx.update(|cx| {
+            // Opened again meanwhile (a launch, the tray): it stays.
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        });
+    })
+    .detach();
 }
+
+/// How long quitting waits once the last window has closed, so the system
+/// takes the window away first (see `window_closed`).
+const QUIT_AFTER_CLOSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Shows or hides the tray icon with a window open, as Settings asks. (The
 /// background process shows its own.)

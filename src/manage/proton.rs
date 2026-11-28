@@ -24,10 +24,16 @@ pub enum ProtonNext {
     MailboxPassword,
     /// Signed in, and the account saved.
     Done(Box<Account>),
+    /// Signed in to Proton Pass (`proton_pass_begin`): its session waits
+    /// for `take_proton_pass_session`.
+    PassSignedIn,
 }
 
 /// A sign-in between its steps.
 pub(super) struct ProtonLogin {
+    /// For Proton Pass (its own session, for Proton's aliases), not to add
+    /// the account.
+    for_pass: bool,
     account: Account,
     taken: Vec<String>,
     login: proton::Login,
@@ -49,6 +55,45 @@ fn proton_remote(id: &str) -> RemoteDraft {
 }
 fn proton_draft(r: &RemoteDraft) -> Option<&str> {
     r.mailbox.strip_prefix("proton:")
+}
+
+/// `m` with what only its source (`raw`) says: Proton's message list
+/// doesn't carry its attachments, preview, list headers and the like.
+/// None when the source doesn't parse.
+fn with_source_headers(a: &Account, m: &Mail, raw: &[u8]) -> Option<Mail> {
+    let mut parsed = parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid).ok()?;
+    let mut next = m.clone();
+    next.has_attachments = !parsed.attachments().is_empty();
+    next.set_attachments(parsed.take_attachments());
+    if next.snippet.is_empty() {
+        next.snippet = std::mem::take(&mut parsed.snippet);
+    }
+    if !parsed.message_id.is_empty() {
+        next.message_id = std::mem::take(&mut parsed.message_id);
+    }
+    // What only the source's headers say: Proton's message list doesn't
+    // carry them. Without List-Unsubscribe, a sender's mail showed under
+    // Subscriptions only once each was opened.
+    if next.references().is_empty() {
+        next.set_references(parsed.references());
+    }
+    if parsed.automatic() {
+        next.set_automatic(true);
+    }
+    if next.receipt_to().is_empty() {
+        next.set_receipt_to(parsed.receipt_to());
+    }
+    if next.list_unsubscribe.is_empty() {
+        next.list_unsubscribe = std::mem::take(&mut parsed.list_unsubscribe);
+        next.one_click = parsed.one_click;
+    }
+    if next.list_id().is_empty() {
+        next.set_list_id(parsed.list_id());
+    }
+    if next.list_links().is_empty() {
+        next.set_list_links(parsed.list_links().to_vec());
+    }
+    Some(next)
 }
 
 /// The Proton message id of one of our rows.
@@ -77,14 +122,14 @@ pub(super) fn label_for(folders: &[proton::Folder], mailbox: &Mailbox) -> Result
             Folder::Junk => label_id::SPAM,
             Folder::Trash => label_id::TRASH,
             Folder::All => label_id::ALL_MAIL,
-            Folder::Other => bail!("Choose one of the account's folders."),
+            Folder::Other => bail!(t!("manage-proton-choose-one-of-the-accounts-folders")),
         }
         .to_owned(),
         Mailbox::Remote(name) => folders
             .iter()
             .find(|f| f.exclusive && &f.path == name)
             .map(|f| f.id.clone())
-            .with_context(|| format!("The folder “{name}” no longer exists at Proton."))?,
+            .with_context(|| t!("manage-proton-the-folder-no-longer-exists-at", name = name))?,
     })
 }
 
@@ -152,22 +197,66 @@ impl Backend {
     ) -> Result<ProtonNext> {
         self.proton_abandon();
         ensure!(proton::available(), "{}", proton::UNAVAILABLE);
-        ensure!(!password.is_empty(), "Enter your Proton password.");
+        ensure!(!password.is_empty(), t!("manage-proton-enter-your-proton-password"));
         account.validate()?;
         self.step(&cancel, SignInStep::Mailbox);
         let login = proton::Login::begin(account.login(), &password, &cancel, &|| {
             self.step(&cancel, SignInStep::Verifying)
         })?;
         self.step(&cancel, SignInStep::Mailbox);
-        ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+        ensure!(!cancel.load(Ordering::Relaxed), t!("manage-proton-sign-in-cancelled"));
         self.proton_advance(
             ProtonLogin {
+                for_pass: false,
                 account: account.clone(),
                 taken: taken.to_vec(),
                 login,
             },
             &cancel,
         )
+    }
+    /// Starts a sign-in to Proton Pass for `account`, a Proton account
+    /// here, as this build's Pass registration: the same steps as signing
+    /// in to Proton Mail, but the session is kept for Pass alone (Proton
+    /// gives Pass access only to a session signed in as an app with it).
+    /// Its keys aren't unlocked, so no mailbox password is asked for.
+    pub fn proton_pass_begin(
+        &self,
+        account: &Account,
+        password: String,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ProtonNext> {
+        self.proton_abandon();
+        ensure!(!password.is_empty(), t!("manage-proton-enter-your-proton-password"));
+        self.step(&cancel, SignInStep::Mailbox);
+        let login = proton::Login::begin_for_pass(account.login(), &password, &cancel, &|| {
+            self.step(&cancel, SignInStep::Verifying)
+        })?;
+        self.step(&cancel, SignInStep::Mailbox);
+        ensure!(!cancel.load(Ordering::Relaxed), t!("manage-proton-sign-in-cancelled"));
+        self.proton_advance(
+            ProtonLogin {
+                for_pass: true,
+                account: account.clone(),
+                taken: Vec::new(),
+                login,
+            },
+            &cancel,
+        )
+    }
+    /// The Proton Pass session signed in for `account`, once: the caller
+    /// keeps it from then on.
+    pub fn take_proton_pass_session(&self, account: &str) -> Option<proton::Saved> {
+        let mut kept = self.proton_pass_session.lock().unwrap();
+        match kept.take() {
+            Some((id, saved)) if id == account => Some(saved),
+            Some(other) => {
+                // Another account's: not this one's to take.
+                *kept = Some(other);
+                None
+            }
+            None => None,
+        }
     }
     /// The code from an authenticator app (step two).
     pub fn proton_code(&self, code: String, cancel: Arc<AtomicBool>) -> Result<ProtonNext> {
@@ -233,10 +322,26 @@ impl Backend {
             .lock()
             .unwrap()
             .take()
-            .context("This sign-in has ended. Start again with your password.")
+            .with_context(|| t!("manage-proton-this-sign-in-has-ended-start"))
     }
     /// Keeps the sign-in for its next step, or finishes it.
     fn proton_advance(&self, mut p: ProtonLogin, cancel: &AtomicBool) -> Result<ProtonNext> {
+        if p.for_pass {
+            if let proton::Next::SecondFactor { code, key } = p.login.next()? {
+                *self.proton_login.lock().unwrap() = Some(p);
+                return Ok(ProtonNext::SecondFactor { code, key });
+            }
+            let saved = p.login.session_only()?;
+            if cancel.load(Ordering::Relaxed) {
+                proton::sign_out(&saved);
+                bail!(t!("manage-proton-sign-in-cancelled"));
+            }
+            // One waiting at a time; an earlier one not taken is signed out.
+            if let Some((_, old)) = self.proton_pass_session.lock().unwrap().replace((p.account.id.clone(), saved)) {
+                proton::sign_out(&old);
+            }
+            return Ok(ProtonNext::PassSignedIn);
+        }
         match p.login.next()? {
             proton::Next::SecondFactor { code, key } => {
                 *self.proton_login.lock().unwrap() = Some(p);
@@ -266,7 +371,7 @@ impl Backend {
         } = p;
         if cancel.load(Ordering::Relaxed) {
             proton::sign_out(&signed.saved);
-            bail!("Sign-in cancelled.");
+            bail!(t!("manage-proton-sign-in-cancelled"));
         }
         let existing = self
             .store
@@ -285,8 +390,7 @@ impl Backend {
             if existing.is_some() || signed.addresses.is_empty() {
                 proton::sign_out(&signed.saved);
                 bail!(
-                    "That Proton account doesn't have {}. Sign in to the account it belongs to.",
-                    account.email
+                    t!("manage-proton-that-proton-account-doesnt-have-sign", email = account.email)
                 );
             }
             account.email = signed.addresses[0].clone();
@@ -302,8 +406,7 @@ impl Backend {
             account.validate()?;
             ensure!(
                 !taken.iter().any(|e| e.eq_ignore_ascii_case(&account.email)),
-                "{} is already added.",
-                account.email
+                t!("manage-proton-is-already-added", email = account.email)
             );
             let lock = self.account_lock(&account.id);
             let _operation = lock.lock().unwrap();
@@ -380,7 +483,30 @@ impl Backend {
         }
         result
     }
+    /// Runs `work` with the session of the Proton account `id`, signed in
+    /// without Bridge, as `with_proton` does: for its Proton aliases
+    /// (`forwarding.rs`), which use the account's own sign-in.
+    pub fn with_proton_account<T>(
+        &self,
+        id: &str,
+        work: impl FnOnce(&Session) -> Result<T>,
+    ) -> Result<T> {
+        let a = self
+            .store
+            .accounts()?
+            .into_iter()
+            .find(|a| a.id == id && a.provider == Provider::Proton)
+            .with_context(|| t!("manage-proton-the-proton-account-its-aliases-come"))?;
+        self.with_proton(&a, work)
+    }
     fn keep_proton_tokens(&self, a: &Account, session: &Session) {
+        // The newest tokens taken and saved in one step. The session is
+        // shared (the event watcher and syncs): two threads could take
+        // tokens in one order and save them in the other, leaving a used,
+        // single-use refresh token in the keychain to sign the account out
+        // at the next launch. Not the account lock, which callers may hold.
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         let Some(saved) = session.renewed() else {
             return;
         };
@@ -419,10 +545,11 @@ impl Backend {
         folders: &[proton::Folder],
         s: &Session,
         m: &MessageMetadata,
+        pre: Option<&Prefetched>,
     ) -> Result<Mail> {
         let id = row_id(a, &m.id);
         let (folder, remote) = location(&m.label_ids, folders);
-        let mut mail = match self.store.message(&id)? {
+        let mut mail = match Prefetched::cached(pre, &self.store, &id)? {
             Some(cached) => cached,
             None => Mail {
                 id,
@@ -457,6 +584,10 @@ impl Backend {
         mail.size = u32::try_from(m.size).unwrap_or(u32::MAX);
         mail.answered = m.is_replied || m.is_replied_all;
         mail.forwarded = m.is_forwarded;
+        // An automatic reply, as Proton marks it.
+        if m.flags & protected_email_bridge::api::types::message_flag::AUTO != 0 {
+            mail.set_automatic(true);
+        }
         let mut labels: Vec<String> = m
             .label_ids
             .iter()
@@ -520,8 +651,9 @@ impl Backend {
                 complete = false;
             }
             let mut rows = Vec::with_capacity(listed.len());
+            let pre = Prefetched::new(&self.store, listed.iter().map(|m| row_id(a, &m.id)).collect())?;
             for m in &listed {
-                rows.push(self.proton_mail(a, &folders, s, m)?);
+                rows.push(self.proton_mail(a, &folders, s, m, Some(&pre))?);
             }
             // What the cache has here that Proton didn't list: within the
             // listed range (or anywhere, when the whole mailbox was listed),
@@ -537,9 +669,11 @@ impl Backend {
                 .unwrap_or(i64::MIN);
             let listed_ids: std::collections::HashSet<&str> =
                 rows.iter().map(|m| m.id.as_str()).collect();
+            // Only their ids are needed: without bodies, every sync no
+            // longer reads (and parses) the whole cached mailbox's text.
             let unlisted: Vec<Mail> = self
                 .store
-                .messages(&a.id, mailbox.clone(), usize::MAX >> 1)?
+                .summaries(&a.id, mailbox.clone())?
                 .into_iter()
                 .filter(|m| proton_id(a, m).is_some() && !listed_ids.contains(m.id.as_str()))
                 .filter(|m| complete || m.date >= oldest)
@@ -548,8 +682,9 @@ impl Backend {
                 let current = s.metadata(&ids(a, &unlisted))?;
                 let still: std::collections::HashSet<String> =
                     current.iter().map(|m| row_id(a, &m.id)).collect();
+                let pre = Prefetched::new(&self.store, current.iter().map(|m| row_id(a, &m.id)).collect())?;
                 for m in &current {
-                    rows.push(self.proton_mail(a, &folders, s, m)?);
+                    rows.push(self.proton_mail(a, &folders, s, m, Some(&pre))?);
                 }
                 let gone: Vec<String> = unlisted
                     .iter()
@@ -582,7 +717,7 @@ impl Backend {
             let folders = s.folders();
             let label = label_for(&folders, mailbox)?;
             let total = s.count(&label)?;
-            let cached = self.store.summaries(&a.id, mailbox.clone())?.len();
+            let cached = self.store.count_messages(&a.id, mailbox.clone())?;
             if cached >= total {
                 return Ok(Catalog {
                     cataloged: total,
@@ -609,8 +744,8 @@ impl Backend {
                         ended = true;
                         continue;
                     }
-                    if self.store.message(&row_id(a, &m.id))?.is_none() {
-                        added.push(self.proton_mail(a, &folders, s, m)?);
+                    if !self.store.has_message(&row_id(a, &m.id))? {
+                        added.push(self.proton_mail(a, &folders, s, m, None)?);
                     }
                 }
                 if last || ended || added.len() >= batch.min(PAGE) {
@@ -641,11 +776,11 @@ impl Backend {
 
     /// Downloads and decrypts one message as MIME, and caches it.
     pub(super) fn download_proton(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
-        let id = proton_id(a, m).context("This message isn't from Proton.")?;
+        let id = proton_id(a, m).with_context(|| t!("manage-proton-this-message-isnt-from-proton"))?;
         let raw = self.with_proton(a, |s| s.literal(id))?;
         ensure!(
             raw.len() <= large::MAX_DOWNLOAD,
-            "Message exceeds the download limit."
+            t!("manage-proton-message-exceeds-the-download-limit")
         );
         self.note_traffic(a, raw.len());
         self.store.save_raw(&m.id, &raw)?;
@@ -656,7 +791,7 @@ impl Backend {
     /// each attachment downloads when it is saved (`proton_attachment`),
     /// as for one through IMAP.
     pub(super) fn read_proton_parts(&self, a: &Account, m: &Mail) -> Result<Mail> {
-        let id = proton_id(a, m).context("This message isn't from Proton.")?;
+        let id = proton_id(a, m).with_context(|| t!("manage-proton-this-message-isnt-from-proton"))?;
         let (text, attachments) = self.with_proton(a, |s| s.text_only(id))?;
         let mut next = parse_message(&text, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         next.set_attachments(
@@ -689,7 +824,7 @@ impl Backend {
         m: &Mail,
         section: &str,
     ) -> Result<Vec<u8>> {
-        let id = proton_id(a, m).context("This message isn't from Proton.")?;
+        let id = proton_id(a, m).with_context(|| t!("manage-proton-this-message-isnt-from-proton"))?;
         self.with_proton(a, |s| s.attachment(id, section))
     }
 
@@ -707,34 +842,61 @@ impl Backend {
                 break;
             }
             let raw = self.download_proton(a, &m)?;
-            if let Ok(mut parsed) = parse_message(&raw, a, &m.id, m.folder, &m.remote_folder, m.uid) {
-                let mut next = m.clone();
-                next.has_attachments = !parsed.attachments().is_empty();
-                next.set_attachments(parsed.take_attachments());
-                if next.snippet.is_empty() {
-                    next.snippet = std::mem::take(&mut parsed.snippet);
-                }
-                if !parsed.message_id.is_empty() {
-                    next.message_id = std::mem::take(&mut parsed.message_id);
-                }
-                // What only the source's headers say: Proton's message list
-                // doesn't carry them. Without List-Unsubscribe, a sender's
-                // mail showed under Subscriptions only once each was opened.
-                if next.references().is_empty() {
-                    next.set_references(parsed.references());
-                }
-                if next.receipt_to().is_empty() {
-                    next.set_receipt_to(parsed.receipt_to());
-                }
-                if next.list_unsubscribe.is_empty() {
-                    next.list_unsubscribe = std::mem::take(&mut parsed.list_unsubscribe);
-                    next.one_click = parsed.one_click;
-                }
+            if let Some(next) = with_source_headers(a, &m, &raw) {
                 self.store.save_messages(&[next])?;
             }
             stored += 1;
         }
         Ok(stored)
+    }
+
+    /// The message a notification told of, to open it: the cached row, or,
+    /// for a Proton account (whose pushes come before the mail is synced),
+    /// its row fetched from Proton and cached, its source too where the
+    /// account keeps mail on this device. `message` is a row id or a
+    /// Message-ID. None when there's no such message (anymore).
+    pub fn fetch_notified(&self, a: &Account, message: &str) -> Result<Option<Mail>> {
+        if let Some(m) = self.store.message(message)? {
+            return Ok(Some(m));
+        }
+        if let Some(m) = self.store.by_message_id(message)?.filter(|m| m.account == a.id) {
+            return Ok(Some(m));
+        }
+        if a.provider != Provider::Proton {
+            return Ok(None);
+        }
+        let Some(id) = message
+            .strip_prefix(a.id.as_str())
+            .and_then(|rest| rest.strip_prefix(":proton:"))
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(None);
+        };
+        let fetched = self.with_proton(a, |s| {
+            let Some(listed) = s.metadata(&[id.to_owned()])?.into_iter().next() else {
+                return Ok(None);
+            };
+            let folders = s.folders();
+            Ok(Some(self.proton_mail(a, &folders, s, &listed, None)?))
+        })?;
+        let Some(mut mail) = fetched else {
+            return Ok(None);
+        };
+        // A check may have cached it meanwhile, perhaps with its source.
+        if let Some(cached) = self.store.message(&mail.id)? {
+            return Ok(Some(cached));
+        }
+        self.store.save_messages(std::slice::from_ref(&mail))?;
+        let offline = a.sync.offline_since(chrono::Utc::now().timestamp()).is_some();
+        if offline
+            && u64::from(mail.size) <= MAX_MESSAGE as u64
+            && let Ok(raw) = self.download_proton(a, &mail)
+            && let Some(next) = with_source_headers(a, &mail, &raw)
+        {
+            self.store.save_messages(std::slice::from_ref(&next))?;
+            mail = next;
+        }
+        Ok(Some(mail))
     }
 
     /// Makes a change at Proton.
@@ -757,7 +919,7 @@ impl Backend {
                     Folder::Archive => label_id::ARCHIVE,
                     Folder::Junk => label_id::SPAM,
                     Folder::Trash => label_id::TRASH,
-                    other => bail!("Proton doesn't move mail to {}.", other.label()),
+                    other => bail!(t!("manage-proton-proton-doesnt-move-mail-to", label = other.label())),
                 };
                 s.label_messages(target, &ids, true)
             }
@@ -813,7 +975,8 @@ impl Backend {
             }
             Ok(count)
         })?;
-        let cached = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
+        // Deleted by id: their bodies needn't be read.
+        let cached = self.store.summaries(&a.id, mailbox)?;
         self.store.commit_changes(&cached, true)?;
         Ok(count)
     }
@@ -835,8 +998,10 @@ impl Backend {
             let folders = s.folders();
             let label = label_for(&folders, mailbox)?;
             let mut out = ServerResults::default();
-            for m in s.list_all(&label, SEARCH_MOST)? {
-                let row = self.proton_mail(a, &folders, s, &m)?;
+            let listed = s.list_all(&label, SEARCH_MOST)?;
+            let pre = Prefetched::new(&self.store, listed.iter().map(|m| row_id(a, &m.id)).collect())?;
+            for m in listed {
+                let row = self.proton_mail(a, &folders, s, &m, Some(&pre))?;
                 if search.matches(&row) {
                     out.total += 1;
                     if out.mails.len() < limit {
@@ -854,25 +1019,13 @@ impl Backend {
     pub(super) fn mark_all_read_proton(&self, a: &Account, mailbox: &Mailbox) -> Result<()> {
         self.with_proton(a, |s| {
             let label = label_for(&s.folders(), mailbox)?;
-            let unread: Vec<String> = s
-                .list_all(&label, usize::MAX >> 1)?
-                .into_iter()
-                .filter(|m| m.unread)
-                .map(|m| m.id)
-                .collect();
+            let unread = s.unread_ids(&label)?;
             if !unread.is_empty() {
                 s.mark_read(&unread, true)?;
             }
             Ok(())
         })?;
-        let mut cached = self
-            .store
-            .messages(&a.id, mailbox.clone(), usize::MAX >> 1)?;
-        cached.retain(|m| m.unread);
-        for m in &mut cached {
-            m.unread = false;
-        }
-        self.store.save_messages(&cached)
+        self.store.mark_mailbox_read(&a.id, mailbox.clone())
     }
 
     /// Saves a copy of a message sent through another server in Sent at
@@ -882,6 +1035,16 @@ impl Backend {
     }
     /// Files Sent copies that couldn't be saved when they were sent.
     fn file_queued_sent_copies_proton(&self, a: &Account) -> Result<usize> {
+        self.file_queued_sent_copies_with(a, |raw| self.file_sent_copy_proton(a, raw))
+    }
+    /// Files Sent copies that couldn't be saved when they were sent, each
+    /// with `file` (an API's own way). Those that keep failing for two
+    /// weeks, or can never be filed, are dropped.
+    pub(super) fn file_queued_sent_copies_with(
+        &self,
+        a: &Account,
+        file: impl Fn(&[u8]) -> Result<()>,
+    ) -> Result<usize> {
         let Ok(entries) = std::fs::read_dir(self.sent_queue(&a.id)) else {
             return Ok(0);
         };
@@ -899,7 +1062,7 @@ impl Backend {
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age > std::time::Duration::from_secs(14 * 86_400));
             let raw = std::fs::read(&path)?;
-            match self.file_sent_copy_proton(a, &raw) {
+            match file(&raw) {
                 Ok(()) => {
                     let _ = std::fs::remove_file(&path);
                     filed += 1;
@@ -937,23 +1100,27 @@ impl Backend {
             {
                 return Err(e);
             }
-            if !pending.is_empty() {
-                self.save_draft_removals(&a.id, &[])?;
-            }
-            let on_server: Vec<String> = s
-                .list_all(label_id::DRAFTS, 1000)?
+            self.clear_draft_removals(&a.id, &pending)?;
+            // Only a complete listing shows that a draft missing from it is
+            // gone: `list_all` stops at its limit, so one more is asked for.
+            const MOST: usize = 20_000;
+            let mut on_server: Vec<String> = s
+                .list_all(label_id::DRAFTS, MOST + 1)?
                 .into_iter()
                 .map(|m| m.id)
                 .collect();
+            let complete = on_server.len() <= MOST;
+            on_server.truncate(MOST);
+            let listed: std::collections::HashSet<&str> = on_server.iter().map(String::as_str).collect();
             let mut changed = 0;
             let mut locals = self.store.drafts(&a.id)?;
             // Copies gone from Proton (sent or deleted elsewhere): unchanged
             // drafts go here too; changed ones upload again.
             for d in &mut locals {
-                let Some(id) = d.remote.as_ref().and_then(proton_draft).map(str::to_owned) else {
+                let Some(id) = d.remote.as_ref().and_then(proton_draft) else {
                     continue;
                 };
-                if on_server.contains(&id) {
+                if !complete || listed.contains(id) {
                     continue;
                 }
                 if d.uploaded == d.fingerprint() {
@@ -967,17 +1134,18 @@ impl Backend {
             }
             locals.retain(|d| !d.id.is_empty());
             // Drafts written elsewhere.
+            let claimed: std::collections::HashSet<String> = locals
+                .iter()
+                .filter_map(|d| d.remote.as_ref().and_then(proton_draft).map(str::to_owned))
+                .collect();
             for id in &on_server {
-                if locals
-                    .iter()
-                    .any(|d| d.remote.as_ref().and_then(proton_draft) == Some(id.as_str()))
-                {
+                if claimed.contains(id) {
                     continue;
                 }
                 let raw = s.literal(id)?;
                 ensure!(
                     raw.len() <= MAX_MESSAGE,
-                    "A draft at Proton is too large to open here."
+                    t!("manage-proton-a-draft-at-proton-is-too")
                 );
                 let mut d = self.draft_from(a, &uuid::Uuid::new_v4().to_string(), &raw)?;
                 d.remote = Some(proton_remote(id));
@@ -992,17 +1160,31 @@ impl Backend {
                 if d.remote.is_some() && d.uploaded == fingerprint {
                     continue;
                 }
+                // Proton keeps drafts encrypted itself; drafts to be
+                // encrypted without a key of yours stay here.
+                if d.encrypt && self.draft_seal(a, d)?.is_none() {
+                    // Its earlier copy is no longer it.
+                    if let Some(old) = d.remote.as_ref().and_then(proton_draft) {
+                        if let Err(e) = s.delete(&[old.to_owned()])
+                            && crate::sync::retry::later(&e)
+                        {
+                            return Err(e);
+                        }
+                        self.keep_draft_here(d)?;
+                    }
+                    continue;
+                }
                 let raw = crate::sync::smtp::build(a, d, true)?.formatted();
                 let id = s.save_draft(&raw)?;
                 if let Some(old) = d.remote.as_ref().and_then(proton_draft) {
                     let _ = s.delete(&[old.to_owned()]);
                 }
-                // A composer may have saved a newer version meanwhile; it
-                // keeps its words, and uploads again next time.
-                let mut current = self.store.draft(&d.id)?.unwrap_or_else(|| d.clone());
-                current.remote = Some(proton_remote(&id));
-                current.uploaded = fingerprint;
-                self.store.save_draft(&current)?;
+                if !self.finish_draft_upload(d, proton_remote(&id), fingerprint)?
+                    && s.delete(std::slice::from_ref(&id)).is_err()
+                {
+                    // Discarded while uploading: its new copy goes too.
+                    self.queue_draft_removal(&a.id, proton_remote(&id))?;
+                }
             }
             Ok(changed)
         })
@@ -1014,6 +1196,7 @@ impl Backend {
             Ok((max > 0).then_some(Quota {
                 used_kib: used / 1024,
                 limit_kib: max / 1024,
+                ..Quota::default()
             }))
         })
     }
@@ -1027,7 +1210,7 @@ impl Backend {
         to: &[String],
         raw: &[u8],
     ) -> Result<()> {
-        ensure!(!to.is_empty(), "Add at least one recipient.");
+        ensure!(!to.is_empty(), t!("manage-proton-add-at-least-one-recipient"));
         self.with_proton(a, |s| s.send(from, to, raw))
     }
 
@@ -1083,13 +1266,7 @@ impl Backend {
         })?;
         // Rows keep their ids; only the folder they show in is renamed.
         for (old, new) in &change.moved {
-            let mut rows =
-                self.store
-                    .messages(&a.id, Mailbox::Remote(old.clone()), usize::MAX >> 1)?;
-            for m in &mut rows {
-                m.remote_folder = new.clone();
-            }
-            self.store.save_messages(&rows)?;
+            self.store.rename_remote(&a.id, old, new)?;
         }
         Ok(change)
     }
@@ -1109,9 +1286,101 @@ impl Backend {
         // Proton moves what was in it to the inbox; the next check finds it there.
         let rows = self
             .store
-            .messages(&a.id, Mailbox::Remote(name.to_owned()), usize::MAX >> 1)?;
+            .summaries(&a.id, Mailbox::Remote(name.to_owned()))?;
         self.store.commit_changes(&rows, true)?;
         Ok(folders)
+    }
+}
+
+// Follow-up reminders and notes (`follow_up`, `notes`).
+impl Backend {
+    /// Picacho's folder at Proton (made with `create`), by label id.
+    fn picacho_label_proton(&self, a: &Account, s: &Session, create: bool) -> Result<Option<String>> {
+        let parent = super::snooze::PARENT;
+        let find = |s: &Session| {
+            s.folders()
+                .into_iter()
+                .find(|f| f.exclusive && f.depth == 0 && f.path.eq_ignore_ascii_case(parent))
+                .map(|f| f.id)
+        };
+        if let Some(id) = find(s) {
+            return Ok(Some(id));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let id = s.create_label(parent, true, None)?;
+        s.reload_folders()?;
+        let _ = self.store.save_folders(&a.id, &remote_folders(&s.folders()));
+        Ok(Some(id))
+    }
+    /// The notes in Picacho's folder, by message id.
+    pub(super) fn read_notes_proton(&self, a: &Account, kind: &str) -> Result<super::notes::NoteSources> {
+        self.with_proton(a, |s| {
+            let Some(label) = self.picacho_label_proton(a, s, false)? else {
+                return Ok(None);
+            };
+            let mut out = Vec::new();
+            for m in s.list_all(&label, 50)? {
+                if super::notes::titled(&m.subject, kind) {
+                    out.push((m.id.clone(), s.literal(&m.id)?));
+                }
+            }
+            Ok(Some(out))
+        })
+    }
+    /// Puts a note in Picacho's folder, then deletes `old`.
+    pub(super) fn write_note_proton(&self, a: &Account, raw: &[u8], old: &[String]) -> Result<()> {
+        self.with_proton(a, |s| {
+            let label = self
+                .picacho_label_proton(a, s, true)?
+                .with_context(|| t!("manage-snooze-proton-didnt-keep-the-new-folder"))?;
+            let id = s.import(raw, &label, false)?;
+            let _ = s.mark_read(&[id], true);
+            if !old.is_empty() {
+                s.delete(old)?;
+            }
+            Ok(())
+        })
+    }
+    /// The messages of the Proton conversation `message_id` is in, newer
+    /// than `since`, as rows (not saved), each given the conversation as its
+    /// thread (returned too). Proton can't list a conversation by itself:
+    /// the message is found by its Message-ID, then All Mail is read newest
+    /// first back to `since`.
+    pub(super) fn proton_conversation(&self, a: &Account, message_id: &str, since: i64) -> Result<(String, Vec<Mail>)> {
+        self.with_proton(a, |s| {
+            let Some(conversation) = s
+                .by_message_id(message_id)?
+                .into_iter()
+                .map(|m| m.conversation_id)
+                .find(|c| !c.is_empty())
+            else {
+                return Ok((String::new(), Vec::new()));
+            };
+            let folders = s.folders();
+            let thread = format!("proton:{conversation}");
+            let mut out = Vec::new();
+            // Up to 1,500 messages back.
+            'pages: for page in 0..10 {
+                let listed = s.list(label_id::ALL_MAIL, page, 150)?;
+                let last = listed.len() < 150;
+                for m in &listed {
+                    if m.time < since {
+                        break 'pages;
+                    }
+                    if m.conversation_id == conversation {
+                        let mut mail = self.proton_mail(a, &folders, s, m, None)?;
+                        mail.set_thread_id(thread.clone());
+                        out.push(mail);
+                    }
+                }
+                if last {
+                    break;
+                }
+            }
+            Ok((thread, out))
+        })
     }
 }
 

@@ -32,14 +32,14 @@ impl Backend {
     ) -> Result<ServerResults> {
         ensure!(
             a.provider != Provider::Pop3,
-            "POP3 servers can't search; only mail on this computer is searched."
+            t!("manage-remote-search-pop3-servers-cant-search-only-mail")
         );
         ensure!(
             mailbox.folder() != Folder::Drafts,
-            "Drafts are searched on this computer."
+            t!("manage-remote-search-drafts-are-searched-on-this-computer")
         );
         let query = query.trim();
-        ensure!(!query.is_empty(), "Type something to search for.");
+        ensure!(!query.is_empty(), t!("manage-remote-search-type-something-to-search-for"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         if a.provider == Provider::Proton {
@@ -47,6 +47,15 @@ impl Backend {
         }
         if a.provider == Provider::Jmap {
             return self.search_jmap(a, mailbox, query, limit);
+        }
+        if a.gmail_api() {
+            return self.search_gmail(a, mailbox, query, limit);
+        }
+        if a.graph() {
+            return self.search_graph(a, mailbox, query, limit);
+        }
+        if a.ews() {
+            return self.search_ews(a, mailbox, query, limit);
         }
         self.with_imap(a, |c| {
             let names = c.names(false)?.to_vec();
@@ -83,16 +92,78 @@ impl Backend {
             }
             let ext = c.extensions()?;
             let utf8 = c.enabled.utf8;
+            let literals = c.literals();
             let string = |text: &str| search_string(text, &ext, utf8);
-            let mut criteria = if ext.gmail {
+            let search = crate::manage::search::Search::parse(query);
+            // Gmail's own search knows no code mail or package updates.
+            let mut criteria = if ext.gmail && !search.wants_kinds() {
                 format!("X-GM-RAW {}", string(query)?)
             } else {
-                crate::manage::search::Search::parse(query).imap_criteria(&string)?
+                search.imap_criteria_with(
+                    &string,
+                    crate::manage::search::ImapSearch {
+                        within: ext.within,
+                        fuzzy: ext.fuzzy,
+                        objectid: ext.objectid,
+                        gmail: ext.gmail,
+                    },
+                )?
             };
             if starred {
                 criteria.push_str(" FLAGGED");
             }
             let mut out = ServerResults::default();
+            // All Mail and Starred in one command where the server can
+            // (MULTISEARCH), without selecting each folder; each mailbox's
+            // newest matches are then listed as below.
+            if ext.multisearch && remotes.len() > 1 {
+                let wire: Vec<String> = remotes
+                    .iter()
+                    .map(|(r, _)| c.mailbox(r))
+                    .collect::<Result<_>>()?;
+                // A server refusing it (one mailbox it can't search, say)
+                // is searched folder by folder below instead.
+                // A reply without a mailbox is no match there (RFC 7377
+                // §2 lets the server leave those out); only a refusal is
+                // searched again.
+                let (found, searched) =
+                    match crate::sync::transport::multisearch(&mut c.session, literals.as_ref(), &wire, &criteria, utf8) {
+                        Ok(found) => (found, std::mem::take(&mut remotes)),
+                        Err(_) => (Vec::new(), Vec::new()),
+                    };
+                for f in found {
+                    let Some((remote, folder)) = searched
+                        .iter()
+                        .find(|(r, _)| c.wire(r) == f.mailbox || *r == f.mailbox)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    out.total += f.count;
+                    let mut newest = f.uids;
+                    newest.sort_unstable_by(|a, b| b.cmp(a));
+                    newest.truncate(limit);
+                    let prefix = format!("{}:{remote}:{}:", a.id, f.validity);
+                    let mut missing = Vec::new();
+                    for uid in &newest {
+                        match self.store.message(&format!("{prefix}{uid}"))? {
+                            Some(m) => out.mails.push(m),
+                            None => missing.push(*uid),
+                        }
+                    }
+                    if !missing.is_empty() {
+                        // Headers come from the mailbox itself.
+                        let selected = c.select(&remote)?;
+                        if selected.validity != f.validity {
+                            continue;
+                        }
+                        let listed =
+                            self.list_uids(c, a, folder, &remote, selected.validity, &missing)?;
+                        self.store.save_messages(&listed)?;
+                        out.mails.extend(listed);
+                    }
+                }
+            }
             for (remote, folder) in remotes {
                 let selected = match c.select(&remote) {
                     Ok(selected) => selected,
@@ -102,9 +173,10 @@ impl Backend {
                     }
                     Err(e) => return Err(e),
                 };
-                let uids = sorted_search(&mut c.session, &ext, &selected, &criteria, utf8)?;
-                out.total += uids.len();
-                let newest = &uids[..uids.len().min(limit)];
+                let (uids, total) =
+                    newest_search(&mut c.session, literals.as_ref(), &ext, &selected, &criteria, utf8, limit)?;
+                out.total += total;
+                let newest = &uids[..];
                 let prefix = format!("{}:{remote}:{}:", a.id, selected.validity);
                 let mut missing = Vec::new();
                 for uid in newest {

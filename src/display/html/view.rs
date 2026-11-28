@@ -1,6 +1,6 @@
 //! GPUI input, clipping and strip caching for an HTML document whose work
 //! happens on its own thread (see `worker.rs`).
-use super::document::{Tone, page_color};
+use super::document::{Scroller, Tone, page_color};
 use super::worker::{self, Command, Output, Update, band_height};
 use crate::manage::model::InlineParts;
 use blitz_traits::events::*;
@@ -37,6 +37,33 @@ pub enum HtmlLink {
     Opened(String),
 }
 
+/// Part of the email to bring into view, in window coordinates: a `#` link's
+/// target (`start`: scroll it to the top) or the element Tab focused (just
+/// into view). The view's owner scrolls (see `scroll_to_reveal`).
+#[derive(Clone, Copy, Debug)]
+pub struct HtmlReveal {
+    pub top: Pixels,
+    pub bottom: Pixels,
+    pub start: bool,
+}
+
+/// Scrolls `handle`'s content to show `reveal`.
+pub fn scroll_to_reveal(handle: &ScrollHandle, reveal: &HtmlReveal) {
+    let view = handle.bounds();
+    let offset = handle.offset();
+    let max = handle.max_offset().y;
+    let margin = px(16.);
+    let by = if reveal.start || reveal.top < view.top() + margin {
+        reveal.top - view.top() - margin
+    } else if reveal.bottom > view.bottom() - margin {
+        (reveal.bottom - view.bottom() + margin).min(reveal.top - view.top() - margin)
+    } else {
+        return;
+    };
+    let y = (offset.y - by).clamp(-max, px(0.));
+    handle.set_offset(point(offset.x, y));
+}
+
 /// The whole email, scaled down, for the collapsed reader.
 struct Thumbnail {
     revision: u64,
@@ -48,7 +75,9 @@ struct Thumbnail {
 }
 
 pub struct HtmlView {
-    source: String,
+    /// The HTML shown, shared with whoever prepared it: the same one handed
+    /// in again (every frame) is known by its pointer, without comparing.
+    source: std::rc::Rc<String>,
     /// Whether the renderer failed on `source`.
     failed: bool,
     /// The message parts `source` refers to by `cid:` address.
@@ -69,9 +98,14 @@ pub struct HtmlView {
     revision: u64,
     laid_out: bool,
     height: f32,
-    /// The width last sent for layout, and the one the latest state used.
+    /// The layout last asked for (width, window height, scale bits), and the
+    /// width the latest state used.
     width: u32,
+    screen: (u32, u32),
     laid_width: u32,
+    /// The email's page color (0xRRGGBB), and its scrollable boxes.
+    page: u32,
+    scrollers: Vec<Scroller>,
     bounds: Bounds<Pixels>,
     focus: FocusHandle,
     cursor: CursorStyle,
@@ -85,9 +119,17 @@ pub struct HtmlView {
     pressed_at: Option<(f32, f32)>,
     /// The link under the pointer.
     hovered: Option<String>,
+    /// The person's text zoom for emails (1: their own size).
+    text_zoom: f32,
+    /// What screen readers are given of the email (its painted strips say
+    /// nothing): its text, and its links (text, address).
+    accessible: Option<(SharedString, Vec<(String, String)>)>,
+    /// An element to bring into view once the document is laid out.
+    pending_reveal: Option<String>,
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
 impl EventEmitter<HtmlLink> for HtmlView {}
+impl EventEmitter<HtmlReveal> for HtmlView {}
 
 impl HtmlView {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -113,7 +155,7 @@ impl HtmlView {
         })
         .detach();
         Self {
-            source: String::new(),
+            source: Default::default(),
             failed: false,
             inline: Default::default(),
             blocked: true,
@@ -129,7 +171,10 @@ impl HtmlView {
             laid_out: false,
             height: 1.,
             width: 0,
+            screen: (0, 0),
             laid_width: 0,
+            page: page_color(Tone::Light),
+            scrollers: Vec::new(),
             bounds: Bounds::default(),
             focus: cx.focus_handle(),
             cursor: CursorStyle::Arrow,
@@ -140,7 +185,20 @@ impl HtmlView {
             context_at: None,
             pressed_at: None,
             hovered: None,
+            text_zoom: 1.,
+            accessible: None,
+            pending_reveal: None,
         }
+    }
+    /// Shows emails larger or smaller (WCAG 1.4.4), now and from now on.
+    pub fn set_text_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(0.5, 3.);
+        if (zoom - self.text_zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.text_zoom = zoom;
+        self.send(Command::TextZoom(zoom));
+        cx.notify();
     }
     /// Says the pointer is over `link` now, if that changed.
     fn hover(&mut self, link: Option<String>, cx: &mut Context<Self>) {
@@ -148,6 +206,16 @@ impl HtmlView {
             self.hovered = link.clone();
             cx.emit(HtmlLink::Hovered(link));
         }
+    }
+    #[cfg(test)]
+    pub fn text_zoom(&self) -> f32 {
+        self.text_zoom
+    }
+    /// How many documents it has started (or cleared), and whether the
+    /// HTML it shows is `html` itself (the same one, not a copy).
+    #[cfg(test)]
+    pub fn started(&self, html: &std::rc::Rc<String>) -> (u64, bool) {
+        (self.generation, std::rc::Rc::ptr_eq(&self.source, html))
     }
     #[cfg(test)]
     pub fn has_document(&self) -> bool {
@@ -163,7 +231,7 @@ impl HtmlView {
         // Dropping the sender ends the thread and cancels its resources.
         self.worker = None;
         self.generation += 1;
-        self.source = String::new();
+        self.source = Default::default();
         // The message's inline images can be large; don't keep them past it.
         self.inline = Default::default();
         self.failed = false;
@@ -174,7 +242,9 @@ impl HtmlView {
         self.thumbnail_requested = None;
         self.requested.clear();
         self.width = 0;
+        self.screen = (0, 0);
         self.laid_width = 0;
+        self.scrollers.clear();
         self.laid_out = false;
         self.selection = None;
         self.cursor = CursorStyle::Arrow;
@@ -190,33 +260,40 @@ impl HtmlView {
     /// they arrive when the message has been read, which shows it again.
     pub fn set_content(
         &mut self,
-        html: &str,
+        source: &std::rc::Rc<String>,
         inline: &Arc<InlineParts>,
         blocked: bool,
         dark: bool,
         clean_links: bool,
         cx: &mut Context<Self>,
     ) {
-        // Called on every reader render: compare cheaply before scanning
-        // the HTML for its color scheme.
+        // Called on every render: the HTML prepared once and handed in
+        // again is the same one (its pointer); only HTML made anew is
+        // compared, before scanning it for its color scheme.
         if self.worker.is_some()
             && self.dark == dark
             && self.blocked == blocked
             && self.clean_links == clean_links
-            && self.source.len() == html.len()
             && (Arc::ptr_eq(&self.inline, inline) || self.inline == *inline)
-            && self.source == html
+            && (std::rc::Rc::ptr_eq(&self.source, source)
+                || (self.source.len() == source.len() && self.source == *source))
         {
+            // The same HTML made anew: kept, so the next frame's (if it is
+            // this one again) is known by its pointer.
+            self.source = source.clone();
             return;
         }
+        let html = source.as_str();
         let tone = Tone::for_email(html, dark);
         self.dark = dark;
         self.clear(cx);
-        self.source = html.into();
+        self.accessible = None;
+        self.source = source.clone();
         self.inline = inline.clone();
         self.blocked = blocked;
         self.clean_links = clean_links;
         self.tone = tone;
+        self.page = page_color(tone);
         self.height = 1.;
         let shown = if clean_links {
             crate::manage::tracking::clean_html_links(html)
@@ -231,6 +308,9 @@ impl HtmlView {
             self.generation,
             self.updates.clone(),
         ));
+        if (self.text_zoom - 1.).abs() > f32::EPSILON {
+            self.send(Command::TextZoom(self.text_zoom));
+        }
         cx.notify();
     }
     /// Takes images no longer shown out of the window's atlas. Strips and
@@ -241,6 +321,15 @@ impl HtmlView {
     pub fn release(&mut self, window: &mut Window) {
         for image in self.retired.drain(..) {
             let _ = window.drop_image(image);
+        }
+    }
+    /// Brings the element with this id into view, once laid out (Find in
+    /// Message): the view emits `HtmlReveal` for its owner to scroll.
+    pub fn reveal_element(&mut self, id: String) {
+        if self.laid_out {
+            self.send(Command::Reveal(id));
+        } else {
+            self.pending_reveal = Some(id);
         }
     }
     fn send(&self, command: Command) {
@@ -259,6 +348,8 @@ impl HtmlView {
                 height,
                 cursor,
                 selection,
+                page,
+                scrollers,
             } => {
                 self.revision = revision;
                 self.laid_width = width;
@@ -266,7 +357,19 @@ impl HtmlView {
                 self.height = height;
                 self.cursor = cursor;
                 self.selection = selection;
+                self.page = page;
+                self.scrollers = scrollers;
+                if let Some(id) = self.pending_reveal.take() {
+                    self.send(Command::Reveal(id));
+                }
                 cx.notify();
+            }
+            Output::Reveal { top, bottom, start } => {
+                cx.emit(HtmlReveal {
+                    top: self.bounds.top() + px(top),
+                    bottom: self.bounds.top() + px(bottom),
+                    start,
+                });
             }
             Output::Tile {
                 band,
@@ -296,14 +399,12 @@ impl HtmlView {
                 revision,
                 size: (pw, ph),
                 content: (cw, ch),
+                scale,
                 pixels,
             } => {
                 let Some(buffer) = image::RgbaImage::from_raw(pw, ph, pixels) else {
                     return;
                 };
-                let scale = self
-                    .thumbnail_requested
-                    .map_or(1., |(_, _, _, scale)| f32::from_bits(scale));
                 let thumbnail = Thumbnail {
                     revision,
                     image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
@@ -317,6 +418,10 @@ impl HtmlView {
             }
             Output::Hover(link) => self.hover(link, cx),
             Output::Open(url) => cx.emit(HtmlLink::Opened(url)),
+            Output::Accessible { text, links } => {
+                self.accessible = Some((text.into(), links));
+                cx.notify();
+            }
             Output::Failed => {
                 self.failed = true;
                 self.laid_out = true;
@@ -341,7 +446,13 @@ impl HtmlView {
             f32::from(position.y - self.bounds.origin.y),
         )
     }
-    fn pointer(&mut self, position: gpui::Point<Pixels>, kind: u8, pressed: bool) {
+    fn pointer(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        kind: u8,
+        pressed: bool,
+        modifiers: Modifiers,
+    ) {
         if self.worker.is_none() || !self.laid_out {
             return;
         }
@@ -363,7 +474,7 @@ impl HtmlView {
             } else {
                 MouseEventButtons::None
             },
-            mods: Default::default(),
+            mods: blitz_modifiers(modifiers),
             details: Default::default(),
             element: Default::default(),
             active_pointers: Default::default(),
@@ -436,9 +547,18 @@ impl HtmlView {
             return Vec::new();
         }
         let width = f32::from(bounds.size.width).ceil().max(1.) as u32;
-        if self.width != width {
+        let screen = (
+            f32::from(window.viewport_size().height).ceil().max(1.) as u32,
+            window.scale_factor().to_bits(),
+        );
+        if self.width != width || self.screen != screen {
             self.width = width;
-            self.send(Command::Layout(width));
+            self.screen = screen;
+            self.send(Command::Layout {
+                width,
+                height: screen.0,
+                scale: window.scale_factor(),
+            });
         }
         if !self.laid_out {
             return Vec::new();
@@ -498,7 +618,23 @@ impl HtmlView {
 impl HtmlView {
     /// The email's page color, for whatever frames it.
     pub fn page_color(&self) -> u32 {
-        page_color(self.tone)
+        self.page
+    }
+    /// Whether a scroll wheel at `position` scrolls one of the email's own
+    /// boxes, which can still scroll that way, rather than the reader.
+    fn scrolls_inside(&self, position: gpui::Point<Pixels>, delta: gpui::Point<Pixels>) -> bool {
+        let (x, y) = self.local(position);
+        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+        self.scrollers.iter().rev().any(|s| {
+            x >= s.x
+                && x < s.x + s.width
+                && y >= s.y
+                && y < s.y + s.height
+                && ((dy > 0. && s.up)
+                    || (dy < 0. && s.down)
+                    || (dx > 0. && s.left)
+                    || (dx < 0. && s.right))
+        })
     }
     /// The whole email scaled to the width of `bounds`, cropped to its height.
     fn prepare_thumbnail(
@@ -542,6 +678,74 @@ impl HtmlView {
     }
 }
 
+/// The most links a screen reader is offered of one email: a newsletter's
+/// footer can hold hundreds, each a node in every frame's tree.
+const MAX_ACCESSIBLE_LINKS: usize = 200;
+
+/// The email's text for screen readers (see `EmailDocument::accessible_text`,
+/// a line a block) as its paragraphs: its non-blank lines.
+pub(super) fn accessible_paragraphs(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|line| !line.is_empty())
+}
+
+/// The email's paragraphs for screen readers, one text node each, so a
+/// reader moves through the email a paragraph at a time. Drawn nowhere.
+fn accessible_text(text: SharedString) -> impl IntoElement {
+    div()
+        .id("html-email-text")
+        .absolute()
+        .size_0()
+        .overflow_hidden()
+        .role(gpui::accesskit::Role::Group)
+        .a11y_synthetic_children(move |builder| {
+            for (i, paragraph) in accessible_paragraphs(&text).enumerate() {
+                let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Label);
+                node.set_value(paragraph);
+                builder.push_child(builder.synthetic_node_id(i), node);
+            }
+        })
+}
+
+/// The email's links for screen readers (text, address), which open when
+/// activated. Drawn nowhere.
+fn accessible_links(
+    links: Vec<(String, String)>,
+    opener: WeakEntity<HtmlView>,
+) -> impl IntoElement {
+    let links = links.into_iter().take(MAX_ACCESSIBLE_LINKS).enumerate();
+    div()
+        .id("html-email-links")
+        .absolute()
+        .size_0()
+        .overflow_hidden()
+        .role(gpui::accesskit::Role::List)
+        .aria_label(t!("html-view-links-in-this-message"))
+        .children(links.map(move |(i, (label, href))| {
+            let opener = opener.clone();
+            // AccessKit's Click, handled here: GPUI's own presses the middle
+            // of the node's bounds, which for this undrawn node is the
+            // email's top left, not the link.
+            div()
+                .id(("html-email-link", i))
+                .role(gpui::accesskit::Role::Link)
+                .aria_label(label)
+                .aria_description(href.clone())
+                .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                    let _ = opener.update(cx, |_, cx| cx.emit(HtmlLink::Opened(href.clone())));
+                })
+        }))
+}
+
+/// GPUI's modifier keys as Blitz's.
+fn blitz_modifiers(m: Modifiers) -> keyboard_types::Modifiers {
+    let mut out = keyboard_types::Modifiers::empty();
+    out.set(keyboard_types::Modifiers::SHIFT, m.shift);
+    out.set(keyboard_types::Modifiers::CONTROL, m.control);
+    out.set(keyboard_types::Modifiers::ALT, m.alt);
+    out.set(keyboard_types::Modifiers::META, m.platform);
+    out
+}
+
 /// Paints `view`'s email scaled down to fit this element's width.
 pub fn thumbnail(view: Entity<HtmlView>) -> impl IntoElement {
     canvas(
@@ -565,7 +769,7 @@ impl Render for HtmlView {
                 .py_6()
                 .text_size(px(13.))
                 .text_color(rgb(0x9aa0a6))
-                .child("This email's formatting couldn't be shown. Choose plain text above to read it.")
+                .child(t!("html-view-this-emails-formatting-couldnt-be-shown"))
                 .into_any_element();
         }
         let view = cx.entity();
@@ -578,19 +782,21 @@ impl Render for HtmlView {
             .w_full()
             .h(px(if self.laid_out { self.height } else { 160. }))
             .flex_shrink_0()
-            .bg(rgb(page_color(self.tone)))
+            .bg(rgb(self.page))
             .cursor(self.cursor)
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseDownEvent, w, cx| {
                     this.focus.focus(w, cx);
-                    this.pointer(e.position, 1, true);
+                    this.pointer(e.position, 1, true, e.modifiers);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, e: &MouseUpEvent, _, _| this.pointer(e.position, 2, false)),
+                cx.listener(|this, e: &MouseUpEvent, _, _| {
+                    this.pointer(e.position, 2, false, e.modifiers)
+                }),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -604,24 +810,57 @@ impl Render for HtmlView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
-                this.pointer(e.position, 0, e.pressed_button == Some(MouseButton::Left))
+                this.pointer(
+                    e.position,
+                    0,
+                    e.pressed_button == Some(MouseButton::Left),
+                    e.modifiers,
+                )
+            }))
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, w, cx| {
+                let delta = e.delta.pixel_delta(w.line_height());
+                if this.worker.is_some() && this.laid_out && this.scrolls_inside(e.position, delta) {
+                    let (x, y) = this.local(e.position);
+                    this.send(Command::Wheel {
+                        x,
+                        y,
+                        dx: f32::from(delta.x),
+                        dy: f32::from(delta.y),
+                    });
+                    cx.stop_propagation();
+                }
             }))
             .on_hover(cx.listener(|this, hovered, w, cx| {
                 if !hovered {
-                    this.pointer(w.mouse_position(), 3, false);
+                    this.pointer(w.mouse_position(), 3, false, Modifiers::default());
                     this.hover(None, cx);
                 }
             }))
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                if (if cfg!(target_os = "macos") {
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, w, cx| {
+                // A way out for keyboard users (WCAG 2.1.2): Escape leaves
+                // the message for the next control, as Tab would; Tab and
+                // Shift-Tab then move among the message's links again.
+                if e.keystroke.key == "escape" {
+                    if e.keystroke.modifiers.shift {
+                        w.focus_prev(cx);
+                    } else {
+                        w.focus_next(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                let command = if cfg!(target_os = "macos") {
                     e.keystroke.modifiers.platform
                 } else {
                     e.keystroke.modifiers.control
-                }) && e.keystroke.key == "c"
-                {
+                };
+                if command && e.keystroke.key == "c" {
                     if let Some(text) = this.selection.clone() {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
+                    cx.stop_propagation();
+                } else if command && e.keystroke.key == "a" {
+                    this.send(Command::SelectAll);
                     cx.stop_propagation();
                 } else if matches!(e.keystroke.key.as_str(), "tab" | "enter" | "space") {
                     let key = match e.keystroke.key.as_str() {
@@ -646,6 +885,17 @@ impl Render for HtmlView {
                     cx.stop_propagation();
                 }
             }))
+            // For screen readers: the email as a document of its paragraphs,
+            // then its links, which open when activated (WCAG 1.1.1, 1.3.1,
+            // 2.1.1). Both are drawn nowhere: the painted strips are what
+            // sighted readers see.
+            .role(gpui::accesskit::Role::Document)
+            .aria_label(t!("html-view-message"))
+            .when_some(self.accessible.clone(), |d, (text, links)| {
+                let opener = cx.entity().downgrade();
+                d.child(accessible_text(text))
+                    .child(accessible_links(links, opener))
+            })
             .child(
                 canvas(
                     move |bounds, w, cx| view.update(cx, |this, _| this.prepare(bounds, w)),

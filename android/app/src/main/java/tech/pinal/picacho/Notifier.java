@@ -43,17 +43,18 @@ final class Notifier {
 
     private static NotificationManager manager(Context context) {
         NotificationManager manager = context.getSystemService(NotificationManager.class);
-        // Creating channels that exist changes nothing.
-        NotificationChannel mail = new NotificationChannel(
-                MAIL_CHANNEL, "New mail", NotificationManager.IMPORTANCE_HIGH);
-        mail.setDescription("New messages in your inboxes, and notices from your mail provider.");
-        NotificationChannel background = new NotificationChannel(
-                BACKGROUND_CHANNEL, "Checking for mail", NotificationManager.IMPORTANCE_MIN);
-        background.setDescription("Shown while Picacho checks for new mail in the background.");
+        // Creating channels that exist only renews their names and
+        // descriptions (so they follow the phone's language).
+        NotificationChannel mail = new NotificationChannel(MAIL_CHANNEL,
+                Lang.of(context).getString(R.string.channel_mail), NotificationManager.IMPORTANCE_HIGH);
+        mail.setDescription(Lang.of(context).getString(R.string.channel_mail_description));
+        NotificationChannel background = new NotificationChannel(BACKGROUND_CHANNEL,
+                Lang.of(context).getString(R.string.channel_background), NotificationManager.IMPORTANCE_MIN);
+        background.setDescription(Lang.of(context).getString(R.string.channel_background_description));
         background.setShowBadge(false);
-        NotificationChannel signIn = new NotificationChannel(
-                SIGN_IN_CHANNEL, "Signing in", NotificationManager.IMPORTANCE_LOW);
-        signIn.setDescription("Shown while you sign in to an account in the browser.");
+        NotificationChannel signIn = new NotificationChannel(SIGN_IN_CHANNEL,
+                Lang.of(context).getString(R.string.channel_sign_in), NotificationManager.IMPORTANCE_LOW);
+        signIn.setDescription(Lang.of(context).getString(R.string.channel_sign_in_description));
         signIn.setShowBadge(false);
         manager.createNotificationChannels(Arrays.asList(mail, background, signIn));
         return manager;
@@ -62,11 +63,20 @@ final class Notifier {
     /**
      * Called from Rust. A notification with the same id is replaced. Tapping
      * it opens Picacho at {@code target} (empty for none; see
-     * {@link #targetOf}).
+     * {@link #targetOf}). {@code actions} are its buttons, a line each: the
+     * action's key, its label and its own target, separated by tabs. Reply
+     * opens Picacho with its target, which says to reply; the others go to
+     * {@link MailService}, which hands them to Rust without opening anything.
      */
     public static void show(
-            Context context, int id, String title, String text, String subText, String target) {
-        Notification notification = new Notification.Builder(context, MAIL_CHANNEL)
+            Context context,
+            int id,
+            String title,
+            String text,
+            String subText,
+            String target,
+            String actions) {
+        Notification.Builder builder = new Notification.Builder(context, MAIL_CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(title)
                 .setContentText(text)
@@ -74,13 +84,43 @@ final class Notifier {
                 .setStyle(new Notification.BigTextStyle().bigText(text))
                 .setCategory(Notification.CATEGORY_EMAIL)
                 .setContentIntent(open(context, id, target))
-                .setAutoCancel(true)
-                .build();
+                .setAutoCancel(true);
+        if (actions != null && !actions.isEmpty()) {
+            String[] lines = actions.split("\n");
+            for (int i = 0; i < lines.length && i < MAX_ACTIONS; i++) {
+                String[] parts = lines[i].split("\t", 3);
+                if (parts.length < 3) {
+                    continue;
+                }
+                // Each button its own request code, so each keeps its target.
+                int requestCode = id * MAX_ACTIONS + i + 1;
+                PendingIntent pending = "reply".equals(parts[0])
+                        ? open(context, requestCode, parts[2])
+                        : quick(context, requestCode, id, parts[2]);
+                Notification.Action.Builder action = new Notification.Action.Builder(
+                        Icon.createWithResource(context, R.drawable.ic_notification),
+                        parts[1],
+                        pending);
+                // Not from a locked phone's lock screen without unlocking
+                // it: anyone holding it could otherwise archive or delete
+                // mail (as iOS's buttons ask, Notifications.swift).
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    action.setAuthenticationRequired(true);
+                }
+                builder.addAction(action.build());
+            }
+        }
+        Notification notification = builder.build();
         try {
             manager(context).notify(id, notification);
         } catch (SecurityException e) {
             // Notifications aren't allowed; nothing to show them with.
         }
+    }
+
+    /** Names the channels anew, in Picacho's language ({@link Lang#set}). */
+    static void renameChannels(Context context) {
+        manager(context);
     }
 
     static Notification ongoing(Context context) {
@@ -90,13 +130,14 @@ final class Notifier {
                 new Intent(context, MailService.class).setAction(MailService.ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification.Action stopAction = new Notification.Action.Builder(
-                        Icon.createWithResource(context, R.drawable.ic_notification), "Stop", stop)
+                        Icon.createWithResource(context, R.drawable.ic_notification),
+                        Lang.of(context).getString(R.string.notification_stop), stop)
                 .build();
         manager(context);
         return new Notification.Builder(context, BACKGROUND_CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle("Checking for new mail")
-                .setContentText("Picacho lets you know when new mail arrives.")
+                .setContentTitle(Lang.of(context).getString(R.string.notification_checking))
+                .setContentText(Lang.of(context).getString(R.string.notification_checking_text))
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .setContentIntent(openApp(context))
                 .setOngoing(true)
@@ -109,13 +150,42 @@ final class Notifier {
         manager(context);
         return new Notification.Builder(context, SIGN_IN_CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle("Signing in")
-                .setContentText("Finish signing in in the browser, then come back to Picacho.")
+                .setContentTitle(Lang.of(context).getString(R.string.notification_signing_in))
+                .setContentText(Lang.of(context).getString(R.string.notification_signing_in_text))
                 .setCategory(Notification.CATEGORY_PROGRESS)
                 .setContentIntent(openApp(context))
                 .setOngoing(true)
                 .setShowWhen(false)
                 .build();
+    }
+
+    /** The most buttons a notification has (Android shows three). */
+    private static final int MAX_ACTIONS = 4;
+    /** The notification a button was on, for {@link MailService} to dismiss. */
+    static final String EXTRA_NOTIFICATION = "tech.pinal.picacho.NOTIFICATION";
+
+    /**
+     * A button that acts without opening Picacho: Mark as Read, Archive,
+     * Delete. {@link MailService} starts (a notification's button may start
+     * a foreground service) and hands {@code target} to Rust, with Picacho's
+     * key as for taps.
+     */
+    private static PendingIntent quick(Context context, int requestCode, int id, String target) {
+        Intent intent = new Intent(context, MailService.class)
+                .setAction(MailService.ACTION_QUICK)
+                .putExtra(EXTRA_OPEN, target)
+                .putExtra(EXTRA_KEY, key(context))
+                .putExtra(EXTRA_NOTIFICATION, id);
+        return PendingIntent.getForegroundService(
+                context,
+                requestCode,
+                intent,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+    }
+
+    /** Takes a notification away (its button was pressed). */
+    static void cancel(Context context, int id) {
+        context.getSystemService(NotificationManager.class).cancel(id);
     }
 
     private static PendingIntent openApp(Context context) {

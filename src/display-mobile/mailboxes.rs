@@ -33,7 +33,7 @@ impl MailApp {
         let settings = self.bar_icon(
             "mobile-settings",
             "settings",
-            "Settings",
+            t!("mobile-mailboxes-settings"),
             Rc::new(
                 |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                     this.mobile_open_settings(w, cx)
@@ -50,7 +50,7 @@ impl MailApp {
                 "mobile-mailboxes-bar",
                 insets,
                 None,
-                "Mailboxes",
+                t!("mobile-mailboxes-mailboxes"),
                 None,
                 self.mobile_reorder_button(cx).into_iter().collect(),
             ))
@@ -71,10 +71,34 @@ impl MailApp {
     /// Every account (and view) with its folders, then Add Account.
     fn mobile_mailbox_sections(&self, mut body: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        // The workspace on, to switch from, once there's one.
+        if !self.workspaces.list.is_empty() {
+            let (name, lead) = match self.workspace() {
+                Some(w) => (w.name.clone(), workspaces::badge(w, 24.).into_any_element()),
+                None => (
+                    t!("workspaces-everything").to_owned(),
+                    icon_el("workspace", 22., c.accent).into_any_element(),
+                ),
+            };
+            body = body.child(div().pt_4().child(self.group(vec![
+                self.cell(
+                    "mobile-workspace",
+                    lead,
+                    name,
+                    Some(t!("workspaces-switch-workspace").to_owned()),
+                    true,
+                    false,
+                    act(Action::Workspaces(workspaces::WsAction::Menu)),
+                    cx,
+                )
+                .into_any_element(),
+            ])));
+        }
         if self.shows_all_mail() {
             body = body.child(self.mobile_view_section(ALL_MAIL, cx));
         }
-        for id in tree::account_order(&self.tree) {
+        let shown = self.shown_tree();
+        for id in tree::account_order(&shown) {
             if fwd::is_view(&id) {
                 body = body.child(self.mobile_view_section(&id, cx));
             } else if let Some((index, a)) =
@@ -85,7 +109,7 @@ impl MailApp {
         }
         // Accounts the sidebar's tree doesn't hold yet.
         for (index, a) in self.accounts.iter().enumerate() {
-            if !tree::account_order(&self.tree).contains(&a.id) {
+            if !tree::account_order(&self.tree).contains(&a.id) && self.in_workspace(&a.id) {
                 body = body.child(self.mobile_account_section(a, index, cx));
             }
         }
@@ -100,11 +124,100 @@ impl MailApp {
                 .collect();
             body = body.child(div().pt_4().child(self.group(rows)));
         }
+        // The inbox's VIPs and Screener, while there are VIPs or it's on.
+        let mut control = Vec::new();
+        if !self.control.vips.is_empty() {
+            control.push(
+                self.cell(
+                    "mobile-open-vips",
+                    icon_el("vip", 22., c.accent).into_any_element(),
+                    t!("inbox-control-vips"),
+                    None,
+                    true,
+                    false,
+                    super::chrome::push(Action::Control(inbox_control::ControlAction::Lens(inbox_control::Lens::Vips))),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        if self.control.screener.enabled {
+            control.push(
+                self.cell(
+                    "mobile-open-screener",
+                    icon_el("screener", 22., c.accent).into_any_element(),
+                    t!("inbox-control-screener"),
+                    None,
+                    true,
+                    false,
+                    super::chrome::push(Action::Control(inbox_control::ControlAction::Lens(inbox_control::Lens::Screener))),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        if !control.is_empty() {
+            body = body.child(div().pt_6().child(self.group(control)));
+        }
+        body = body.child(div().pt_6().child(self.group(vec![
+            self.cell(
+                "mobile-open-calendar",
+                icon_el("clock", 22., c.accent).into_any_element(),
+                t!("mobile-mailboxes-calendar"),
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Calendar,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+            self.cell(
+                "mobile-open-tasks",
+                icon_el("tasks", 22., c.accent).into_any_element(),
+                t!("calendar-views-tasks"),
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Tasks,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+            self.cell(
+                "mobile-open-contacts",
+                icon_el("contact", 22., c.accent).into_any_element(),
+                t!("mobile-mailboxes-contacts"),
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Contacts,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+            self.cell(
+                "mobile-open-attachments",
+                icon_el("paperclip", 22., c.accent).into_any_element(),
+                t!("attachments-attachments"),
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Attachments,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+        ])));
         body = body.child(div().pt_6().child(self.group(vec![
                     self.cell(
                         "mobile-add-account",
                         icon_el("plus", 20., c.accent).into_any_element(),
-                        "Add Account",
+                        t!("mobile-mailboxes-add-account"),
                         None,
                         false,
                         false,
@@ -149,7 +262,9 @@ impl MailApp {
         let active = self.mobile.split
             && self.account.as_deref() == Some(account)
             && self.mailbox() == mailbox
-            && !self.subs_open;
+            && !self.subs_open
+            && !self.summary_open
+            && !self.waiting_open;
         let count = self.unread_for(account, &mailbox);
         let selector = format!("mobile-nav-{account}-{}", mailbox.key());
         let menu_account = account.to_owned();
@@ -183,11 +298,57 @@ impl MailApp {
         self.cell(
             format!("mobile-subscriptions-{id}"),
             icon_el("subscriptions", 22., c.accent).into_any_element(),
-            "Subscriptions",
+            t!("mobile-mailboxes-subscriptions"),
             None,
             true,
             active,
             super::chrome::push(Action::OpenSubscriptions(id.to_owned())),
+            cx,
+        )
+        .into_any_element()
+    }
+
+    /// The row opening the sent mail an account (or every account) waits
+    /// on a reply to: there while something is waited on, or it is open.
+    fn mobile_waiting_cell(&self, id: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = self.colors();
+        let open = self.waiting_open && self.account.as_deref() == Some(id);
+        let (all, overdue) = self.waiting_counts(id);
+        if all == 0 && !open {
+            return None;
+        }
+        let account = id.to_owned();
+        Some(
+            self.cell(
+                format!("mobile-waiting-{id}"),
+                icon_el("waiting", 22., c.accent).into_any_element(),
+                t!("mobile-mailboxes-waiting-for"),
+                self.badge(if overdue > 0 { overdue } else { all }),
+                true,
+                self.mobile.split && open,
+                Rc::new(move |this, w, cx| {
+                    this.mobile.mailboxes = false;
+                    this.handle(Action::OpenWaiting(account.clone()), w, cx);
+                    this.mobile_pushed(cx);
+                }),
+                cx,
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// The row opening an account's Summary.
+    fn mobile_summary_cell(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let active = self.mobile.split && self.summary_open && self.account.as_deref() == Some(id);
+        self.cell(
+            format!("mobile-summary-{id}"),
+            icon_el("summary", 22., c.accent).into_any_element(),
+            t!("mobile-mailboxes-summary"),
+            None,
+            true,
+            active,
+            super::chrome::push(Action::OpenSummary(id.to_owned())),
             cx,
         )
         .into_any_element()
@@ -224,11 +385,13 @@ impl MailApp {
                         ));
                     }
                 }
+                rows.push(self.mobile_summary_cell(&a.id, cx));
             }
         }
         if a.provider != Provider::Pop3 {
             rows.push(self.mobile_subscriptions_cell(&id, cx));
         }
+        rows.extend(self.mobile_waiting_cell(&id, cx));
         let menu_id = id.clone();
         let header = div()
             .id(SharedString::from(format!("mobile-account-{id}")))
@@ -270,7 +433,7 @@ impl MailApp {
                 d.child(self.touch_icon(
                     SharedString::from(format!("mobile-issue-{id}")),
                     "triangle-alert",
-                    "This account needs attention",
+                    t!("mobile-mailboxes-this-account-needs-attention"),
                     super::chrome::push(Action::AccountSettings(id.clone())),
                     cx,
                 ))
@@ -279,7 +442,7 @@ impl MailApp {
             .child(self.touch_icon(
                 SharedString::from(format!("mobile-account-menu-{id}")),
                 "ellipsis",
-                "Account actions",
+                t!("mobile-mailboxes-account-actions"),
                 Rc::new(
                     move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                         let entries = without_folding(this.account_entries(&menu_id, false));
@@ -315,10 +478,17 @@ impl MailApp {
                 )
             })
             .collect();
-        // Every account's subscriptions, as the sidebar lists under All
-        // Accounts (aliases' views have none of their own).
+        // Every account's Summary (after the Inbox) and subscriptions, as
+        // the sidebar lists under All Accounts (aliases' views have none of
+        // their own).
         if id == ALL_MAIL {
+            let inbox = Self::view_folders(id)
+                .iter()
+                .position(|f| *f == Folder::Inbox)
+                .map_or(0, |i| i + 1);
+            rows.insert(inbox.min(rows.len()), self.mobile_summary_cell(id, cx));
             rows.push(self.mobile_subscriptions_cell(id, cx));
+            rows.extend(self.mobile_waiting_cell(id, cx));
         }
         let menu_id = id.to_owned();
         div()
@@ -366,7 +536,7 @@ impl MailApp {
                     .child(self.touch_icon(
                         SharedString::from(format!("mobile-view-menu-{id}")),
                         "ellipsis",
-                        "Actions",
+                        t!("mobile-mailboxes-actions"),
                         Rc::new(
                             move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                                 let entries = without_folding(this.view_entries(&menu_id));
@@ -405,26 +575,22 @@ impl MailApp {
     pub(super) fn mobile_status(&self) -> (bool, String) {
         let d = &self.download;
         if self.checking_server() || self.mailbox_loading() {
-            (true, "Checking for mail…".to_owned())
+            (true, t!("mobile-mailboxes-checking-for-mail").to_owned())
         } else if d.total > 0 && d.missing > 0 {
             (
                 true,
-                format!(
-                    "Downloading {} of {}",
-                    fmt_count(d.total - d.missing),
-                    fmt_count(d.total)
-                ),
+                t!("mobile-mailboxes-downloading-of", done = fmt_count(d.total - d.missing), total = fmt_count(d.total)),
             )
         } else if !self.unreachable_accounts().is_empty() {
-            (false, "Offline".to_owned())
+            (false, t!("mobile-mailboxes-offline").to_owned())
         } else {
             let unread = self.mailbox_unread();
             (
                 false,
                 if unread > 0 {
-                    format!("{} unread", fmt_count(unread))
+                    t!("mobile-mailboxes-unread", shown = fmt_count(unread), count = unread)
                 } else {
-                    "Up to date".to_owned()
+                    t!("mobile-mailboxes-up-to-date").to_owned()
                 },
             )
         }
@@ -442,7 +608,7 @@ impl MailApp {
             } else {
                 "chevron-right"
             },
-            if open { "Hide folders" } else { "Show folders" },
+            if open { t!("mobile-mailboxes-hide-folders") } else { t!("mobile-mailboxes-show-folders") },
             act(Action::ToggleAccount(id.to_owned())),
             cx,
         )

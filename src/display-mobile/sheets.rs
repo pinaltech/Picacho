@@ -144,7 +144,7 @@ impl MailApp {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(c.accent))
             .active(move |s| s.bg(rgb(c.border)))
-            .child("Cancel")
+            .child(t!("mobile-sheets-cancel"))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.menu = None;
                 cx.notify();
@@ -192,6 +192,7 @@ impl MailApp {
         let height = f32::from(window.viewport_size().height);
         let parsed = url::Url::parse(&confirm.url).ok();
         let dangers = parsed.as_ref().map(link_dangers).unwrap_or_default();
+        let trustable = dangers.is_empty();
         let choose = |choice: LinkChoice| {
             cx.listener(move |this, _: &ClickEvent, w, cx| {
                 this.handle(Action::LinkChoice(choice), w, cx)
@@ -215,10 +216,13 @@ impl MailApp {
                 .active(move |s| s.opacity(0.7))
                 .child(div().truncate().child(label))
         };
-        // The site, with the part that names it (its last two labels)
-        // stressed: what comes before is anyone's to choose.
-        let (lead, named) = match confirm.site.rmatch_indices('.').nth(1) {
-            Some((i, _)) => confirm.site.split_at(i + 1),
+        // The site, with the part that names it stressed (the name
+        // registered under its public suffix: "evil.co.uk", not "co.uk"):
+        // what comes before is anyone's to choose.
+        let (lead, named) = match psl::domain_str(&confirm.site)
+            .filter(|d| confirm.site.ends_with(d))
+        {
+            Some(d) => confirm.site.split_at(confirm.site.len() - d.len()),
             None => ("", confirm.site.as_str()),
         };
         let site = div()
@@ -295,7 +299,7 @@ impl MailApp {
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(c.danger))
                     .text_center()
-                    .child("Be careful with this link"),
+                    .child(t!("mobile-sheets-be-careful-with-this-link")),
             )
             .child(
                 div()
@@ -304,8 +308,7 @@ impl MailApp {
                     .text_center()
                     .line_height(relative(1.4))
                     .child(
-                        "Links in email are the most common way to steal passwords and money. \
-                         This one takes you to:",
+                        t!("mobile-sheets-links-in-email-are-the-most"),
                     ),
             )
             .child(destination)
@@ -337,35 +340,39 @@ impl MailApp {
                     .line_height(relative(1.4))
                     .text_center()
                     .child(
-                        "Open it only if you expected this email and know the site. \
-                         Never sign in or pay on a page a link took you to: go to the site yourself.",
+                        t!("mobile-sheets-open-it-only-if-you-expected"),
                     ),
             )
             .child(
-                row_button("link-sheet-back", "Go Back".into(), c.on_accent, true)
+                row_button("link-sheet-back", t!("mobile-sheets-go-back").into(), c.on_accent, true)
                     .w_full()
                     .bg(rgb(c.accent))
                     .on_click(choose(LinkChoice::Cancel)),
             )
             .child(
-                row_button("link-sheet-open", "Open Anyway".into(), c.danger, true)
+                row_button("link-sheet-open", t!("mobile-sheets-open-anyway").into(), c.danger, true)
                     .w_full()
                     .border_1()
                     .border_color(rgb(c.danger))
                     .on_click(choose(LinkChoice::Open)),
             )
-            .child(
-                row_button(
-                    "link-sheet-trust",
-                    format!("Always Trust {}", confirm.site),
-                    c.text,
-                    false,
+            // Not offered for a link with any danger named above (plain
+            // http, a bare address, look-alike letters, a hidden site):
+            // trusting it would stop the warnings for what made it suspect.
+            .when(trustable, |d| {
+                d.child(
+                    row_button(
+                        "link-sheet-trust",
+                        t!("mobile-sheets-always-trust", site = confirm.site),
+                        c.text,
+                        false,
+                    )
+                    .w_full()
+                    .on_click(choose(LinkChoice::TrustAndOpen)),
                 )
-                .w_full()
-                .on_click(choose(LinkChoice::TrustAndOpen)),
-            )
+            })
             .child(
-                row_button("link-sheet-copy", "Copy Link".into(), c.muted, false)
+                row_button("link-sheet-copy", t!("mobile-sheets-copy-link").into(), c.muted, false)
                     .w_full()
                     .on_click(choose(LinkChoice::Copy)),
             );
@@ -417,7 +424,7 @@ impl MailApp {
         let size = window.viewport_size();
         let tall = matches!(
             modal,
-            Modal::Connect | Modal::Reconnect(_) | Modal::Original | Modal::Snooze(_)
+            Modal::Connect | Modal::Reconnect(_) | Modal::Original | Modal::Snooze(_) | Modal::FollowUp(_)
         );
         let wide = Self::mobile_split(window);
         let max_h = f32::from(size.height) * SHEET_MAX;

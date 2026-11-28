@@ -1,13 +1,16 @@
 //! Checking for new mail while Picacho has no window: on a desktop once the
 //! last window closes (when Picacho keeps running in the background), and on
 //! Android once the activity is gone while the mail service keeps the app's
-//! process alive.
+//! process alive. iOS doesn't let apps run on: it wakes Picacho now and then
+//! for a moment (background app refresh), which does one pass of the same
+//! work (`check_once`).
 //!
 //! The window does this itself while it is open (`MailApp`); the monitor is
 //! the same work without any interface: it keeps an IDLE (or Proton events)
 //! watch on each inbox, checks inboxes on their schedule, and announces new
-//! unread mail. It also sends scheduled mail (Send Later) once due and
-//! brings snoozed messages back to the inbox, announcing both. It runs on a
+//! unread mail. It also sends scheduled mail (Send Later) once due,
+//! brings snoozed messages back to the inbox, and reminds about sent mail
+//! nobody replied to (follow-up reminders), announcing each. It runs on a
 //! thread of its own, so it needs no GPUI, and shares the app's `Backend`
 //! (its account locks, connections and sessions).
 //!
@@ -27,7 +30,11 @@ use super::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -37,6 +44,9 @@ pub const PREFERENCE: &str = "background";
 /// The preference that shows the tray icon while a window is open too. While
 /// Picacho runs in the background the icon always shows.
 pub const TRAY_PREFERENCE: &str = "tray_icon";
+/// The preference that starts Picacho in the background (no window) when
+/// the person signs in to their computer (desktop). Off unless turned on.
+pub const STARTUP_PREFERENCE: &str = "start_in_background";
 
 pub fn enabled(store: &super::store::Store) -> bool {
     store.preference(PREFERENCE).as_deref() != Some("false")
@@ -44,6 +54,13 @@ pub fn enabled(store: &super::store::Store) -> bool {
 
 pub fn tray_while_open(store: &super::store::Store) -> bool {
     store.preference(TRAY_PREFERENCE).as_deref() == Some("true")
+}
+
+/// Whether Picacho starts in the background at sign-in. Only while it may
+/// run in the background at all: the background process quits at once
+/// otherwise.
+pub fn starts_at_login(store: &super::store::Store) -> bool {
+    enabled(store) && store.preference(STARTUP_PREFERENCE).as_deref() == Some("true")
 }
 
 /// How often the monitor looks for checks that are due, as the window does.
@@ -69,6 +86,8 @@ pub enum Announcement<'a> {
         account: &'a str,
         account_id: &'a str,
         message: &'a str,
+        /// Every new message's id, for the notification's buttons.
+        messages: &'a [&'a str],
         sender: &'a str,
         subject: &'a str,
         count: usize,
@@ -80,6 +99,16 @@ pub enum Announcement<'a> {
         account_id: &'a str,
         message_id: &'a str,
         sender: &'a str,
+        subject: &'a str,
+        count: usize,
+    },
+    /// Sent messages waited on got no reply by their reminder's time: the
+    /// latest's recipients, subject and Message-ID, and how many.
+    NoReply {
+        account: &'a str,
+        account_id: &'a str,
+        message_id: &'a str,
+        to: &'a str,
         subject: &'a str,
         count: usize,
     },
@@ -121,6 +150,8 @@ struct Shared {
     /// Set once the monitor is dropped. Held while the thread starts
     /// watches, so none starts after `Drop` ended them.
     stopped: Mutex<bool>,
+    /// Set when the system ends a single pass's time (`check_once`).
+    cancel: Arc<AtomicBool>,
 }
 
 enum Wake {
@@ -138,6 +169,7 @@ impl Monitor {
         let shared = Arc::new(Shared {
             backend,
             stopped: Mutex::new(false),
+            cancel: Arc::default(),
         });
         let thread_shared = shared.clone();
         let thread_wake = wake.clone();
@@ -200,7 +232,139 @@ impl Drop for Monitor {
 
 impl Shared {
     fn stopped(&self) -> bool {
-        *self.stopped.lock().unwrap_or_else(|e| e.into_inner())
+        self.cancel.load(Ordering::Relaxed)
+            || *self.stopped.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One pass of the monitor's work, for a system that wakes Picacho for a
+/// moment rather than letting it run (iOS's background app refresh): sends
+/// scheduled mail that's due, brings back snoozed mail, checks each inbox
+/// that's checked on a schedule once, and announces mail that arrived since
+/// Picacho last looked. Watches nothing. Stops between steps once `cancel`
+/// is set (the system's time is up). Returns whether every check went.
+#[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
+pub fn check_once(backend: Arc<Backend>, announce: &Announce, cancel: Arc<AtomicBool>) -> bool {
+    let shared = Shared {
+        backend,
+        stopped: Mutex::new(false),
+        cancel,
+    };
+    let backend = &shared.backend;
+    let store = &backend.store;
+    // Hide mail outside Picacho, as set now: this process (a phone's
+    // background check) may have shown no window that loaded it.
+    super::applock::load_hiding(store);
+    let accounts = store.accounts().unwrap_or_default();
+    // Unread inbox mail already in the cache was seen in the window (or
+    // announced) before; only what arrives now is new.
+    let mut known: HashMap<String, HashSet<String>> = accounts
+        .iter()
+        .map(|a| {
+            let unread = store.unread_ids(&a.id, Folder::Inbox).unwrap_or_default();
+            (a.id.clone(), unread.into_iter().collect())
+        })
+        .collect();
+    let mut refused = HashSet::new();
+    let mut later = Later::default();
+    let mut codes = Codes::default();
+    if send_due(&shared, &accounts, &refused, &mut later, announce).is_err()
+        || wake_snoozed(
+            &shared,
+            &accounts,
+            &mut refused,
+            &mut later,
+            &mut codes,
+            announce,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    remind_follow_ups(&shared, &accounts, &mut later, &mut codes, announce);
+    let mut all = later.sends.is_empty() && later.wakes.is_empty();
+    let mut checked = false;
+    for a in &accounts {
+        let returning = later.returning.remove(&a.id);
+        if refused.contains(&a.id)
+            || backend.throttled_until(&a.id).is_some()
+            || (a.sync.refresh_minutes == 0 && returning.is_none())
+        {
+            continue;
+        }
+        if shared.stopped() {
+            return false;
+        }
+        checked = true;
+        match backend.sync(a, Folder::Inbox, CHECK_LIMIT) {
+            Ok(messages) => {
+                let mut fresh = fresh_mail(known.entry(a.id.clone()).or_default(), &messages);
+                without_returning(&mut fresh, returning);
+                // Nothing keeps Proton's pushes coming while iOS holds
+                // Picacho: what they'd announce is announced here.
+                arrived(&shared, a, fresh, false, &mut codes, announce);
+            }
+            Err(_) => all = false,
+        }
+    }
+    if checked {
+        super::widgets::publish(store);
+        super::memory::release_unused();
+    }
+    all && !shared.stopped()
+}
+
+/// Applies blocked senders, muted conversations and rules to the new mail
+/// of a check of `a`'s inbox, as the window does, and announces what they
+/// leave (`pushed`: unless Proton's pushes announce the account's mail).
+fn arrived(
+    shared: &Shared,
+    a: &Account,
+    mut fresh: Vec<&Mail>,
+    pushed: bool,
+    codes: &mut Codes,
+    announce: &Announce,
+) {
+    let backend = &shared.backend;
+    let store = &backend.store;
+    if shared.stopped() {
+        return;
+    }
+    // What the rules file away or mark read isn't announced.
+    let org = super::organize::Organizing::load(store);
+    if !fresh.is_empty() && org.applies_to_arrivals() {
+        let arrived: Vec<Mail> = fresh.iter().map(|m| (*m).clone()).collect();
+        if let Err(e) = super::organize::apply_to_arrivals(backend, a, &arrived) {
+            eprintln!("Picacho: a rule couldn't be applied to {}: {e:#}", a.email);
+        }
+        let facts = super::organize::BackendFacts::new(backend, &org, std::slice::from_ref(a));
+        facts.with(|facts| fresh.retain(|m| !org.silenced_with(m, facts)));
+    }
+    if !a.sync.notify || (pushed && a.pushes_new_mail()) || shared.stopped() || fresh.is_empty() {
+        return;
+    }
+    // First-time senders wait in the Screener; VIPs, categories kept
+    // silent and quiet hours decide the rest (`inbox_control`), sorted as
+    // the window sorts: with the inbox category model where it's on.
+    let gate = super::inbox_control::Gate::load(backend, std::slice::from_ref(a));
+    let ai = (gate.control.wants_category() && gate.categories.sorting() && super::local_ai::categories_enabled(store))
+        .then(|| super::local_ai::category_ai(store).ok())
+        .flatten();
+    fresh.retain(|m| gate.announces(m, || super::categories::Content::of_with(m, ai.as_ref())));
+    if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
+        // The preview gives the model the message's context, as the window
+        // has; only the subject is shown.
+        let subject = codes.hide(store, &latest.subject, &latest.snippet);
+        let ids: Vec<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
+        announce(Announcement::NewMail {
+            account: &a.email,
+            account_id: &a.id,
+            message: &latest.id,
+            messages: &ids,
+            sender: &latest.sender,
+            subject: &subject,
+            count: fresh.len(),
+        });
     }
 }
 
@@ -214,12 +378,11 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
         .unwrap_or_default()
         .into_iter()
         .map(|a| {
+            // By id from the index: the inbox's messages aren't read.
             let unread = store
-                .summaries(&a.id, Folder::Inbox)
+                .unread_ids(&a.id, Folder::Inbox)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|m| m.unread)
-                .map(|m| m.id)
                 .collect();
             (a.id, unread)
         })
@@ -232,6 +395,11 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
     let mut codes = Codes::default();
     let mut later = Later::default();
     loop {
+        // Hide mail outside Picacho, as set now, before anything is
+        // announced: the background process, and a phone's service, show
+        // no window that would have loaded it, and Settings may change it
+        // in another process meanwhile.
+        super::applock::load_hiding(store);
         let accounts = store.accounts().unwrap_or_default();
         let present = |id: &String| accounts.iter().any(|a| &a.id == id);
         known.retain(|id, _| present(id));
@@ -259,6 +427,7 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
         {
             return;
         }
+        remind_follow_ups(shared, &accounts, &mut later, &mut codes, &announce);
         // Accounts with mail back from snooze are checked now, so it lists.
         pushed.extend(later.returning.keys().cloned());
         let now = Instant::now();
@@ -288,21 +457,11 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
                     without_returning(&mut fresh, later.returning.remove(&a.id));
                     // An account added since the monitor started: what it
                     // has now was there before, like the window's first check.
-                    // Proton's pushes announce mail for accounts that take them.
-                    if first || !a.sync.notify || a.pushes_new_mail() || shared.stopped() {
+                    if first {
                         continue;
                     }
-                    if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
-                        let subject = codes.hide(store, &latest.subject);
-                        announce(Announcement::NewMail {
-                            account: &a.email,
-                            account_id: &a.id,
-                            message: &latest.id,
-                            sender: &latest.sender,
-                            subject: &subject,
-                            count: fresh.len(),
-                        });
-                    }
+                    // Proton's pushes announce mail for accounts that take them.
+                    arrived(shared, a, fresh, true, &mut codes, &announce);
                 }
                 Err(e) if e.downcast_ref::<AccessFailure>().is_some() => {
                     refused.insert(a.id.clone());
@@ -317,6 +476,7 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
         // A check parses and stores mail, then frees it all again; give that
         // back to the system before waiting.
         if checked {
+            super::widgets::publish(store);
             super::memory::release_unused();
         }
         match woken.recv_timeout(TICK) {
@@ -351,6 +511,64 @@ struct Later {
     wakes: HashMap<String, Instant>,
     /// Message-IDs back from snooze, by account.
     returning: HashMap<String, HashSet<String>>,
+    /// Each account's mail as last looked through for replies to what it
+    /// waits on (`Backend::list_revision`), and when.
+    replies: HashMap<String, ((u64, u64), Instant)>,
+}
+
+/// How often the monitor looks for replies to what's waited on even when
+/// nothing changed here: another process (the window's) may have synced.
+const REPLIES_AGAIN: Duration = Duration::from_secs(10 * 60);
+
+/// Reminds about sent messages waited on that got no reply by their time,
+/// and stops waiting on those answered (`MailApp::check_follow_ups`). Only
+/// the cache is read: no network.
+fn remind_follow_ups(
+    shared: &Shared,
+    accounts: &[Account],
+    later: &mut Later,
+    codes: &mut Codes,
+    announce: &Announce,
+) {
+    let backend = &shared.backend;
+    later.replies.retain(|id, _| accounts.iter().any(|a| &a.id == id));
+    let now = chrono::Utc::now().timestamp();
+    for a in accounts {
+        if shared.stopped() {
+            return;
+        }
+        // Shared with other computers now and then (a no-op otherwise).
+        let _ = backend.sync_follow_ups(a, false);
+        let waiting = backend.follow_ups(&a.id);
+        if waiting.is_empty() {
+            continue;
+        }
+        let revision = backend.list_revision(&a.id);
+        let replies = later
+            .replies
+            .get(&a.id)
+            .is_none_or(|(seen, at)| *seen != revision || at.elapsed() >= REPLIES_AGAIN);
+        if !replies && !waiting.iter().any(|f| !f.reminded && f.overdue(now)) {
+            continue;
+        }
+        let Ok(check) = backend.check_follow_ups_online(a, replies) else {
+            continue;
+        };
+        if replies {
+            later.replies.insert(a.id.clone(), (revision, Instant::now()));
+        }
+        if let Some(latest) = check.due.iter().max_by_key(|f| f.due) {
+            let subject = codes.hide(&backend.store, &latest.subject, "");
+            announce(Announcement::NoReply {
+                account: &a.email,
+                account_id: &a.id,
+                message_id: &latest.message_id,
+                to: &latest.to,
+                subject: &subject,
+                count: check.due.len(),
+            });
+        }
+    }
 }
 
 /// Sends the scheduled drafts whose time has come (`MailApp::send_due`).
@@ -379,7 +597,7 @@ fn send_due(
             return Err(Stopped);
         }
         let Some(a) = accounts.iter().find(|a| a.id == d.account) else {
-            let error = "Its account was removed.";
+            let error = t!("manage-background-its-account-was-removed");
             backend.schedule_failed(&d.id, error);
             announce(Announcement::ScheduledFailed {
                 account: &d.account,
@@ -444,6 +662,10 @@ fn wake_snoozed(
     let now = chrono::Utc::now().timestamp();
     later.wakes.retain(|_, t| *t > Instant::now());
     for a in accounts {
+        // What other computers snoozed or woke (a no-op until it's time).
+        if a.provider != Provider::Pop3 && !refused.contains(&a.id) {
+            let _ = backend.share_snoozed(a, false);
+        }
         if a.provider == Provider::Pop3
             || refused.contains(&a.id)
             || later.wakes.contains_key(&a.id)
@@ -459,7 +681,9 @@ fn wake_snoozed(
                 let Some(latest) = woken.iter().max_by_key(|s| s.until) else {
                     continue;
                 };
-                let subject = codes.hide(&backend.store, &latest.subject);
+                // Back here: no longer snoozed on other computers either.
+                let _ = backend.share_snoozed(a, true);
+                let subject = codes.hide(&backend.store, &latest.subject, "");
                 announce(Announcement::BackFromSnooze {
                     account: &a.email,
                     account_id: &a.id,
@@ -537,6 +761,7 @@ pub(super) fn wake_once(
     let shared = Shared {
         backend,
         stopped: Mutex::new(false),
+        cancel: Arc::default(),
     };
     let (mut refused, mut later, mut codes) = (HashSet::new(), Later::default(), Codes::default());
     let said = Arc::new(Mutex::new(Vec::new()));
@@ -569,28 +794,31 @@ fn fresh_mail<'a>(known: &mut HashSet<String>, messages: &'a [Mail]) -> Vec<&'a 
 }
 
 /// Sign-in codes kept out of announcements while Local AI hides them, as
-/// the window keeps them off the lock screen. The model loads on the first
-/// announcement that needs it and is freed with the monitor.
+/// the window keeps them off the lock screen: those the model finds, or,
+/// where it can't load (not installed yet, or damaged), every string shaped
+/// like a code. A notification has no Show code to click. The model loads
+/// on the first announcement that needs it, is tried again a minute after
+/// it couldn't load (it may have been installed since), and is freed with
+/// the monitor.
 #[derive(Default)]
 struct Codes {
-    detector: Option<Result<otp::Detector, ()>>,
+    detector: Option<otp::Detector>,
+    tried: Option<Instant>,
 }
 
 impl Codes {
-    fn hide(&mut self, store: &super::store::Store, subject: &str) -> String {
+    /// `subject` as announced, its codes hidden; `body` (the message's
+    /// preview, not shown) gives the model its context.
+    fn hide(&mut self, store: &super::store::Store, subject: &str, body: &str) -> String {
         if !local_ai::otp_enabled(store) {
             self.detector = None;
             return subject.to_owned();
         }
-        let detector = self
-            .detector
-            .get_or_insert_with(|| local_ai::otp_detector(store).map_err(|_| ()));
-        match detector {
-            Ok(detector) => otp::mask(subject, &detector.codes(subject, "")).into_owned(),
-            // Without the model a code can't be told apart; leave the
-            // subject out rather than show one.
-            Err(()) => "New message".to_owned(),
+        if self.detector.is_none() && self.tried.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+            self.tried = Some(Instant::now());
+            self.detector = local_ai::otp_detector(store).ok();
         }
+        otp::mask(subject, &otp::codes_to_hide(self.detector.as_ref(), subject, body)).into_owned()
     }
 }
 
@@ -665,6 +893,7 @@ mod tests {
         let shared = Shared {
             backend: Arc::new(Backend::new(store)),
             stopped: Mutex::new(false),
+            cancel: Arc::default(),
         };
         let said = Arc::new(Mutex::new(Vec::new()));
         let heard = said.clone();
@@ -681,6 +910,38 @@ mod tests {
             send_at: Some(at),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sent_mail_without_a_reply_is_announced_once() {
+        let (shared, announce, said, dir) = quiet();
+        let backend = &shared.backend;
+        let mut a = Account::new(Provider::Imap);
+        a.id = "acct".into();
+        a.email = "me@example.com".into();
+        let now = chrono::Utc::now().timestamp();
+        let waited = |message_id: &str, due: i64| super::super::backend::FollowUp {
+            message_id: message_id.into(),
+            subject: "Plans".into(),
+            to: "ana@example.org".into(),
+            sent: now - 7200,
+            due,
+            reminded: false,
+            changed: 0,
+        };
+        backend.note_follow_up(&a.id, waited("<due@me>", now - 60)).unwrap();
+        backend.note_follow_up(&a.id, waited("<later@me>", now + 3600)).unwrap();
+        let (mut later, mut codes) = (Later::default(), Codes::default());
+        let accounts = [a];
+        remind_follow_ups(&shared, &accounts, &mut later, &mut codes, &announce);
+        remind_follow_ups(&shared, &accounts, &mut later, &mut codes, &announce);
+        let said = said.lock().unwrap().clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("NoReply") && said[0].contains("<due@me>"));
+        // Both still wait: one overdue, one not yet.
+        assert_eq!(backend.follow_ups("acct").len(), 2);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -746,6 +1007,36 @@ mod tests {
                 .is_empty()
         );
         assert!(said.lock().unwrap().is_empty());
+        drop(shared);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// iOS's background refresh: a pass whose time is up sends nothing,
+    /// and a draft whose account is gone is said to have failed.
+    #[test]
+    fn one_pass_stops_when_its_time_is_up() {
+        let (shared, announce, said, dir) = quiet();
+        let past = chrono::Utc::now().timestamp() - 5;
+        let store = &shared.backend.store;
+        store.save_draft(&scheduled("d1", "gone", past)).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert!(!check_once(shared.backend.clone(), &announce, cancel));
+        assert!(store.draft("d1").unwrap().unwrap().send_error.is_empty());
+        assert!(said.lock().unwrap().is_empty());
+        // With time to run, the orphaned draft is reported, and an account
+        // checked only by hand isn't checked.
+        let mut manual = Account::new(Provider::Imap);
+        manual.email = "manual@example.com".into();
+        manual.sync.refresh_minutes = 0;
+        store.save_account(&manual).unwrap();
+        assert!(check_once(
+            shared.backend.clone(),
+            &announce,
+            Arc::default()
+        ));
+        let said = said.lock().unwrap().clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("ScheduledFailed"), "{said:?}");
         drop(shared);
         let _ = std::fs::remove_dir_all(dir);
     }

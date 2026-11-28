@@ -1,16 +1,19 @@
 //! Each document lives on its own thread. Parsing, styling, layout, input and
 //! rasterization never run on the UI thread, so opening a heavy newsletter,
 //! hovering links or scrolling never stalls the window.
-use super::document::{ContextTarget, EmailDocument, Tone};
+use super::document::{ContextTarget, EmailDocument, Scroller, Tone};
 use crate::manage::model::InlineParts;
 use blitz_dom::Document;
-use blitz_traits::events::{BlitzKeyEvent, UiEvent};
+use blitz_traits::events::{
+    BlitzKeyEvent, BlitzPointerEvent, BlitzWheelDelta, BlitzWheelEvent, MouseEventButtons,
+    PointerCoords, UiEvent,
+};
 use futures::channel::mpsc::UnboundedSender;
 use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     sync::{atomic::Ordering, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// The side, in device pixels, of the textures GPUI's image atlas makes.
@@ -51,11 +54,29 @@ fn pad(width: u32, height: u32, pixels: Vec<u8>) -> ((u32, u32), Vec<u8>) {
     (size, out)
 }
 
+/// Coordinates in commands and outputs are the view's: logical pixels from
+/// the email's top left. They are the document's own unless the email is
+/// shown scaled down to fit (see `EmailDocument::layout`).
 pub enum Command {
-    /// Lay the document out for this many CSS pixels of width.
-    Layout(u32),
+    /// Lay the document out for this many CSS pixels of width, in a window
+    /// this tall at this scale (for `vh` units and media queries).
+    Layout {
+        width: u32,
+        height: u32,
+        scale: f32,
+    },
     Pointer(UiEvent),
     Key(BlitzKeyEvent),
+    /// Select all of the email's text.
+    SelectAll,
+    /// A scroll wheel over one of the email's scrollable boxes, by this many
+    /// pixels.
+    Wheel {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
     /// Rasterize one strip for the current layout.
     Paint {
         band: u32,
@@ -69,6 +90,8 @@ pub enum Command {
         max_height: f32,
         scale: f32,
     },
+    /// The person's text zoom (1: the email's own size).
+    TextZoom(f32),
     /// A long press: select the word at this point.
     SelectWord {
         x: f32,
@@ -85,6 +108,8 @@ pub enum Command {
         x: f32,
         y: f32,
     },
+    /// Bring the element with this id into view (Find in Message).
+    Reveal(String),
 }
 
 pub struct Update {
@@ -93,13 +118,23 @@ pub struct Update {
 }
 
 pub enum Output {
-    /// The document changed: its new revision, height, cursor and selection.
+    /// The document changed: its new revision, height, cursor, selection,
+    /// page color (0xRRGGBB) and scrollable boxes.
     State {
         revision: u64,
         width: u32,
         height: f32,
         cursor: gpui::CursorStyle,
         selection: Option<String>,
+        page: u32,
+        scrollers: Vec<Scroller>,
+    },
+    /// Bring this part of the email into view: the target of a `#` link
+    /// (`start`: to the top), or the element Tab focused (just into view).
+    Reveal {
+        top: f32,
+        bottom: f32,
+        start: bool,
     },
     Tile {
         band: u32,
@@ -115,6 +150,12 @@ pub enum Output {
     Hover(Option<String>),
     /// A link was clicked: this address, for the view's owner to open.
     Open(String),
+    /// What a screen reader reads of the email (see
+    /// `EmailDocument::accessible_text`), after its first layout.
+    Accessible {
+        text: String,
+        links: Vec<(String, String)>,
+    },
     /// The renderer failed on this email; nothing more will come.
     Failed,
     Thumbnail {
@@ -122,8 +163,66 @@ pub enum Output {
         /// Device pixels, padded (see `TILE`), and those the email fills.
         size: (u32, u32),
         content: (u32, u32),
+        /// The window scale it was painted at.
+        scale: f32,
         pixels: Vec<u8>,
     },
+}
+
+/// A pointer event's coordinates in the document's own pixels.
+fn unzoom(event: UiEvent, zoom: f32) -> UiEvent {
+    if zoom == 1. {
+        return event;
+    }
+    let scaled = |mut e: BlitzPointerEvent| {
+        let c = e.coords;
+        e.coords = PointerCoords {
+            page_x: c.page_x / zoom,
+            page_y: c.page_y / zoom,
+            client_x: c.client_x / zoom,
+            client_y: c.client_y / zoom,
+            screen_x: c.screen_x / zoom,
+            screen_y: c.screen_y / zoom,
+        };
+        e
+    };
+    match event {
+        UiEvent::PointerMove(e) => UiEvent::PointerMove(scaled(e)),
+        UiEvent::PointerUp(e) => UiEvent::PointerUp(scaled(e)),
+        UiEvent::PointerDown(e) => UiEvent::PointerDown(scaled(e)),
+        UiEvent::PointerCancel(e) => UiEvent::PointerCancel(scaled(e)),
+        UiEvent::PointerLeave(e) => UiEvent::PointerLeave(scaled(e)),
+        other => other,
+    }
+}
+
+/// Successive presses counted as one double or triple click.
+struct Clicks {
+    at: Instant,
+    x: f32,
+    y: f32,
+    count: u32,
+}
+impl Clicks {
+    fn press(last: &mut Option<Clicks>, x: f32, y: f32) -> u32 {
+        let count = match last {
+            Some(c)
+                if c.at.elapsed() < Duration::from_millis(500)
+                    && (c.x - x).abs() <= 4.
+                    && (c.y - y).abs() <= 4. =>
+            {
+                c.count + 1
+            }
+            _ => 1,
+        };
+        *last = Some(Clicks {
+            at: Instant::now(),
+            x,
+            y,
+            count,
+        });
+        count
+    }
 }
 
 /// The width an email is laid out at before the reader has measured it,
@@ -156,6 +255,8 @@ pub fn spawn(
                     output: Output::Failed,
                 });
             }
+            // The document (its DOM, styles, decoded images) is gone now.
+            crate::manage::memory::release_unused_soon();
         });
     tx
 }
@@ -170,19 +271,43 @@ fn run(
     out: UnboundedSender<Update>,
 ) {
     let send = |output| out.unbounded_send(Update { generation, output }).is_ok();
-    let mut doc = EmailDocument::with_parts(&html, inline, blocked, tone);
-    drop(html);
+    let mut doc = EmailDocument::with_parts(&html, inline.clone(), blocked, tone);
+    // Whether the pointer passing over an element can change how it looks:
+    // only through a `:hover` rule, in the email's styles or a stylesheet it
+    // links (not read yet). Most email has neither: there, a move from one
+    // element to another needs no restyle and repaint of what is shown.
+    let hover_styles = {
+        let lower = html.to_ascii_lowercase();
+        lower.contains(":hover") || lower.contains("<link")
+    };
+    // Kept until the first layout shows whether the email's own dark styles
+    // darken it (see `EmailDocument::mostly_light`).
+    let mut source = (tone == Tone::NativeDark).then_some(html);
     let mut width = 0u32;
+    let mut screen = (600u32, 1f32);
+    // In the document's own pixels (see `EmailDocument::zoom`).
     let mut height = 1f32;
     let mut revision = 0u64;
     let mut selection = None;
     let mut word = None;
     let mut hovered: Option<String> = None;
+    let mut clicks: Option<Clicks> = None;
+    let mut told_accessible = false;
     loop {
-        let first = match rx.recv_timeout(Duration::from_millis(40)) {
-            Ok(command) => Some(command),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        // While resources are arriving, look every 40 ms for them; once
+        // none are, sleep until a command comes rather than waking 25 times
+        // a second for nothing (every open email and thumbnail has a thread).
+        let first = if doc.settled() {
+            match rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         };
         // Coalesce everything queued: a burst of pointer moves resolves once.
         let commands: Vec<Command> = first.into_iter().chain(rx.try_iter()).collect();
@@ -195,42 +320,120 @@ fn run(
         let mut pointed = false;
         // The pointer left the email: over no link, whatever blitz keeps.
         let mut left = false;
+        // A `#` link clicked, and whether Tab moved the focus.
+        let mut fragment = None;
+        let mut focus_moved = false;
         for command in commands {
+            let zoom = doc.zoom();
             match command {
-                Command::Layout(w) => {
-                    relayout |= w != width;
+                Command::Layout {
+                    width: w,
+                    height: h,
+                    scale,
+                } => {
+                    relayout |= w != width || (h, scale) != screen;
                     width = w;
+                    screen = (h, scale);
+                    doc.set_screen(h, scale);
                 }
                 Command::Pointer(event) => {
+                    let event = unzoom(event, zoom);
                     pointed = true;
                     left = matches!(event, UiEvent::PointerLeave(_));
                     let interactive = !matches!(event, UiEvent::PointerMove(_))
-                        || matches!(&event, UiEvent::PointerMove(e) if e.buttons != blitz_traits::events::MouseEventButtons::None);
+                        || matches!(&event, UiEvent::PointerMove(e) if e.buttons != MouseEventButtons::None);
+                    let mut presses = 0;
+                    if let UiEvent::PointerDown(e) = &event {
+                        let (x, y) = (e.coords.page_x, e.coords.page_y);
+                        // Shift-click extends the selection.
+                        if e.mods.contains(keyboard_types::Modifiers::SHIFT)
+                            && doc.extend_selection_to(x, y)
+                        {
+                            selection_changed = true;
+                            restyle = true;
+                            continue;
+                        }
+                        presses = Clicks::press(&mut clicks, x, y);
+                    }
+                    if matches!(event, UiEvent::PointerUp(_)) {
+                        fragment = doc
+                            .hovered_href()
+                            .and_then(|href| href.trim().strip_prefix('#').map(String::from))
+                            .or(fragment);
+                    }
+                    let at = match &event {
+                        UiEvent::PointerDown(e) => Some((e.coords.page_x, e.coords.page_y)),
+                        _ => None,
+                    };
                     let hover = doc.doc.get_hover_node_id();
                     let cursor = doc.cursor();
                     doc.doc.handle_ui_event(event);
+                    // Blitz scrolls its viewport to a `#` link's target; the
+                    // reader scrolls instead (`Output::Reveal`).
+                    doc.doc
+                        .set_viewport_scroll(blitz_dom::Point { x: 0., y: 0. });
+                    if let Some((x, y)) = at {
+                        match presses {
+                            2 => word = doc.select_word_at(x, y),
+                            3.. => doc.select_block_at(x, y),
+                            _ => {}
+                        }
+                    }
                     restyle |= interactive
-                        || hover != doc.doc.get_hover_node_id()
+                        || (hover_styles && hover != doc.doc.get_hover_node_id())
                         || cursor != doc.cursor();
                     selection_changed |= interactive;
                 }
                 Command::Key(event) => {
+                    let focused = doc.focused();
                     doc.doc.handle_ui_event(UiEvent::KeyDown(event.clone()));
                     doc.doc.handle_ui_event(UiEvent::KeyUp(BlitzKeyEvent {
                         state: blitz_traits::events::KeyState::Released,
                         ..event
                     }));
-                    relayout = width > 0;
+                    doc.doc
+                        .set_viewport_scroll(blitz_dom::Point { x: 0., y: 0. });
+                    focus_moved |= doc.focused() != focused;
+                    // Enter on a `<summary>` opens its details: a restyle
+                    // lays out what changed, without a new viewport.
+                    restyle = true;
+                }
+                Command::SelectAll => {
+                    doc.select_all();
+                    selection_changed = true;
+                    restyle = true;
+                }
+                Command::Wheel { x, y, dx, dy } => {
+                    let coords = PointerCoords {
+                        page_x: x / zoom,
+                        page_y: y / zoom,
+                        client_x: x / zoom,
+                        client_y: y / zoom,
+                        screen_x: x / zoom,
+                        screen_y: y / zoom,
+                    };
+                    doc.doc.handle_ui_event(UiEvent::Wheel(BlitzWheelEvent {
+                        delta: BlitzWheelDelta::Pixels((dx / zoom) as f64, (dy / zoom) as f64),
+                        coords,
+                        buttons: MouseEventButtons::None,
+                        mods: Default::default(),
+                        element: Default::default(),
+                    }));
+                    // A box scrolled to its end passes the rest to the
+                    // viewport, which is not scrolled here.
+                    doc.doc
+                        .set_viewport_scroll(blitz_dom::Point { x: 0., y: 0. });
+                    restyle = true;
                 }
                 Command::SelectWord { x, y } => {
-                    word = doc.select_word_at(x, y);
+                    word = doc.select_word_at(x / zoom, y / zoom);
                     // Repaint even when the same text is selected elsewhere.
                     selection_changed = true;
                     restyle = true;
                 }
                 Command::ExtendWord { x, y } => {
                     if let Some(word) = word {
-                        doc.extend_word_to(word, x, y);
+                        doc.extend_word_to(word, x / zoom, y / zoom);
                         selection_changed = true;
                         restyle = true;
                     }
@@ -238,7 +441,12 @@ fn run(
                 Command::Paint { band, width, scale } => {
                     paints.insert(band, (width, scale));
                 }
-                Command::Context { x, y } => contexts.push((x, y)),
+                Command::TextZoom(z) => {
+                    doc.set_text_zoom(z);
+                    relayout |= width > 0;
+                }
+                Command::Context { x, y } => contexts.push((x / zoom, y / zoom)),
+                Command::Reveal(id) => fragment = Some(id),
                 Command::Thumbnail {
                     width: w,
                     max_height,
@@ -255,10 +463,27 @@ fn run(
         }
         if relayout {
             height = doc.layout(width);
+            // An email whose dark styles leave it light is read inverted.
+            if let Some(html) = source.take()
+                && doc.mostly_light()
+            {
+                let zoom = doc.text_zoom();
+                doc = EmailDocument::with_parts(&html, inline.clone(), blocked, Tone::InvertedDark);
+                doc.set_screen(screen.0, screen.1);
+                doc.set_text_zoom(zoom);
+                height = doc.layout(width);
+            }
+            // Once, for screen readers: the email's text and links.
+            if !told_accessible {
+                told_accessible = true;
+                let (text, links) = doc.accessible_text();
+                send(Output::Accessible { text, links });
+            }
         } else if restyle && width > 0 {
-            doc.doc.resolve(0.);
+            doc.resolve();
             height = doc.content_height();
         }
+        let zoom = doc.zoom();
         if selection_changed {
             let now = doc.doc.get_selected_text().filter(|s| !s.is_empty());
             selection_changed = now != selection;
@@ -266,15 +491,44 @@ fn run(
         }
         if relayout || restyle || selection_changed {
             revision += 1;
+            let scrollers = doc
+                .scrollers()
+                .into_iter()
+                .map(|s| Scroller {
+                    x: s.x * zoom,
+                    y: s.y * zoom,
+                    width: s.width * zoom,
+                    height: s.height * zoom,
+                    ..s
+                })
+                .collect();
             if !send(Output::State {
                 revision,
                 width,
-                height,
+                height: height * zoom,
                 cursor: doc.cursor(),
                 selection: selection.clone(),
+                page: doc.page_color(),
+                scrollers,
             }) {
                 return;
             }
+        }
+        let reveal = fragment
+            .and_then(|f| doc.fragment_box(&f).map(|b| (b, true)))
+            .or_else(|| {
+                focus_moved
+                    .then(|| doc.focused_box().map(|b| (b, false)))
+                    .flatten()
+            });
+        if let Some(((top, bottom), start)) = reveal
+            && !send(Output::Reveal {
+                top: top * zoom,
+                bottom: bottom * zoom,
+                start,
+            })
+        {
+            return;
         }
         if pointed {
             let now = if left { None } else { doc.hovered_link() };
@@ -311,6 +565,7 @@ fn run(
                 revision,
                 size,
                 content: (pw, ph),
+                scale,
                 pixels,
             }) {
                 return;
@@ -322,13 +577,14 @@ fn run(
                 continue;
             }
             let top = band as f32 * band_height(scale);
-            if top >= height {
+            let shown = height * zoom;
+            if top >= shown {
                 continue;
             }
-            let rows = (height - top).min(band_height(scale));
+            let rows = (shown - top).min(band_height(scale));
             let pw = (width as f32 * scale).ceil().clamp(1., 8192.) as u32;
             let ph = ((rows * scale).ceil() as u32).clamp(1, TILE);
-            let pixels = doc.pixels(pw, ph, scale, band * TILE);
+            let pixels = doc.pixels(pw, ph, scale * zoom, band * TILE);
             let (size, pixels) = pad(pw, ph, pixels);
             if !send(Output::Tile {
                 band,

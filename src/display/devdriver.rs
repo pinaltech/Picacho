@@ -144,6 +144,10 @@ fn run(
                 Some("forward") => Action::Forward,
                 Some("composing") => Action::SettingsPage(Page::Composing),
                 Some("forwarding") => Action::SettingsPage(Page::Forwarding),
+                Some("contacts") => Action::SettingsPage(Page::Contacts),
+                Some("calendar") => Action::SettingsPage(Page::Calendar),
+                Some("encryption") => Action::SettingsPage(Page::Encryption),
+                Some("privacy") => Action::SettingsPage(Page::Privacy),
                 Some("fwdopen") => match this.forwarding.first() {
                     Some(f) => Action::ToggleForwarding(f.id.clone()),
                     None => return,

@@ -36,6 +36,14 @@ impl Wire {
         self.patience = wait;
         self.deadline = Instant::now() + wait.unwrap_or(COMMAND_TIMEOUT);
     }
+    /// The server reported progress on a long command (INPROGRESS, RFC
+    /// 9585): its response gets a fresh time budget, since it is working
+    /// rather than gone. Only time: the byte budget stays.
+    pub(crate) fn progressed(&mut self) {
+        if self.patience.is_none() {
+            self.deadline = Instant::now() + COMMAND_TIMEOUT;
+        }
+    }
     /// A handle that can close the connection from another thread, ending
     /// a read that is waiting on it.
     pub(crate) fn interrupter(&self) -> io::Result<TcpStream> {
@@ -50,7 +58,7 @@ impl Read for Wire {
         if self.remaining == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Mail server response exceeds the 32 MB session-command limit",
+                t!("sync-wire-mail-server-response-exceeds-the-32"),
             ));
         }
         let remaining_time = self
@@ -58,7 +66,7 @@ impl Read for Wire {
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "Mail server command timed out")
+                io::Error::new(io::ErrorKind::TimedOut, t!("sync-wire-mail-server-command-timed-out"))
             })?;
         let idle = self.patience.unwrap_or(IDLE_TIMEOUT);
         self.socket

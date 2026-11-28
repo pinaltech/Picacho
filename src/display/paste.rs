@@ -3,11 +3,13 @@
 //! system here and turned into the composer's Markdown.
 
 /// What a paste into the composer can insert: the clipboard's plain text, and
-/// its formatting as Markdown when that differs.
+/// its formatting as Markdown when that differs (and the HTML it came as,
+/// which the formatted composer pastes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Pasted {
     pub(super) plain: String,
     pub(super) formatted: String,
+    pub(super) html: String,
 }
 
 impl Pasted {
@@ -19,9 +21,52 @@ impl Pasted {
     }
 
     pub(super) fn from_parts(plain: String, html: &str) -> Option<Self> {
+        // Converted as it is pasted, on the interface's thread: a page copied
+        // whole (megabytes of markup) pastes as plain text rather than
+        // stalling the window while it is converted.
+        if html.len() > 2 * 1024 * 1024 {
+            return None;
+        }
         let formatted = html_to_markdown(html)?;
         let same = |a: &str, b: &str| a.split_whitespace().eq(b.split_whitespace());
-        (!formatted.is_empty() && !same(&formatted, &plain)).then_some(Self { plain, formatted })
+        let html = fragment(html).to_owned();
+        (!formatted.is_empty() && !same(&formatted, &plain)).then_some(Self { plain, formatted, html })
+    }
+}
+
+/// The part of copied HTML that was copied: Windows' CF_HTML gives the
+/// fragment's byte offsets in its header (StartFragment:/EndFragment:);
+/// those are what count, and the comment markers where the header's are
+/// missing or out of range.
+pub(super) fn fragment(html: &str) -> &str {
+    let offset = |name: &str| {
+        let at = html.find(name)? + name.len();
+        html[at..]
+            .split(['\r', '\n'])
+            .next()?
+            .trim()
+            .parse::<usize>()
+            .ok()
+    };
+    let header = match (offset("StartFragment:"), offset("EndFragment:")) {
+        (Some(start), Some(end))
+            if start < end
+                && end <= html.len()
+                && html.is_char_boundary(start)
+                && html.is_char_boundary(end) =>
+        {
+            Some(&html[start..end])
+        }
+        _ => None,
+    };
+    match (
+        header,
+        html.find("<!--StartFragment-->"),
+        html.find("<!--EndFragment-->"),
+    ) {
+        (Some(fragment), ..) => fragment,
+        (None, Some(start), Some(end)) if start < end => &html[start + 20..end],
+        _ => html,
     }
 }
 
@@ -29,14 +74,7 @@ impl Pasted {
 /// styles, scripts or page furniture.
 pub(super) fn html_to_markdown(html: &str) -> Option<String> {
     use htmd::options::{BrStyle, BulletListMarker, HrStyle, Options};
-    // Windows' CF_HTML and some apps wrap the fragment in markers.
-    let html = match (
-        html.find("<!--StartFragment-->"),
-        html.find("<!--EndFragment-->"),
-    ) {
-        (Some(start), Some(end)) if start < end => &html[start + 20..end],
-        _ => html,
-    };
+    let html = fragment(html);
     let converter = htmd::HtmlToMarkdown::builder()
         .options(Options {
             bullet_list_marker: BulletListMarker::Dash,
@@ -46,8 +84,13 @@ pub(super) fn html_to_markdown(html: &str) -> Option<String> {
             hr_style: HrStyle::Dashes,
             ..Options::default()
         })
+        // Remote images and embeds too: as Markdown images they'd be sent
+        // as <img> (a tracking pixel copied from a page or an email would
+        // report each recipient opening the reply). Pictures to send go in
+        // as attachments.
         .skip_tags(vec![
-            "head", "script", "style", "title", "meta", "link", "noscript",
+            "head", "script", "style", "title", "meta", "link", "noscript", "img", "picture",
+            "svg", "iframe", "object", "embed", "video", "audio",
         ])
         // The composer's strikethrough; htmd keeps only the text.
         .add_handler(vec!["s", "del", "strike"], strikethrough)
@@ -240,6 +283,14 @@ mod tests {
             html_to_markdown(html).unwrap(),
             "Hello **there**, see [this](https://example.com).\n\n- one\n- two"
         );
+    }
+
+    /// A tracking pixel (or any remote image) copied with the text isn't
+    /// pasted: it would go out as an image recipients load.
+    #[test]
+    fn remote_images_are_left_out() {
+        let html = "<p>Thanks!<img src=\"https://t.example/p.gif\" width=1 height=1></p>";
+        assert_eq!(html_to_markdown(html).unwrap(), "Thanks!");
     }
 
     #[test]

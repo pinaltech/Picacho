@@ -49,6 +49,26 @@ final class Native {
     static native void open(String target);
 
     /**
+     * A new-mail notification's button was pressed (Mark as Read, Archive,
+     * Delete): {@code target} names the messages and the button (see
+     * Notifier).
+     */
+    static native void quick(String target);
+
+    /**
+     * Another app handed Picacho something to open (see {@link Shared}): a
+     * mailto: link, an email file's path, "attach:" and a shared file's, or
+     * a {@code picacho://widget/...} deep link from a home-screen widget.
+     */
+    static native void launch(String request);
+
+    /**
+     * Rebuilds {@code widget-snapshot.json} from the local mail store at
+     * {@code dataDir} and refreshes all placed home-screen widgets.
+     */
+    static native void refreshWidgets(String dataDir);
+
+    /**
      * An answer to a request Rust made ({@link VerifyActivity}, {@link Passkeys}):
      * {@code value} is the answer, or null when there is nothing more.
      */

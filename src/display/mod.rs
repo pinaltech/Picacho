@@ -1,12 +1,16 @@
 //! Display: GPUI views, assets, and desktop notifications.
 mod assets;
+/// Touch ID, Face ID and Android's biometrics, for the app lock.
+pub(crate) mod biometric;
 mod desktop;
 pub mod notify;
-mod ui;
+/// `mailto:` addresses and email files Picacho was opened with.
+pub mod launch;
+pub(crate) mod ui;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use ui::run;
+pub use ui::{run, run_recovery};
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub use ui::{new_backend, run_on};
+pub use ui::{new_backend, run_on, run_recovery_on};
 /// One Picacho per data directory: later launches show its window.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod instance;
@@ -16,8 +20,18 @@ pub mod resident;
 /// The tray icon while Picacho runs in the background.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tray;
+/// Starting Picacho in the background when the person signs in.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod autostart;
 /// Proton's human verification window (a process of its own).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod verify;
+/// What Windows needs of Picacho itself, and its delay-loaded DLLs.
+#[cfg(windows)]
+pub mod windows;
+/// Open With… for attachments on macOS and Linux.
+pub(crate) mod open_with;
 
 mod html;
+/// Pictures no longer shown, released from the windows' atlases.
+mod textures;

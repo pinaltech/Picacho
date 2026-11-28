@@ -14,18 +14,22 @@ pub fn parse_message(
     let header = |name: &str| p.headers.get_first_value(name).unwrap_or_default();
     let mixed = p.ctype.mimetype.eq_ignore_ascii_case("multipart/mixed");
     let from_header = header("From");
+    // From may list several authors (RFC 5322 §3.6.2); the first is shown.
     let (sender, from) = mailparse::addrparse(&from_header)
         .ok()
-        .and_then(|v| v.extract_single_info())
+        .and_then(|v| first_mailbox(&v))
         .map(|s| (s.display_name.unwrap_or_else(|| s.addr.clone()), s.addr))
         .unwrap_or_else(|| (from_header.clone(), from_header));
+    let sender = shown_name(&sender);
     let mut body = String::new();
     let mut html = None;
     let mut attachments = Vec::new();
     let mut inline = InlineParts::default();
+    // Each leaf with whether it is one of a multipart/alternative's
+    // versions, found in the one walk through the tree.
     let mut leaves = Vec::new();
-    collect_leaves(&p, &mut leaves);
-    for (index, part) in leaves.iter().enumerate() {
+    collect_marked_leaves(&p, false, &mut leaves);
+    for (index, &(part, alternative)) in leaves.iter().enumerate() {
         // Parts with a Content-ID can be shown in the HTML (`cid:` images),
         // also when listed as attachments.
         if let Some(content_id) = part.headers.get_first_value("Content-ID")
@@ -33,6 +37,23 @@ pub fn parse_message(
             && let Ok(bytes) = part.get_body_raw()
         {
             inline.insert(&content_id, bytes);
+        }
+        // MHTML (RFC 2557): a part named by the address the HTML uses;
+        // relative ones against the message's base.
+        if let Some(location) = part.headers.get_first_value("Content-Location")
+            && !part.ctype.mimetype.starts_with("text/html")
+            && let Ok(bytes) = part.get_body_raw()
+        {
+            let base = p.headers.get_first_value("Content-Base")
+                .or_else(|| p.headers.get_first_value("Content-Location"))
+                .and_then(|b| url::Url::parse(b.trim()).ok());
+            let absolute = match url::Url::parse(location.trim()) {
+                Ok(u) => Some(u.to_string()),
+                Err(_) => base.and_then(|b| b.join(location.trim()).ok()).map(|u| u.to_string()),
+            };
+            if let Some(absolute) = absolute {
+                inline.insert_location(&absolute, bytes);
+            }
         }
         let disposition = part.get_content_disposition();
         let filename = disposition
@@ -50,8 +71,30 @@ pub fn parse_message(
             });
         } else if part.ctype.mimetype == "text/html" && html.is_none() {
             html = part.get_body().ok();
+        } else if part.ctype.mimetype == "text/plain" && !body.is_empty() && !alternative {
+            // More text after an attachment (a mailing list's footer, a
+            // forwarded note): shown after the first, as mail apps do.
+            let more = part.get_body().unwrap_or_default();
+            if !more.trim().is_empty() {
+                body.push_str("\n\n");
+                body.push_str(more.trim_end());
+            }
         } else if part.ctype.mimetype == "text/plain" && body.is_empty() {
             body = part.get_body().unwrap_or_default();
+            // format=flowed (RFC 3676): soft line breaks joined again.
+            if part
+                .ctype
+                .params
+                .get("format")
+                .is_some_and(|f| f.eq_ignore_ascii_case("flowed"))
+            {
+                let delsp = part
+                    .ctype
+                    .params
+                    .get("delsp")
+                    .is_some_and(|d| d.eq_ignore_ascii_case("yes"));
+                body = unflow(&body, delsp);
+            }
         }
     }
     if body.is_empty()
@@ -62,7 +105,10 @@ pub fn parse_message(
     let snippet = snippet(&body);
     let date = mailparse::dateparse(&header("Date")).unwrap_or_default();
     let subject = header("Subject");
-    let has_attachments = mixed || !attachments.is_empty();
+    // Only parts that are attachments say so: multipart/mixed alone (a
+    // text part and a footer) isn't one.
+    let _ = mixed;
+    let has_attachments = !attachments.is_empty();
     let mut mail = Mail {
         id: id.into(),
         account: account.id.clone(),
@@ -109,26 +155,201 @@ pub fn parse_message(
     } else {
         references
     });
-    mail.set_receipt_to(receipt_address(&header("Disposition-Notification-To")));
+    // No receipt for mail that must not be answered (RFC 8098 §2.1,
+    // §2.2, RFC 3834): reports, automatic mail, a null return path, or
+    // options this app can't honour that the sender marked required.
+    let auto = header("Auto-Submitted");
+    let automatic = !auto.trim().is_empty() && !auto.trim().eq_ignore_ascii_case("no");
+    let report = p.ctype.mimetype.eq_ignore_ascii_case("multipart/report");
+    let null_path = p
+        .headers
+        .get_all_values("Return-Path")
+        .iter()
+        .any(|v| v.trim().trim_matches(['<', '>']).trim().is_empty());
+    let required = header("Disposition-Notification-Options")
+        .split(';')
+        .any(|o| o.split_once('=').is_some_and(|(_, v)| v.trim().to_ascii_lowercase().starts_with("required")));
+    if !(automatic || report || null_path || required) {
+        mail.set_receipt_to(receipt_addresses(&header("Disposition-Notification-To")));
+    }
+    // Sent by a machine: told from someone answering (follow-up reminders).
+    // Delivery and disposition reports (multipart/report) are too.
+    mail.set_automatic(machine_sent(&header) || report);
+    // A mailing list's identity and addresses (RFC 2919, RFC 2369).
+    mail.set_list_id(crate::manage::list_headers::list_id(&header("List-Id")));
+    mail.set_list_links(crate::manage::list_headers::links(&header));
     Ok(mail)
 }
-/// The address a read receipt goes to, from Disposition-Notification-To.
+/// Whether a message's headers say a machine sent it: Auto-Submitted other
+/// than "no" (RFC 3834), the X-Autoreply and X-Autorespond that vacation
+/// responders add, or Precedence: auto_reply.
+pub(crate) fn machine_sent(header: &dyn Fn(&str) -> String) -> bool {
+    let auto = header("Auto-Submitted");
+    (!auto.trim().is_empty() && !auto.trim().eq_ignore_ascii_case("no"))
+        || !header("X-Autoreply").trim().is_empty()
+        || !header("X-Autorespond").trim().is_empty()
+        || header("Precedence").trim().eq_ignore_ascii_case("auto_reply")
+}
+/// Whether an Exchange message class (PR_MESSAGE_CLASS, EWS's ItemClass)
+/// is one a machine sends: an out-of-office or rule's automatic reply
+/// (`IPM.Note.Rules.OofTemplate.Microsoft`, `IPM.Note.Rules.ReplyTemplate…`)
+/// or a report (`REPORT.IPM.Note.NDR`, read and delivery receipts).
+pub(crate) fn automatic_class(class: &str) -> bool {
+    let class = class.trim().to_ascii_lowercase();
+    class.starts_with("report.")
+        || class.starts_with("ipm.note.rules.ooftemplate")
+        || class.starts_with("ipm.note.rules.replytemplate")
+}
+/// format=flowed text (RFC 3676 §4) as paragraphs: a line ending in a
+/// space continues on the next with the same quote depth (the space
+/// dropped too with DelSp=yes); space-stuffing is undone; "-- " ends a
+/// paragraph as the signature separator.
+pub(crate) fn unflow(text: &str, delsp: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut open: Option<usize> = None;
+    let text = text.replace("\r\n", "\n");
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    for raw in body.split('\n') {
+        let depth = raw.chars().take_while(|c| *c == '>').count();
+        let mut line = &raw[depth..];
+        line = line.strip_prefix(' ').unwrap_or(line);
+        let signature = line == "-- ";
+        let soft = line.ends_with(' ') && !signature;
+        if open.is_some_and(|d| d != depth) {
+            // A different quote depth starts a new line.
+            out.push('\n');
+            open = None;
+        }
+        if open.is_none() && depth > 0 {
+            out.push_str(&">".repeat(depth));
+            out.push(' ');
+        }
+        let text = if soft && delsp { &line[..line.len() - 1] } else { line };
+        out.push_str(if soft || signature { text } else { text.trim_end_matches(' ') });
+        if soft {
+            open = Some(depth);
+        } else {
+            out.push('\n');
+            open = None;
+        }
+    }
+    if out.ends_with('\n') && !text.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// A header's text as RFC 2047 encoded words where it isn't plain ASCII:
+/// each word at most 75 characters (§2), split between characters, and
+/// separated by folding white space. Line breaks become spaces.
+pub(crate) fn encoded_words(text: &str) -> String {
+    use base64::Engine as _;
+    let text = text.replace(['\r', '\n'], " ");
+    if text.is_ascii() {
+        return text;
+    }
+    // "=?UTF-8?B?" + "?=" is 12; 63 base64 characters hold 45 bytes, at
+    // most 75 in all.
+    const MOST: usize = 45;
+    let mut words = Vec::new();
+    let mut piece = String::new();
+    for c in text.chars() {
+        if piece.len() + c.len_utf8() > MOST {
+            words.push(std::mem::take(&mut piece));
+        }
+        piece.push(c);
+    }
+    if !piece.is_empty() {
+        words.push(piece);
+    }
+    words
+        .iter()
+        .map(|w| format!("=?UTF-8?B?{}?=", base64::engine::general_purpose::STANDARD.encode(w)))
+        .collect::<Vec<_>>()
+        .join("\r\n ")
+}
+/// A display name for an address header (`Name <a@b>`): encoded words
+/// where it isn't ASCII, a quoted string where it holds RFC 5322 specials
+/// (`,` `;` `.` `"` and the like), else as it is.
+pub(crate) fn display_name(name: &str) -> String {
+    let name = name.replace(['\r', '\n'], " ");
+    let name = name.trim();
+    if !name.is_ascii() {
+        return encoded_words(name);
+    }
+    if name.contains(['(', ')', '<', '>', '[', ']', ':', ';', '@', '\\', ',', '.', '"']) {
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        name.to_owned()
+    }
+}
+
+/// The first mailbox of an address list, groups included.
+fn first_mailbox(list: &mailparse::MailAddrList) -> Option<mailparse::SingleInfo> {
+    list.iter().find_map(|a| match a {
+        mailparse::MailAddr::Single(s) => Some(s.clone()),
+        mailparse::MailAddr::Group(g) => g.addrs.first().cloned(),
+    })
+}
+/// The first address in an address header (From, Sender…).
 pub(crate) fn receipt_address(value: &str) -> String {
     mailparse::addrparse(value)
         .ok()
-        .and_then(|v| v.extract_single_info())
+        .and_then(|v| first_mailbox(&v))
         .map(|s| s.addr)
         .unwrap_or_default()
+}
+/// Where a read receipt goes: every address in Disposition-Notification-To
+/// (RFC 8098 §2.1: a list of mailboxes; the report goes to all of them),
+/// joined with ", ", each once. Groups give their members.
+pub(crate) fn receipt_addresses(value: &str) -> String {
+    let Ok(list) = mailparse::addrparse(value) else {
+        return String::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for single in list.iter().flat_map(|a| match a {
+        mailparse::MailAddr::Single(s) => vec![s.addr.clone()],
+        mailparse::MailAddr::Group(g) => g.addrs.iter().map(|s| s.addr.clone()).collect(),
+    }) {
+        if !single.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&single)) {
+            out.push(single);
+        }
+    }
+    out.join(", ")
 }
 pub(crate) fn collect_leaves<'a>(
     p: &'a mailparse::ParsedMail<'a>,
     out: &mut Vec<&'a mailparse::ParsedMail<'a>>,
 ) {
+    let mut marked = Vec::new();
+    collect_marked_leaves(p, false, &mut marked);
+    out.extend(marked.into_iter().map(|(leaf, _)| leaf));
+}
+
+/// The most leaves of a message's MIME tree looked at (`collect_leaves`):
+/// a message of many small parts, well within any size limit, otherwise
+/// costs work and memory for each. Past it, parts are left out, the same
+/// way wherever a part is found again by its index.
+pub(crate) const MAX_LEAVES: usize = 4096;
+
+/// `collect_leaves`, each with whether it is one of a
+/// multipart/alternative's versions (the plain text beside the HTML, not
+/// more text of its own): whether its own parent is one. `alternative`
+/// says whether `p`'s is.
+fn collect_marked_leaves<'a>(
+    p: &'a mailparse::ParsedMail<'a>,
+    alternative: bool,
+    out: &mut Vec<(&'a mailparse::ParsedMail<'a>, bool)>,
+) {
+    if out.len() >= MAX_LEAVES {
+        return;
+    }
     if p.subparts.is_empty() {
-        out.push(p);
+        out.push((p, alternative));
     } else {
+        let here = p.ctype.mimetype.eq_ignore_ascii_case("multipart/alternative");
         for part in &p.subparts {
-            collect_leaves(part, out);
+            collect_marked_leaves(part, here, out);
         }
     }
 }
@@ -205,7 +426,13 @@ pub(crate) fn html_to_text(html: &str) -> String {
                     hidden.truncate(at);
                 }
             } else if !tag.trim_end().ends_with('/') {
-                hidden.push(base);
+                // Past a deep nesting no page has, another opening tag
+                // changes nothing (its text is hidden either way); kept,
+                // each closing tag searched them all, and many unclosed
+                // tags made that slow on every one.
+                if hidden.len() < 256 {
+                    hidden.push(base);
+                }
             }
             continue;
         }
@@ -293,8 +520,16 @@ pub(crate) fn snippet(body: &str) -> String {
         .chars()
         .filter(|c| !invisible(*c))
         .collect();
-    text.split_whitespace().take(45).collect::<Vec<_>>().join(" ")
+    let words = text.split_whitespace().take(45).collect::<Vec<_>>().join(" ");
+    // At most a few lines' worth: a "word" can be a whole encoded blob, and
+    // every listed message keeps its preview in memory.
+    match words.char_indices().nth(SNIPPET_CHARS) {
+        Some((end, _)) => words[..end].to_owned(),
+        None => words,
+    }
 }
+/// The longest preview kept, in characters.
+const SNIPPET_CHARS: usize = 400;
 
 /// Decodes HTML character references: numeric ones, and the named ones
 /// mail uses. Unknown names are left as written.
@@ -497,7 +732,88 @@ fn entity(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 8098 §2.1: Disposition-Notification-To may name several
+    /// mailboxes; a receipt goes to each, once.
+    #[test]
+    fn every_receipt_address_is_kept() -> anyhow::Result<()> {
+        assert_eq!(
+            receipt_addresses("Ana <ana@example.com>, bo@example.com, Team: cy@example.com, ANA@example.com;"),
+            "ana@example.com, bo@example.com, cy@example.com"
+        );
+        assert_eq!(receipt_addresses(""), "");
+        let a = crate::manage::model::Account::new(crate::manage::model::Provider::Imap);
+        let raw = b"From: Ana <ana@example.com>\r\nDisposition-Notification-To: ana@example.com, Bo <bo@example.com>\r\nSubject: Hi\r\n\r\nBody";
+        let m = parse_message(raw, &a, "x:INBOX:1:1", crate::manage::model::Folder::Inbox, "INBOX", 1)?;
+        assert_eq!(m.receipt_to(), "ana@example.com, bo@example.com");
+        Ok(())
+    }
+    /// RFC 2919 and RFC 2369: a list message keeps its List-Id and links.
+    #[test]
+    fn list_headers_are_parsed() -> anyhow::Result<()> {
+        let a = crate::manage::model::Account::new(crate::manage::model::Provider::Imap);
+        let raw = b"From: list@example.org\r\nList-Id: Users <users.example.org>\r\nList-Post: <mailto:users@example.org>\r\nList-Help: <https://example.org/help>\r\nSubject: Hi\r\n\r\nBody";
+        let m = parse_message(raw, &a, "x:INBOX:1:1", crate::manage::model::Folder::Inbox, "INBOX", 1)?;
+        assert_eq!(m.list_id(), "users.example.org");
+        let kinds: Vec<_> = m.list_links().iter().map(|l| (l.kind, l.uri.as_str())).collect();
+        use crate::manage::list_headers::ListLinkKind as K;
+        assert_eq!(kinds, [(K::Help, "https://example.org/help"), (K::Post, "mailto:users@example.org")]);
+        Ok(())
+    }
+    #[test]
+    fn flowed_text_round_trips() {
+        let text = format!("{}\n\n> quoted line\n-- \nAna", "word ".repeat(40).trim_end());
+        let sent = crate::sync::smtp::flowed(&text);
+        assert!(sent.lines().all(|l| l.chars().count() <= 79), "{sent}");
+        assert!(sent.lines().next().unwrap().ends_with(' '));
+        assert_eq!(unflow(&sent, false), text);
+        assert_eq!(unflow("a \r\nb\r\n>> c \r\n>> d\r\n", false), "a b\n>> c d\n");
+        assert_eq!(unflow("long-  \r\nword", true), "long- word");
+        // "From " is stuffed; a typed `>` is a quote (written `> `).
+        assert_eq!(crate::sync::smtp::flowed("From here\n>quoted"), " From here\r\n> quoted");
+    }
     use super::*;
+
+    /// A wide message (thousands of small parts, far within any size
+    /// limit) is read in one walk: the plain text beside the HTML isn't
+    /// shown twice, text after it is; leaves past `MAX_LEAVES` and inline
+    /// parts past `InlineParts::MAX_PARTS` are left out.
+    #[test]
+    fn wide_messages_are_read_in_one_walk_within_a_part_budget() {
+        let mut raw = String::from(
+            "Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain\r\n\r\nPlain version\r\n--a\r\nContent-Type: text/html\r\n\r\n<p>Rich version</p>\r\n--a--\r\n--m\r\nContent-Type: text/plain\r\n\r\nThe footer\r\n",
+        );
+        for i in 0..MAX_LEAVES + 50 {
+            raw.push_str(&format!(
+                "--m\r\nContent-Type: image/png\r\nContent-ID: <p{i}@x>\r\n\r\npng{i}\r\n"
+            ));
+        }
+        raw.push_str("--m--\r\n");
+        let a = Account::new(Provider::Imap);
+        let m = parse_message(raw.as_bytes(), &a, "id", Folder::Inbox, "INBOX", 1).unwrap();
+        assert_eq!(m.body.as_deref(), Some("Plain version\n\nThe footer"));
+        assert_eq!(m.html.as_deref(), Some("<p>Rich version</p>"));
+        let parsed = mailparse::parse_mail(raw.as_bytes()).unwrap();
+        let mut leaves = Vec::new();
+        collect_leaves(&parsed, &mut leaves);
+        assert_eq!(leaves.len(), MAX_LEAVES);
+        assert!(m.inline.get("cid:p0@x").is_some());
+        assert!(m.inline.get(&format!("cid:p{}@x", InlineParts::MAX_PARTS)).is_none());
+    }
+
+    /// The inline parts' total is kept as parts are added and replaced.
+    #[test]
+    fn inline_parts_keep_their_total() {
+        let mut parts = InlineParts::default();
+        let half = InlineParts::MAX_BYTES / 2;
+        assert!(parts.insert("<a>", vec![0; half]));
+        assert!(parts.insert("<b>", vec![0; half]));
+        assert!(!parts.insert("<c>", vec![0; 1]), "full");
+        // Replacing one counts it once.
+        assert!(parts.insert("<a>", vec![0; half - 10]));
+        assert!(parts.insert("<c>", vec![0; 10]));
+        assert!(!parts.insert("<d>", vec![0; 1]));
+    }
+
     #[test]
     fn retains_html_alternative_without_treating_html_attachments_as_body() {
         let raw = b"Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain alternative\r\n--a\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nPGI+UmljaCBhbHRlcm5hdGl2ZTwvYj4=\r\n--a--\r\n--m\r\nContent-Type: text/html; name=attachment.html\r\nContent-Disposition: attachment; filename=attachment.html\r\n\r\n<script>attachment</script>\r\n--m--\r\n";
@@ -584,6 +900,17 @@ mod tests {
     }
 }
 
+/// A sender's name as it is shown: without direction overrides and
+/// isolates (U+202E turns "Bank moc.evil@" around to read like an address),
+/// and at most 100 characters, so it can't push the address out of view.
+/// Direction marks (U+200E, U+200F), which right-to-left names use, stay.
+fn shown_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .take(100)
+        .collect()
+}
+
 /// What a reader shows under "details": addressing, the sending domains and
 /// how the message was protected in transit and by its sender.
 ///
@@ -593,6 +920,9 @@ mod tests {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Details {
     pub from: String,
+    /// Who actually sent it on the author's behalf (RFC 5322 §3.6.2:
+    /// Sender), where that isn't the From address.
+    pub sender: String,
     pub reply_to: String,
     pub to: String,
     pub cc: String,
@@ -606,6 +936,15 @@ pub struct Details {
     pub spf: Option<String>,
     pub dkim: Option<String>,
     pub dmarc: Option<String>,
+    /// What the From domain asks for mail failing DMARC: `none`,
+    /// `quarantine` or `reject` (its `p=`, or `sp=` for a subdomain).
+    pub dmarc_policy: Option<String>,
+    /// The ARC chain (RFC 8617): forwarding servers vouching for what they
+    /// received, as `pass`, `fail` or `none`.
+    pub arc: Option<String>,
+    /// A signature covering only the body's start (DKIM `l=`): what follows
+    /// could have been added by anyone.
+    pub partly_signed: bool,
     pub security: Security,
     /// How the mailbox's provider received the message, if recorded.
     pub arrival: Option<Arrival>,
@@ -614,6 +953,21 @@ pub struct Details {
     /// Whether `auth::check` has run: the checks look the sender's records
     /// up in DNS, so they wait until asked for.
     pub checked: bool,
+    /// What the sender's OpenPGP signature says, when the message has one
+    /// (checked against your keyring when it was read).
+    pub signature: Option<String>,
+    /// Whether that signature checked out.
+    pub signature_good: bool,
+    /// An S/MIME message's signers, each with its own result (RFC 5652
+    /// §5.1 lets one message carry several), when there is more than one.
+    pub signers: Vec<crate::manage::smime::Signer>,
+    /// RFC 5280 §6.3, RFC 6960: whether an S/MIME signer's certificate was
+    /// found revoked, when asked (Check sender): a line saying so, and
+    /// whether all was well.
+    pub revocation: Option<(String, bool)>,
+    /// BIMI: what Check sender found of the sender's brand logo (see
+    /// `manage/bimi.rs`): a line saying so, and whether one is shown.
+    pub brand: Option<(String, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -633,11 +987,11 @@ pub enum Security {
 impl Security {
     pub fn label(self) -> &'static str {
         match self {
-            Security::EndToEnd => "End-to-end encryption",
-            Security::Undecrypted => "Encrypted, but not decrypted here",
-            Security::Tls => "Standard encryption (TLS)",
-            Security::Plain => "Not encrypted in transit",
-            Security::Unknown => "Not recorded",
+            Security::EndToEnd => t!("sync-mime-end-to-end-encryption"),
+            Security::Undecrypted => t!("sync-mime-encrypted-but-not-decrypted-here"),
+            Security::Tls => t!("sync-mime-standard-encryption-tls"),
+            Security::Plain => t!("sync-mime-not-encrypted-in-transit"),
+            Security::Unknown => t!("sync-mime-not-recorded"),
         }
     }
 }
@@ -888,8 +1242,7 @@ pub fn details(raw: &[u8], decrypted: bool) -> Details {
     };
     let one = |name: &str| headers.get_first_value(name).unwrap_or_default();
     let arrival = arrival(&headers.get_all_values("Received"));
-    let encrypted = crate::manage::crypto::sender_encrypted(raw)
-        || crate::manage::crypto::encrypted_part(raw).is_some();
+    let encrypted = crate::manage::crypto::is_encrypted(raw);
     let security = match &arrival {
         _ if decrypted => Security::EndToEnd,
         _ if encrypted => Security::Undecrypted,
@@ -903,6 +1256,12 @@ pub fn details(raw: &[u8], decrypted: bool) -> Details {
         .filter(|r| !r.is_empty());
     Details {
         from: one("From"),
+        sender: {
+            let sender = one("Sender");
+            let differs = !receipt_address(&sender).is_empty()
+                && !receipt_address(&sender).eq_ignore_ascii_case(&receipt_address(&one("From")));
+            if differs { sender } else { String::new() }
+        },
         reply_to: one("Reply-To"),
         to: one("To"),
         cc: one("Cc"),

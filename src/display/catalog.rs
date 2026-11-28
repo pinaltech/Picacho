@@ -206,6 +206,9 @@ impl MailApp {
     /// Replaces the listed messages, keeping the open message's body and the
     /// list's scroll position on the same message, wherever it moved.
     pub(super) fn set_messages(&mut self, messages: Vec<Mail>, cx: &App) {
+        // Conversations are completed again for the new list.
+        self.thread_extras.clear();
+        self.threads_completed.clear();
         let kept = self.list_place();
         self.install_messages(messages, kept, cx);
     }
@@ -225,7 +228,7 @@ impl MailApp {
     /// Shows `messages`, keeping what `kept` (taken from the list before)
     /// holds: see `set_messages`.
     pub(super) fn install_messages(&mut self, messages: Vec<Mail>, kept: ListPlace, cx: &App) {
-        let mut messages = self.backend.with_readable(messages);
+        let mut messages = self.backend.with_readable_previews(messages);
         if let Some(open) = kept.open
             && let Some(m) = messages
                 .iter_mut()
@@ -239,7 +242,13 @@ impl MailApp {
                 ..open
             };
         }
-        self.messages = messages;
+        let replaced = std::mem::replace(&mut self.messages, messages);
+        // A long list let go of (another mailbox opened): its memory goes
+        // back to the system rather than staying with the window.
+        if replaced.len() > 1000 {
+            drop(replaced);
+            crate::manage::memory::release_unused_soon();
+        }
         self.apply_filter(cx);
         if let Some(anchor) = kept.anchor {
             self.restore_scroll(anchor);
@@ -251,13 +260,13 @@ impl MailApp {
         if offset <= px(0.) {
             return None;
         }
-        let index = (offset / px(ROW_HEIGHT)).floor() as usize;
+        let index = (offset / px(self.row_height())).floor() as usize;
         let id = self.messages.get(*self.visible.get(index)?)?.id.clone();
-        Some((id, offset - px(ROW_HEIGHT) * index as f32))
+        Some((id, offset - px(self.row_height()) * index as f32))
     }
     pub(super) fn restore_scroll(&self, (id, within): (String, Pixels)) {
         if let Some(index) = self.visible.iter().position(|i| self.messages[*i].id == id) {
-            let y = px(ROW_HEIGHT) * index as f32 + within;
+            let y = px(self.row_height()) * index as f32 + within;
             self.list_scroll
                 .0
                 .borrow()

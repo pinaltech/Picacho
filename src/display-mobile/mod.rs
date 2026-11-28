@@ -90,6 +90,9 @@ pub(super) struct Mobile {
     pub(super) pan: Option<String>,
     /// When the last swipe ended; its fling must not start another.
     pub(super) swipe_ended: Option<std::time::Instant>,
+    /// How far the row being swiped must go for letting go to act (see
+    /// `list::swipe_reach`).
+    pub(super) swipe_reach: f32,
     /// How far a pull-to-refresh has been dragged down at the list's top.
     pub(super) pull: f32,
     /// The current touch began with the list at its top, so pulling past
@@ -150,6 +153,8 @@ pub(super) struct Mobile {
     pub(super) sheet_scroll: ScrollHandle,
     /// The filter chips' sideways scroll.
     pub(super) filters_scroll: ScrollHandle,
+    /// The inbox's category chips, sideways.
+    pub(super) categories_scroll: ScrollHandle,
     /// Stands in for the system's insets in tests.
     #[cfg(test)]
     pub(super) fake_insets: Option<Insets>,
@@ -166,6 +171,7 @@ impl Mobile {
             split: false,
             swipe: None,
             swipe_ended: None,
+            swipe_reach: 88.,
             pan: None,
             pull: 0.,
             pull_armed: false,
@@ -194,6 +200,7 @@ impl Mobile {
             settings_scroll: ScrollHandle::new(),
             sheet_scroll: ScrollHandle::new(),
             filters_scroll: ScrollHandle::new(),
+            categories_scroll: ScrollHandle::new(),
             #[cfg(test)]
             fake_insets: None,
         }
@@ -261,6 +268,10 @@ pub(super) enum Screen {
     List,
     Reader,
     Subscriptions,
+    /// An account's Summary.
+    Summary,
+    /// Calendar or Contacts opened as its own full-screen view.
+    AppView(calendar_views::AppView),
     Settings,
 }
 
@@ -273,6 +284,10 @@ impl MailApp {
             Screen::Settings
         } else if self.subs_open {
             Screen::Subscriptions
+        } else if self.summary_open {
+            Screen::Summary
+        } else if let Some(view) = self.app_view {
+            Screen::AppView(view)
         } else if self.selected.is_some() && self.selection.len() <= 1 {
             Screen::Reader
         } else if self.mobile.mailboxes {
@@ -316,6 +331,8 @@ impl MailApp {
             Screen::Setup => self.mobile_setup(insets, window, cx),
             Screen::Settings => self.mobile_settings(insets, window, cx),
             Screen::Subscriptions => self.mobile_subscriptions(insets, window, cx),
+            Screen::Summary => self.mobile_summary(insets, cx),
+            Screen::AppView(view) => self.mobile_app_view(view, insets, cx),
             _ if split => self.mobile_split_view(screen, insets, window, cx),
             Screen::Mailboxes => self.mobile_mailboxes(insets, cx),
             Screen::List => self.mobile_list(insets, window, cx),
@@ -488,6 +505,8 @@ impl MailApp {
             })
             .children(self.link_sheet(insets, window, cx))
             .children(self.mobile_toast(insets, screen, cx))
+            // A tablet's keyboard opens the command palette too.
+            .children(self.palette_layer(window, cx))
     }
 
     /// The system's insets: safe area and keyboard.
@@ -529,6 +548,13 @@ impl MailApp {
         }
         // Settings: a page goes back to the list of pages.
         if self.modal == Some(Modal::Settings) {
+            // A workspace's page goes back to Workspaces.
+            if matches!(self.page, Page::Workspace(_)) {
+                self.ws_ui.deleting = None;
+                self.handle(Action::SettingsPage(Page::Workspaces), w, cx);
+                self.mobile_popped(cx);
+                return true;
+            }
             // Beside the list, reverse aliases go back to Forwarding, in
             // their column; anything else leaves Settings.
             if Self::mobile_split(w) {
@@ -549,13 +575,62 @@ impl MailApp {
             self.mobile.settings_page = false;
             return false;
         }
-        if self.modal.is_some() || self.selecting || self.search_open {
+        if self.modal.is_some() {
+            return false;
+        }
+        // An open message goes back to the list, even with a search or
+        // a find open: Back used to close the search under the message
+        // (or the find in it, after sliding away as though going back),
+        // leaving the message where it was.
+        if self.mobile_screen() == Screen::Reader && !self.selecting {
+            if self.find.open {
+                self.tool_action(super::tools::ToolAction::FindClose, w, cx);
+                return true;
+            }
+            self.mobile_popped(cx);
+            self.handle(Action::BackToList, w, cx);
+            cx.notify();
+            return true;
+        }
+        if self.selecting || self.search_open {
             return false;
         }
         match self.mobile_screen() {
             Screen::Subscriptions if self.selected.is_none() && self.subs_sender.is_none() => {
                 // Subscriptions were opened from the mailboxes.
                 self.open_mailbox(self.account.clone(), Folder::Inbox.into(), w, cx);
+                self.mobile.mailboxes = true;
+                self.mobile_popped(cx);
+                true
+            }
+            Screen::Summary if self.summary_packages && self.summary_search => {
+                // Back closes the packages' search first.
+                self.search_parcels(false, w, cx);
+                true
+            }
+            Screen::Summary if self.summary_receipts && self.receipts_search => {
+                // Back closes the receipts' search first.
+                self.search_receipts(false, w, cx);
+                true
+            }
+            Screen::Summary if self.summary_packages || self.summary_receipts => {
+                // The Packages and Receipts pages go back to the Summary's
+                // widgets.
+                self.summary_packages = false;
+                self.summary_receipts = false;
+                cx.notify();
+                true
+            }
+            Screen::Summary => {
+                // The Summary was opened from the mailboxes.
+                self.open_mailbox(self.account.clone(), Folder::Inbox.into(), w, cx);
+                self.mobile.mailboxes = true;
+                self.mobile_popped(cx);
+                true
+            }
+            Screen::AppView(_) => {
+                // Calendar or Contacts was opened from the mailboxes.
+                self.app_view = None;
                 self.mobile.mailboxes = true;
                 self.mobile_popped(cx);
                 true
@@ -610,6 +685,8 @@ impl MailApp {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub(super) fn mobile_has_back(&self, w: &Window, cx: &App) -> bool {
         self.keyboard_shown(w)
+            // Back closes the command palette (`MailApp::close`).
+            || self.palette.open
             || self.links.confirm.is_some()
             || self.mobile_composer(cx).is_some()
             || self.menu.is_some()
@@ -655,7 +732,12 @@ impl MailApp {
             }
             // A sheet or the keyboard (no drag for those), or the button.
             Back::Go if self.mobile.back_release.is_none() => self.close(w, cx),
-            Back::Go => {}
+            // Pressed again while the last one's slide finishes: that one
+            // goes back now, and this one too. It used to be dropped.
+            Back::Go => {
+                self.mobile_finish_release(w, cx);
+                self.close(w, cx);
+            }
             Back::Cancelled => {
                 self.mobile_back_gesture(&gesture(BackGesturePhase::Cancelled, 0.), w, cx);
             }
@@ -688,16 +770,19 @@ impl MailApp {
     /// Whether a back drag can start here: a screen to go back to, and
     /// nothing (a sheet, a composer) over it.
     fn mobile_can_go_back(&self, cx: &App) -> bool {
-        !matches!(self.mobile_screen(), Screen::Mailboxes | Screen::Setup)
+        let screen = self.mobile_screen();
+        !matches!(screen, Screen::Mailboxes | Screen::Setup)
             && !self.mobile_split_frame()
             && !self.mobile_split_settings()
             && self.menu.is_none()
+            && !self.palette.open
             && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
             && self.mobile.back_release.is_none()
             && self.links.confirm.is_none()
             && !self.selecting
-            && !self.search_open
+            // A message opened from search results goes back to them.
+            && (!self.search_open || (screen == Screen::Reader && !self.find.open))
     }
 
     /// Listens, before anything under the finger, for pans that start at
@@ -818,6 +903,19 @@ impl MailApp {
         .detach();
     }
 
+    /// Ends a let-go back drag's slide at once, going back if it was to.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    fn mobile_finish_release(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, commit, _)) = self.mobile.back_release.take() {
+            if commit {
+                self.close(w, cx);
+                self.mobile.slide = Slide::None;
+                self.mobile.push_anim += 1;
+            }
+            cx.notify();
+        }
+    }
+
     /// Goes back as a back button does: the screen slides away over the one
     /// below, where there is one to show, else at once.
     pub(super) fn mobile_animate_back(&mut self, w: &mut Window, cx: &mut Context<Self>) {
@@ -838,8 +936,11 @@ impl MailApp {
         match screen {
             Screen::Reader => !self.subs_open,
             Screen::List => true,
-            Screen::Settings => self.fwd_reverse.is_none(),
+            Screen::Settings => {
+                self.fwd_reverse.is_none() && !matches!(self.page, Page::Workspace(_))
+            }
             Screen::Subscriptions => self.selected.is_none() && self.subs_sender.is_none(),
+            Screen::Summary | Screen::AppView(_) => true,
             Screen::Mailboxes | Screen::Setup => false,
         }
     }
@@ -857,7 +958,9 @@ impl MailApp {
         }
         Some(match screen {
             Screen::Reader => self.mobile_list(insets, window, cx),
-            Screen::List | Screen::Subscriptions => self.mobile_mailboxes(insets, cx),
+            Screen::List | Screen::Subscriptions | Screen::Summary | Screen::AppView(_) => {
+                self.mobile_mailboxes(insets, cx)
+            }
             Screen::Settings if self.mobile.settings_page => {
                 self.mobile_settings_list(insets, false, cx)
             }
@@ -983,7 +1086,12 @@ impl MailApp {
     pub(super) fn keyboard_fields(&self, cx: &App) -> Vec<(FocusHandle, Keys)> {
         let mut out = vec![];
         let mut add = |state: &Entity<InputState>, keys: Keys| {
-            out.push((state.read(cx).focus_handle(cx), keys));
+            let state = state.read(cx);
+            // Every masked field (passwords, PINs, API keys, passphrases)
+            // asks for the password keyboard, whatever it was listed as: a
+            // plain one learned and synced what was typed.
+            let keys = if state.presentation().is_masked() { Keys::Password } else { keys };
+            out.push((state.focus_handle(cx), keys));
         };
         for (i, state) in self.form.iter().enumerate() {
             add(
@@ -1024,8 +1132,44 @@ impl MailApp {
         ] {
             add(state, Keys::Text);
         }
+        for state in self.lock.fields() {
+            add(state, Keys::Password);
+        }
         add(&self.fwd_server, Keys::Url);
         add(&self.fwd_contact_new, Keys::Email);
+        // Masked, so the password keyboard (see `add`): not listed before,
+        // they got the platform's plain keyboard.
+        for state in [&self.calendar_password, &self.contacts_password, &self.key_passphrase, &self.fwd_pass_password] {
+            add(state, Keys::Password);
+        }
+        for state in [&self.cal.interval, &self.cal.month_day, &self.cal.count, &self.cal.until] {
+            add(state, Keys::Text);
+        }
+        for state in [
+            &self.event_title,
+            &self.event_start,
+            &self.event_end,
+            &self.event_location,
+            &self.event_notes,
+            &self.event_zone,
+            &self.contact_name,
+            &self.contact_phones,
+            &self.contact_org,
+            &self.contact_note,
+            &self.contact_addresses,
+            &self.contact_birthday,
+            &self.contact_title,
+            &self.contact_nicknames,
+            &self.contact_links,
+            &self.contact_anniversary,
+            &self.contact_members,
+        ] {
+            add(state, Keys::Text);
+        }
+        for state in [&self.event_guests, &self.contact_emails] {
+            add(state, Keys::Email);
+        }
+        add(&self.contact_filter, Keys::Search);
         out.push((self.signature_input.read(cx).focus_handle(cx), Keys::Text));
         if let Some(focus) = self
             .picker
@@ -1143,6 +1287,7 @@ impl MailApp {
         (self.mobile_split_frame() || self.mobile_split_settings())
             && self.mobile_screen() != Screen::Mailboxes
             && self.menu.is_none()
+            && !self.palette.open
             && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
             && self.links.confirm.is_none()
@@ -1249,7 +1394,7 @@ impl MailApp {
                 .bg(rgb(c.surface))
                 .text_color(rgb(c.muted))
                 .child(icon_el("mail", 44., c.border))
-                .child("No message selected")
+                .child(t!("mobile-mod-no-message-selected"))
                 .into_any_element()
         };
         let reader = self.mobile_pane_motion(SplitPane::Reader, reader);

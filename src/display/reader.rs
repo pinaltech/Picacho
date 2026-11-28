@@ -19,16 +19,18 @@ impl MailApp {
         let n = picked.len();
         let unread = picked.iter().filter(|m| m.unread).count();
         let all_starred = n > 0 && picked.iter().all(|m| m.starred);
-        // The senders, most frequent first.
-        let mut senders: Vec<(String, usize)> = Vec::new();
-        for m in &picked {
+        // The senders, most frequent first (counted in a map: a list
+        // searched for each message was slow with thousands selected).
+        let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
+        for (i, m) in picked.iter().enumerate() {
             let name = if m.sender.trim().is_empty() { &m.from } else { &m.sender };
-            match senders.iter_mut().find(|(s, _)| s == name) {
-                Some((_, count)) => *count += 1,
-                None => senders.push((name.clone(), 1)),
-            }
+            counts.entry(name.as_str()).or_insert((0, i)).0 += 1;
         }
-        senders.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        // Ties keep the order they were first seen in, as before.
+        let mut senders: Vec<(String, usize, usize)> =
+            counts.into_iter().map(|(name, (n, first))| (name.to_owned(), n, first)).collect();
+        senders.sort_by_key(|(_, count, first)| (std::cmp::Reverse(*count), *first));
+        let senders: Vec<(String, usize)> = senders.into_iter().map(|(s, n, _)| (s, n)).collect();
         let shown = senders.len().min(3);
         let mut who = senders[..shown]
             .iter()
@@ -36,7 +38,8 @@ impl MailApp {
             .collect::<Vec<_>>()
             .join(", ");
         if senders.len() > shown {
-            who += &format!(" and {} more", fmt_count(senders.len() - shown));
+            let more = senders.len() - shown;
+            who = t!("reader-names-and-more", names = who, count = more, shown = fmt_count(more));
         }
         let action = |id: &str, label: &str, icon: &str, change: Change| {
             self.button(id.to_owned(), label, icon, Action::ApplySelection(change), false, cx)
@@ -46,6 +49,8 @@ impl MailApp {
         };
         div()
             .id("reader-pane")
+            .role(Role::Main)
+            .aria_label(t!("reader-message"))
             .debug_selector(|| "reader-pane".into())
             .relative()
             .flex_1()
@@ -75,7 +80,7 @@ impl MailApp {
                     .debug_selector(|| "selection-summary".into())
                     .text_size(px(18.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("{} messages selected", fmt_count(n))),
+                    .child(t!("reader-messages-selected", shown = fmt_count(n), count = n)),
             )
             .child(
                 div()
@@ -84,9 +89,9 @@ impl MailApp {
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
                     .child(if unread > 0 {
-                        format!("{} unread · from {who}", fmt_count(unread))
+                        t!("reader-unread-from", shown = fmt_count(unread), who = who, count = unread)
                     } else {
-                        format!("From {who}")
+                        t!("reader-from", who = who)
                     }),
             )
             .child(
@@ -96,19 +101,19 @@ impl MailApp {
                     .flex_col()
                     .gap_1()
                     .child(if unread > 0 {
-                        action("summary-read", "Mark as read", "mail-open", Change::Read(true))
+                        action("summary-read", t!("reader-mark-as-read"), "mail-open", Change::Read(true))
                     } else {
-                        action("summary-unread", "Mark as unread", "mail", Change::Read(false))
+                        action("summary-unread", t!("reader-mark-as-unread"), "mail", Change::Read(false))
                     })
                     .child(if all_starred {
-                        action("summary-unstar", "Unstar", "star", Change::Star(false))
+                        action("summary-unstar", t!("reader-unstar"), "star", Change::Star(false))
                     } else {
-                        action("summary-star", "Star", "star", Change::Star(true))
+                        action("summary-star", t!("reader-star"), "star", Change::Star(true))
                     })
                     .when(self.folder != Folder::Archive, |d| {
                         d.child(action(
                             "summary-archive",
-                            "Archive",
+                            t!("reader-archive"),
                             "archive",
                             Change::Move(Folder::Archive),
                         ))
@@ -116,7 +121,7 @@ impl MailApp {
                     .when(self.folder != Folder::Inbox, |d| {
                         d.child(action(
                             "summary-inbox",
-                            "Move to Inbox",
+                            t!("reader-move-to-inbox"),
                             "inbox",
                             Change::Move(Folder::Inbox),
                         ))
@@ -124,7 +129,7 @@ impl MailApp {
                     .when(self.folder != Folder::Junk, |d| {
                         d.child(action(
                             "summary-spam",
-                            "Move to spam",
+                            t!("reader-move-to-spam"),
                             "spam",
                             Change::Move(Folder::Junk),
                         ))
@@ -132,7 +137,7 @@ impl MailApp {
                     .when(self.folder != Folder::Trash, |d| {
                         d.child(action(
                             "summary-trash",
-                            "Move to trash",
+                            t!("reader-move-to-trash"),
                             "trash",
                             Change::Move(Folder::Trash),
                         ))
@@ -143,7 +148,7 @@ impl MailApp {
                             d.child(
                                 self.button(
                                     "summary-folder",
-                                    "Move to folder…",
+                                    t!("reader-move-to-folder"),
                                     "folder",
                                     Action::MoveMenu(MoveTarget::Selection),
                                     false,
@@ -164,7 +169,7 @@ impl MailApp {
                     .child(
                         self.button(
                             "summary-done",
-                            "Clear selection",
+                            t!("reader-clear-selection"),
                             "",
                             Action::StopSelecting,
                             false,
@@ -221,9 +226,22 @@ impl MailApp {
         }
         let max = f32::from(self.reader_scroll.max_offset().y);
         let viewport = f32::from(self.reader_scroll.bounds().size.height);
-        if max <= 0. || self.html_view.read(cx).is_loading() {
+        if self.html_view.read(cx).is_loading() {
             // Laid out on a later frame.
             window.request_animation_frame();
+            return;
+        }
+        if max <= 0. {
+            // Its height can reach the scroll a frame or two after it's laid
+            // out. A message that never scrolls (it fits) gives up after a
+            // second: it asked for a frame on every frame, for as long as it
+            // stayed open.
+            self.reveal_waited += 1;
+            if self.reveal_waited > 60 {
+                self.reveal = None;
+            } else {
+                window.request_animation_frame();
+            }
             return;
         }
         self.reveal = None;
@@ -248,6 +266,8 @@ impl MailApp {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             return div()
                 .id("reader-pane")
+            .role(Role::Main)
+            .aria_label(t!("reader-message"))
                 .debug_selector(|| "reader-pane".into())
                 .relative()
                 .flex_1()
@@ -272,7 +292,7 @@ impl MailApp {
                     )
                 })
                 .child(icon_el("mail", 36., c.border))
-                .child("No message selected")
+                .child(t!("reader-no-message-selected"))
                 .into_any_element();
         };
         let width = super::window::content_size(window).width;
@@ -280,6 +300,8 @@ impl MailApp {
         let single = width < px(900.);
         let toolbar = div()
             .id("reader-toolbar")
+            .role(Role::Toolbar)
+            .aria_label(t!("reader-message-actions"))
             .debug_selector(|| "reader-toolbar".into())
             .h(px(57.))
             .flex_shrink_0()
@@ -296,7 +318,7 @@ impl MailApp {
             .when(single, |d| {
                 d.child(self.button(
                     "reader-back",
-                    "@Back to messages",
+                    t!("reader-back-to-messages"),
                     "arrow-left",
                     Action::BackToList,
                     false,
@@ -305,7 +327,7 @@ impl MailApp {
             })
             .child(self.button(
                 "reply",
-                if compact { "@Reply" } else { "Reply" },
+                &if compact { shortcuts::tip("@Reply", "reply", cx) } else { t!("reader-reply").into() },
                 "reply",
                 Action::Reply(false),
                 false,
@@ -313,7 +335,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "reply-all",
-                if compact { "@Reply all" } else { "Reply all" },
+                &if compact { shortcuts::tip(t!("reader-reply-all"), "reply-all", cx) } else { t!("reader-reply-all-2").into() },
                 "reply-all",
                 Action::Reply(true),
                 false,
@@ -321,7 +343,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "forward",
-                if compact { "@Forward" } else { "Forward" },
+                &if compact { shortcuts::tip("@Forward", "forward", cx) } else { t!("reader-forward").into() },
                 "forward",
                 Action::Forward,
                 false,
@@ -329,8 +351,16 @@ impl MailApp {
             ))
             .child(div().flex_1())
             .child(self.button(
+                "print",
+                &shortcuts::tip("@Print", "print", cx),
+                "print",
+                Action::Tools(super::tools::ToolAction::Print(m.id.clone())),
+                false,
+                cx,
+            ))
+            .child(self.button(
                 "open-window",
-                "@Open in new window · ⌘O",
+                &shortcuts::tip(t!("reader-open-in-new-window"), "open-in-window", cx),
                 "popout",
                 Action::OpenWindow(m.id.clone()),
                 false,
@@ -338,7 +368,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "archive",
-                "@Archive message",
+                &shortcuts::tip(t!("reader-archive-message"), "archive", cx),
                 "archive",
                 Action::Move(Folder::Archive),
                 false,
@@ -350,7 +380,7 @@ impl MailApp {
                 |d| {
                     d.child(self.button(
                         "snooze",
-                        "@Snooze until…",
+                        t!("reader-snooze-until"),
                         "snooze",
                         Action::SnoozeMenu(vec![m.id.clone()]),
                         false,
@@ -358,9 +388,31 @@ impl MailApp {
                     ))
                 },
             )
+            // Sent mail: be reminded if nobody replies.
+            .when(
+                m.folder == Folder::Sent && !m.message_id.trim().is_empty(),
+                |d| {
+                    d.child(self.button(
+                        "follow-up",
+                        t!("reader-remind-me-if-no-reply"),
+                        "waiting",
+                        Action::FollowUpMenu(m.id.clone()),
+                        false,
+                        cx,
+                    ))
+                },
+            )
+            .child(self.button(
+                "add-to-tasks",
+                t!("tasks-add-to-tasks-button"),
+                "tasks",
+                Action::Tasks(super::tasks::TaskAction::FromMail(m.id.clone(), None)),
+                false,
+                cx,
+            ))
             .child(self.button(
                 "read",
-                "@Mark read / unread",
+                &shortcuts::tip(t!("reader-mark-read-unread"), "toggle-read", cx),
                 "mail",
                 Action::Read(m.id.clone()),
                 false,
@@ -368,14 +420,46 @@ impl MailApp {
             ))
             .child(self.button(
                 "trash",
-                "@Move to trash",
+                &shortcuts::tip(t!("reader-move-to-trash-2"), "delete", cx),
                 "trash",
                 Action::Move(Folder::Trash),
                 false,
                 cx,
-            ));
+            ))
+            // The contact panel's button, at the edge it opens from.
+            .when(!self.mobile.on && !single, |d| {
+                d.child(div().w(px(1.)).h(px(20.)).mx_1().bg(rgb(c.border)))
+                    .child(self.contact_panel_toggle(cx))
+            });
+        let panel = self.shows_contact_panel(single);
+        if panel && self.contact_panel_stale(&m.id) {
+            // Only what tells who the other person is: never its text.
+            let m = Mail {
+                id: m.id.clone(),
+                account: m.account.clone(),
+                folder: m.folder,
+                from: m.from.clone(),
+                sender: m.sender.clone(),
+                to: m.to.clone(),
+                ..Mail::default()
+            };
+            let view = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |this, cx| this.ensure_contact_panel(&m, cx));
+            });
+        }
+        // The reader's width: the pane's, or the window's less the sidebar
+        // with the reader below the list.
+        let reader_width = if self.org.layout == crate::manage::organize::ReaderLayout::Below {
+            let window = self.window_width.get();
+            window - self.layout(window, compact).sidebar
+        } else {
+            self.reader_shown.get()
+        };
         div()
             .id("reader-pane")
+            .role(Role::Main)
+            .aria_label(t!("reader-message"))
             .debug_selector(|| "reader-pane".into())
             .flex_1()
             .min_w_0()
@@ -386,7 +470,24 @@ impl MailApp {
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(self.reader_body(m, window, cx))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.reader_body(m, window, cx)),
+                    )
+                    .when(panel, |d| d.child(self.contact_panel(m, reader_width, cx))),
+            )
             .into_any_element()
     }
 
@@ -453,11 +554,11 @@ impl MailApp {
                     .child(
                         self.button(
                             "reader-star",
-                            if m.starred {
-                                "@Unstar · ⌘⇧S"
-                            } else {
-                                "@Star · ⌘⇧S"
-                            },
+                            &shortcuts::tip(
+                                if m.starred { "@Unstar" } else { "@Star" },
+                                "toggle-star",
+                                cx,
+                            ),
                             "",
                             Action::Star(m.id.clone()),
                             false,
@@ -478,7 +579,7 @@ impl MailApp {
                     .gap_3()
                     .flex_wrap()
                     .mb_6()
-                    .child(avatar(&m.initials(), 40., 0, c))
+                    .child(sender_picture(&m.initials(), self.brand_marks.get(&m.id), 40., 0, c))
                     .child(
                         div()
                             .flex_1()
@@ -536,6 +637,7 @@ impl MailApp {
             )
             .when(self.details_open, |d| d.child(self.details_panel(m, cx)))
             .children(self.snooze_banner(m, cx))
+            .children(self.follow_up_banner(m, cx))
             .children(self.receipt_banner(m, cx))
             .children(self.unsubscribe_banner(m, cx));
         let locked = m.body.is_none() && self.locked.contains(&m.account);
@@ -549,7 +651,31 @@ impl MailApp {
                 d.child(self.rendering_controls(m, options, narrow, cx))
             })
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6())
-            .children((!locked).then(|| self.codes_banner(m, cx)).flatten());
+            .children((!locked).then(|| self.codes_banner(m, cx)).flatten())
+            .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) })
+            .children((!locked).then(|| self.invitation_card(m, cx)).flatten())
+            .children((!locked).then(|| self.delivery_report_card(m)).flatten())
+            .children((!locked).then(|| self.security_key_card(m, cx)).flatten())
+            .children((!locked).then(|| self.setup_message_card(m, cx)).flatten())
+            .children((!locked).then(|| self.carried_certificates_card(m, cx)).flatten());
+        if !locked && !self.invitations.contains_key(&m.id) {
+            let m = m.clone();
+            let view = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.check_invitation(&m, cx);
+                    this.check_delivery_report(&m, cx);
+                    this.complete_jmap_thread(&m, cx);
+                });
+            });
+        }
+        if self.find.open && !locked {
+            content = content.child(self.find_bar(cx));
+        }
+        // Find in Message shows a plain email as HTML, to mark what it finds.
+        let find_plain = (self.find_query(cx).is_some() && !(options.html && m.html.is_some()))
+            .then(|| m.body.clone())
+            .flatten();
         if locked {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));
@@ -558,19 +684,69 @@ impl MailApp {
             if options.html
                 && let Some(html) = &m.html
             {
-                let hidden = self.html_without_quotes(m, html);
-                has_quotes = hidden.is_some();
-                let shown = match &hidden {
-                    Some(hidden) if !self.quotes_open => hidden.as_str(),
-                    _ => html.as_str(),
+                // Prepared once for what it's shown with (quotes, alias,
+                // hidden codes, Find): every frame (a hover, a scroll, a
+                // spinner) otherwise copied and scanned the whole HTML again.
+                let query = self.find_query(cx);
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (
+                        &m.id,
+                        html.len(),
+                        self.quotes_open,
+                        mask.as_ref().map(|k| (&k.address, &k.alias)),
+                        self.hidden_codes(m).as_slice(),
+                        &query,
+                        self.find.current,
+                    )
+                        .hash(&mut h);
+                    h.finish()
                 };
-                let masked = mask.as_ref().map(|k| k.apply(shown));
-                let shown = masked.as_deref().unwrap_or(shown);
-                let shown = self.hide_codes_html(m, shown);
-                let shown = shown.as_ref();
+                let cached = self
+                    .prepared_html
+                    .borrow()
+                    .as_ref()
+                    .filter(|(k, ..)| *k == key)
+                    .map(|(_, shown, quotes, marked, count)| (shown.clone(), *quotes, *marked, *count));
+                let (shown, quotes, marked) = match cached {
+                    Some((shown, quotes, marked, count)) => {
+                        self.find.count.set(count);
+                        (shown, quotes, marked)
+                    }
+                    None => {
+                        let hidden = self.html_without_quotes(m, html);
+                        let quotes = hidden.is_some();
+                        let shown = match &hidden {
+                            Some(hidden) if !self.quotes_open => hidden.as_str(),
+                            _ => html.as_str(),
+                        };
+                        let masked = mask.as_ref().map(|k| k.apply(shown));
+                        let shown = masked.as_deref().unwrap_or(shown);
+                        let shown = self.hide_codes_html(m, shown);
+                        let found = self.find_marked(shown.as_ref(), false, cx);
+                        let marked = found.is_some();
+                        let shown = Rc::new(found.unwrap_or_else(|| shown.into_owned()));
+                        *self.prepared_html.borrow_mut() =
+                            Some((key, shown.clone(), quotes, marked, self.find.count.get()));
+                        (shown, quotes, marked)
+                    }
+                };
+                has_quotes = quotes;
                 self.html_view.update(cx, |view, cx| {
-                    view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
+                    view.set_content(&shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
+                if marked {
+                    self.reveal_find(cx);
+                }
+                content = content.child(self.html_view.clone());
+            } else if let Some(text) = find_plain {
+                has_quotes = false;
+                let marked = Rc::new(self.find_marked(&text, true, cx).unwrap_or_default());
+                self.html_view.update(cx, |view, cx| {
+                    view.set_content(&marked, &m.inline, options.block_remote, dark, self.clean_links, cx)
+                });
+                self.reveal_find(cx);
                 content = content.child(self.html_view.clone());
             } else {
                 self.html_view.update(cx, |view, cx| view.clear(cx));
@@ -626,7 +802,13 @@ impl MailApp {
             if has_quotes {
                 content = content.child(div().flex().child(self.quotes_toggle(cx)));
             }
+            let previews = self.attached_previews.clone();
             for (i, a) in m.attachments().iter().enumerate() {
+                // RFC 6532 §3.7: message/global is an attached message too.
+                let is_message = a.mime.eq_ignore_ascii_case("message/rfc822")
+                    || a.mime.eq_ignore_ascii_case("message/global")
+                    || a.name.to_ascii_lowercase().ends_with(".eml");
+                let preview = previews.get(&(m.id.clone(), i)).cloned();
                 content = content.child(
                     div()
                         .mt_3()
@@ -644,18 +826,44 @@ impl MailApp {
                                 .min_w_0()
                                 .text_size(px(12.))
                                 .truncate()
-                                .child(format!("{}  ·  {} KB", a.name, a.size / 1024)),
+                                .child(format!("{}  ·  {}", a.name, human_size(a.size as u64))),
                         )
+                        .when(is_message && preview.is_none(), |d| {
+                            d.child(self.button(
+                                format!("attachment-preview-{i}"),
+                                t!("reader-preview"),
+                                "preview",
+                                Action::PreviewAttachment(i),
+                                false,
+                                cx,
+                            ))
+                        })
+                        .children(self.attachment_buttons(i, a, cx))
                         .child(self.button(
                             format!("attachment-{i}"),
-                            "Save",
+                            t!("reader-save"),
                             "download",
                             Action::SaveAttachment(i),
                             false,
                             cx,
                         )),
                 );
+                content = content.children(self.image_preview(i));
+                if let Some(text) = preview {
+                    content = content.child(
+                        div()
+                            .id(SharedString::from(format!("attachment-preview-text-{i}")))
+                            .mt_1()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(c.raised))
+                            .text_size(px(12.))
+                            .whitespace_normal()
+                            .children(text.lines().map(|l| div().child(l.to_owned())).collect::<Vec<_>>()),
+                    );
+                }
             }
+            content = content.children(self.delivery_line(m, cx));
             let later = self.thread_cards(m, false, cx);
             if !later.is_empty() {
                 content = content.child(div().mt_8().children(later));
@@ -690,7 +898,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 "reply-bottom",
-                                "Reply",
+                                t!("reader-reply"),
                                 "reply",
                                 Action::Reply(false),
                                 false,
@@ -702,7 +910,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 "reply-all-bottom",
-                                "Reply all",
+                                t!("reader-reply-all-2"),
                                 "reply-all",
                                 Action::Reply(true),
                                 false,
@@ -714,7 +922,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 "forward-bottom",
-                                "Forward",
+                                t!("reader-forward"),
                                 "forward",
                                 Action::Forward,
                                 false,
@@ -724,6 +932,9 @@ impl MailApp {
                             .border_color(rgb(c.border)),
                         ),
                 );
+                if let Some(chips) = self.smart_reply_chips(m, cx) {
+                    content = content.child(chips);
+                }
             }
             content = content.child(self.source_links(cx));
         }
@@ -757,6 +968,105 @@ const OPEN_FADE: Duration = Duration::from_millis(220);
 impl MailApp {
     /// Locked messages use the same toolbar, scrolling region and pane sizing
     /// as readable mail. Keeping the shell shared prevents layout drift.
+    /// Reads a downloaded message once for a delivery report (RFC 3464,
+    /// RFC 6533), from its cached source: nothing is fetched for it.
+    fn check_delivery_report(&mut self, m: &Mail, cx: &mut Context<Self>) {
+        if self.delivery_reports.contains_key(&m.id) {
+            return;
+        }
+        // Until its source is downloaded there's nothing to read; it is
+        // looked at again once there is (asked of the index alone, cheaply).
+        if !self.backend.store.has_source(&m.id).unwrap_or(false) {
+            return;
+        }
+        if self.delivery_reports.len() >= super::READER_CACHE {
+            self.delivery_reports.clear();
+        }
+        // Read off the UI thread: its source is inflated (up to tens of
+        // megabytes) and parsed. Marked meanwhile, so it's read once.
+        self.delivery_reports.insert(m.id.clone(), None);
+        let (id, mail) = (m.id.clone(), m.clone());
+        self.task(
+            cx,
+            move |b| Ok(b.delivery_report(&mail)),
+            move |this, result: anyhow::Result<Option<Option<crate::sync::dsn::DeliveryReport>>>, cx| {
+                if let Ok(Some(Some(report))) = result {
+                    this.delivery_reports.insert(id, Some(report));
+                    cx.notify();
+                }
+            },
+        );
+    }
+    /// What a delivery report says of each recipient, above its text: who,
+    /// what happened, the status code, and the server's words, muted.
+    fn delivery_report_card(&self, m: &Mail) -> Option<AnyElement> {
+        use crate::sync::dsn::Action as Outcome;
+        let report = self.delivery_reports.get(&m.id)?.as_ref()?;
+        let c = self.colors();
+        let rows = report.recipients.iter().take(50).enumerate().map(|(i, r)| {
+            let outcome = match r.action {
+                Outcome::Failed => t!("reader-failed"),
+                Outcome::Delayed => t!("reader-delayed"),
+                Outcome::Delivered => t!("reader-delivered"),
+                Outcome::Relayed => t!("reader-relayed"),
+                Outcome::Expanded => t!("reader-expanded"),
+                Outcome::Other => t!("reader-unknown"),
+            };
+            let status = r
+                .status
+                .map(|(class, subject, detail)| format!(" {class}.{subject}.{detail}"))
+                .unwrap_or_default();
+            div()
+                .id(SharedString::from(format!("delivery-report-{i}")))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().font_weight(FontWeight::MEDIUM).child(r.recipient.clone()))
+                        .child(
+                            div()
+                                .text_color(rgb(if r.action == Outcome::Failed { c.danger } else { c.muted }))
+                                .child(format!("{outcome}{status}")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(r.summary()),
+                )
+                .when(!r.diagnostic.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(c.muted))
+                            .child(r.diagnostic.clone()),
+                    )
+                })
+        });
+        Some(
+            div()
+                .id("delivery-report")
+                .debug_selector(|| "delivery-report".into())
+                .role(Role::Region)
+                .aria_label(t!("reader-delivery-report"))
+                .m_3()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised))
+                .child(div().font_weight(FontWeight::MEDIUM).child(t!("reader-delivery-report")))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
     fn unlock_panel(&self, account: &str, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let unlocking = self.unlocking.contains(account);
@@ -773,12 +1083,12 @@ impl MailApp {
             .items_center()
             .gap_3()
             .child(div().size(px(52.)).flex_shrink_0().rounded(px(16.)).bg(rgb(c.soft)).flex().items_center().justify_center().child(icon_el("lock",22.,c.accent)))
-            .child(div().w_full().text_center().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("This message is encrypted"))
-            .child(div().w_full().text_size(px(12.)).text_color(rgb(c.muted)).text_center().child("Enter your Pinal password to read encrypted mail on this computer. After a password reset, use your previous password or your recovery key."))
-            .child(div().w_full().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("Password or recovery key"))
+            .child(div().w_full().text_center().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(t!("reader-this-message-is-encrypted")))
+            .child(div().w_full().text_size(px(12.)).text_color(rgb(c.muted)).text_center().child(t!("reader-enter-your-pinal-password-to-read")))
+            .child(div().w_full().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(t!("reader-password-or-recovery-key")))
             .child(div().id("unlock-field").debug_selector(|| "unlock-field".into()).w_full().min_w_0().child(field(Input::new(&self.unlock_input), c, unlocking).disabled(unlocking).w_full().h(px(39.)).text_size(px(13.))))
             .when_some(self.unlock_errors.get(account), |panel, error| panel.child(div().id("unlock-error").debug_selector(|| "unlock-error".into()).w_full().text_size(px(12.)).text_color(rgb(c.danger)).child(error.clone())))
-            .child(self.button("unlock-mail", if unlocking { "Unlocking…" } else { "Unlock" }, "lock", Action::UnlockMail, true, cx).w_full().flex_shrink_0().when(unlocking, |d| d.opacity(0.7)))
+            .child(self.button("unlock-mail", if unlocking { t!("reader-unlocking") } else { t!("reader-unlock") }, "lock", Action::UnlockMail, true, cx).w_full().flex_shrink_0().when(unlocking, |d| d.opacity(0.7)))
             .into_any_element()
     }
 }
@@ -860,7 +1170,7 @@ fn loading_body(c: Colors) -> AnyElement {
             div()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .child("Loading message…"),
+                .child(t!("reader-loading-message")),
         )
         .into_any_element()
 }
@@ -892,7 +1202,7 @@ impl MailApp {
                 c.muted,
             )))
             .tooltip(move |w, cx| {
-                Tooltip::new(if open { "Hide details" } else { "Show details" }).build(w, cx)
+                Tooltip::new(if open { t!("reader-hide-details") } else { t!("reader-show-details") }).build(w, cx)
             })
             .on_click(cx.listener(|this, _, w, cx| this.handle(Action::ToggleDetails, w, cx)))
             .into_any_element()
@@ -978,6 +1288,8 @@ impl MailApp {
         };
         let mut panel = div()
             .id("message-details")
+            .role(Role::Group)
+            .aria_label(t!("reader-message-details"))
             .debug_selector(|| "message-details".into())
             .mb_5()
             .p_4()
@@ -1056,7 +1368,7 @@ impl MailApp {
                         .gap_2()
                         .text_color(rgb(c.muted))
                         .child(spinner(13., c.muted))
-                        .child("Checking the sender…")
+                        .child(t!("reader-checking-the-sender"))
                         .into_any_element(),
                 )
                 .into_any_element(),
@@ -1098,6 +1410,69 @@ impl MailApp {
                     )
                     .into_any_element(),
                 );
+                if let Some(signature) = &d.signature {
+                    let (icon, color) = if d.signature_good {
+                        ("lock", 0x1e8e3e)
+                    } else {
+                        ("warning", c.danger)
+                    };
+                    panel_rows.push(
+                        row(
+                            "signature:",
+                            div()
+                                .id("openpgp-signature")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon_el(icon, 13., color))
+                                .child(div().text_color(rgb(c.text)).child(signature.clone()))
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                if !d.signers.is_empty() {
+                    panel_rows.push(row("signers:", self.signer_list(&d.signers)).into_any_element());
+                }
+                // RFC 5280 §6.3, RFC 6960: what Check sender found of the
+                // BIMI: what Check sender found of the sender's logo.
+                if let Some((line, good)) = &d.brand {
+                    let (icon, color) = if *good { ("check", 0x1e8e3e) } else { ("info", c.muted) };
+                    panel_rows.push(
+                        row(
+                            "brand:",
+                            div()
+                                .id("bimi-brand")
+                                .debug_selector(|| "bimi-brand".into())
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon_el(icon, 13., color))
+                                .child(div().text_color(rgb(c.text)).child(line.clone()))
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                // S/MIME signers' revocation.
+                if let Some((line, good)) = &d.revocation {
+                    let (icon, color) = if *good { ("lock", 0x1e8e3e) } else { ("warning", c.danger) };
+                    panel_rows.push(
+                        row(
+                            "revocation:",
+                            div()
+                                .id("smime-revocation")
+                                .debug_selector(|| "smime-revocation".into())
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon_el(icon, 13., color))
+                                .child(div().text_color(rgb(c.text)).child(line.clone()))
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                    );
+                }
                 let checks: Vec<(&str, &Option<String>)> =
                     vec![("SPF", &d.spf), ("DKIM", &d.dkim), ("DMARC", &d.dmarc)];
                 if !d.checked {
@@ -1112,7 +1487,7 @@ impl MailApp {
                                     .gap_2()
                                     .text_color(rgb(c.muted))
                                     .child(spinner(13., c.muted))
-                                    .child("Checking the sender…")
+                                    .child(t!("reader-checking-the-sender"))
                                     .into_any_element()
                             } else {
                                 div()
@@ -1123,7 +1498,7 @@ impl MailApp {
                                     .child(
                                         self.button(
                                             "check-sender",
-                                            "Check sender",
+                                            t!("reader-check-sender"),
                                             "",
                                             Action::CheckSender,
                                             false,
@@ -1142,7 +1517,7 @@ impl MailApp {
                                             .w_full()
                                             .min_w_0()
                                             .text_color(rgb(c.muted))
-                                            .child("Looks up SPF, DKIM and DMARC; the sender's DNS can see when."),
+                                            .child(t!("reader-looks-up-spf-dkim-and-dmarc")),
                                     )
                                     .into_any_element()
                             },
@@ -1151,7 +1526,7 @@ impl MailApp {
                     );
                 } else if !checks.iter().any(|(_, v)| v.is_some()) {
                     panel_rows.push(
-                        row("verified:", text("Couldn't check the sender (no DNS answer)".into()))
+                        row("verified:", text(t!("reader-couldnt-check-the-sender-no-dns").into()))
                             .into_any_element(),
                     );
                 }
@@ -1189,7 +1564,7 @@ impl MailApp {
                     .child(
                         self.button(
                             "show-original",
-                            "Show original",
+                            t!("reader-show-raw"),
                             "code",
                             Action::ShowOriginal,
                             false,
@@ -1298,7 +1673,7 @@ impl MailApp {
                     .child(segment(
                         "email-light",
                         "",
-                        "Light email",
+                        t!("reader-light-email"),
                         "sun",
                         !dark,
                         Action::ToggleEmailTheme,
@@ -1306,7 +1681,7 @@ impl MailApp {
                     .child(segment(
                         "email-dark",
                         "",
-                        "Dark email",
+                        t!("reader-dark-email"),
                         "moon",
                         dark,
                         Action::ToggleEmailTheme,
@@ -1318,16 +1693,16 @@ impl MailApp {
                 group("toggle-email-html")
                     .child(segment(
                         "show-formatted",
-                        "Formatted",
-                        "Show the sender's formatting",
+                        t!("reader-formatted"),
+                        t!("reader-show-the-senders-formatting"),
                         "formatted",
                         showing_html,
                         Action::ShowHtml(true),
                     ))
                     .child(segment(
                         "show-plain",
-                        "Plain text",
-                        "Show the plain text version",
+                        t!("reader-plain-text"),
+                        t!("reader-show-the-plain-text-version"),
                         "text",
                         !showing_html,
                         Action::ShowHtml(false),
@@ -1357,9 +1732,9 @@ impl MailApp {
                     .hover(move |s| s.bg(rgb(c.raised)))
                     .tooltip(move |w, cx| {
                         Tooltip::new(if allowed {
-                            "Remote images and styles load from the sender's servers"
+                            t!("reader-remote-images-and-styles-load-from")
                         } else {
-                            "Remote images are blocked so senders can't tell you opened this"
+                            t!("reader-remote-images-are-blocked-so-senders")
                         })
                         .build(w, cx)
                     })
@@ -1368,7 +1743,7 @@ impl MailApp {
                         14.,
                         if allowed { c.accent } else { c.muted },
                     ))
-                    .when(!narrow, |d| d.child("Remote images"))
+                    .when(!narrow, |d| d.child(t!("reader-remote-images")))
                     .child(switch(
                         allowed,
                         self.switch_anim,
@@ -1403,9 +1778,9 @@ impl MailApp {
                 row = row.child("·");
             }
             let label = match view {
-                SourceView::Headers => "View headers",
-                SourceView::Html => "View HTML",
-                SourceView::Original => "View original",
+                SourceView::Headers => t!("reader-view-headers"),
+                SourceView::Html => t!("reader-view-html"),
+                SourceView::Original => t!("reader-view-raw"),
             };
             row = row.child(self.link(
                 &format!("view-source-{}", view.label().to_lowercase()),
@@ -1457,12 +1832,12 @@ impl MailApp {
                 let checked = d.checked;
                 let verdict = |v: &Option<String>, domain: Option<&String>| match (v, domain) {
                     (Some(v), _) if v == crate::sync::auth::UNVERIFIABLE => {
-                        "Couldn't verify (the signing key may have changed since)".into()
+                        t!("reader-couldnt-verify-the-signing-key-may").into()
                     }
-                    (Some(v), Some(d)) => format!("{} with domain {d}", v.to_uppercase()),
+                    (Some(v), Some(d)) => t!("reader-with-domain", to_uppercase = v.to_uppercase(), d = d),
                     (Some(v), None) => v.to_uppercase(),
-                    (None, _) if !checked => "Not checked (use Check sender in the message's details)".into(),
-                    (None, _) => "Not recorded".into(),
+                    (None, _) if !checked => t!("reader-not-checked-use-check-sender-in").into(),
+                    (None, _) => t!("reader-not-recorded").into(),
                 };
                 let view = self.source_view;
                 let shown = original.view(view);
@@ -1527,15 +1902,26 @@ impl MailApp {
                             .text_size(px(if self.mobile.on { 14. } else { 12. }))
                             .border_b_1()
                             .border_color(rgb(c.border))
-                            .child(fact("Message ID", d.message_id.clone()))
-                            .child(fact("Created at", d.date.clone()))
-                            .child(fact("From", d.from.clone()))
-                            .child(fact("To", d.to.clone()))
-                            .child(fact("Subject", d.subject.clone()))
+                            .child(fact(t!("reader-message-id"), d.message_id.clone()))
+                            .child(fact(t!("reader-created-at"), d.date.clone()))
+                            .child(fact(t!("reader-from-2"), d.from.clone()))
+                            .when(!d.sender.is_empty(), |e| e.child(fact(t!("reader-sent-by"), d.sender.clone())))
+                            .child(fact(t!("reader-to"), d.to.clone()))
+                            .child(fact(t!("reader-subject"), d.subject.clone()))
                             .child(fact("SPF", verdict(&d.spf, d.mailed_by.as_ref())))
                             .child(fact("DKIM", verdict(&d.dkim, d.signed_by.first())))
-                            .child(fact("DMARC", verdict(&d.dmarc, None)))
-                            .child(fact("Security", d.security.label().into()))
+                            .child(fact(
+                                "DMARC",
+                                match &d.dmarc_policy {
+                                    Some(p) if p != "none" => t!("reader-domain-asks-to-failures", verdict = verdict(&d.dmarc, None), p = p),
+                                    _ => verdict(&d.dmarc, None),
+                                },
+                            ))
+                            .when_some(d.arc.clone(), |e, arc| e.child(fact("ARC", arc)))
+                            .when(d.partly_signed, |e| {
+                                e.child(fact(t!("reader-note"), t!("reader-only-the-start-of-the-message").into()))
+                            })
+                            .child(fact(t!("reader-security"), d.security.label().into()))
                             .child(
                                 div()
                                     .mt_2()
@@ -1545,7 +1931,7 @@ impl MailApp {
                                     .child(
                                         self.button(
                                             "copy-original",
-                                            "Copy to clipboard",
+                                            t!("reader-copy-to-clipboard"),
                                             "copy",
                                             Action::CopyOriginal,
                                             false,
@@ -1558,7 +1944,7 @@ impl MailApp {
                                     .child(
                                         self.button(
                                             "save-original",
-                                            "Download original",
+                                            t!("reader-download-raw"),
                                             "download",
                                             Action::SaveOriginal,
                                             false,
@@ -1577,7 +1963,7 @@ impl MailApp {
                                 .p_5()
                                 .text_size(px(12.))
                                 .text_color(rgb(c.muted))
-                                .child("This message has no HTML part; it is plain text."),
+                                .child(t!("reader-this-message-has-no-html-part")),
                         )
                     })
                     .when(shown.is_some(), |d| d.child(
@@ -1638,6 +2024,72 @@ impl MailApp {
     }
 }
 
+impl MailApp {
+    /// The replies the reply model suggests (Settings → Local AI) as chips
+    /// under a message, each starting a reply with it written in. None for
+    /// mail one doesn't answer (drafts, one's own sent mail) or when there
+    /// is nothing to suggest.
+    pub(super) fn smart_reply_chips(&self, m: &Mail, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        let c = self.colors();
+        if matches!(m.folder, Folder::Drafts | Folder::Sent) {
+            return None;
+        }
+        let smart = self.smart_replies_for(m, cx);
+        if smart.replies.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id("smart-replies")
+                .role(Role::Group)
+                .aria_label(t!("reader-suggested-replies"))
+                .debug_selector(|| "smart-replies".into())
+                .mt_3()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .children(smart.replies.iter().enumerate().map(|(i, s)| {
+                    let intent = s.intent.to_owned();
+                    let menu = intent.clone();
+                    let selector = format!("smart-reply-{i}");
+                    div()
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector)
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .px(px(12.))
+                        .py(px(5.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(c.soft))
+                        .bg(rgb(c.soft))
+                        .text_size(px(12.5))
+                        .cursor_pointer()
+                        .hover(move |d| d.bg(rgb(c.surface)))
+                        .child(icon_el("sparkle", 12., c.accent))
+                        .child(s.text.to_owned())
+                        .tooltip(|w, cx| {
+                            Tooltip::new(
+                                t!("reader-suggested-by-local-ai-right-click"),
+                            )
+                            .build(w, cx)
+                        })
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.handle(Action::SmartReply(intent.clone()), w, cx)
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                cx.stop_propagation();
+                                this.handle(Action::SmartReplyMenu(menu.clone()), w, cx)
+                            }),
+                        )
+                })),
+        )
+    }
+}
+
 /// A pass/fail chip for an authentication result.
 fn verdict_chip(name: &str, verdict: &str, c: Colors) -> AnyElement {
     let (fg, bg) = match verdict {
@@ -1654,7 +2106,7 @@ fn verdict_chip(name: &str, verdict: &str, c: Colors) -> AnyElement {
         .text_color(rgb(fg))
         .bg(rgba((bg << 8) | 0x1f))
         .child(if verdict == crate::sync::auth::UNVERIFIABLE {
-            format!("{name} couldn't verify (key may have changed)")
+            t!("reader-couldnt-verify-key-may-have-changed", name = name)
         } else {
             format!("{name} {verdict}")
         })
@@ -1745,7 +2197,7 @@ impl MailApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.muted))
                     .child(icon_el("thread", 13., c.muted))
-                    .child(format!("CONVERSATION · {} MESSAGES", rows.len()))
+                    .child(t!("reader-conversation-messages", count = rows.len()))
                     .into_any_element(),
             );
         }
@@ -1802,7 +2254,7 @@ impl MailApp {
                                                 .truncate()
                                                 .text_size(px(11.))
                                                 .text_color(rgb(c.muted))
-                                                .child(format!("to {}", to.join(", "))),
+                                                .child(t!("reader-to-2", to = to.join(", "))),
                                         )
                                     }),
                             )
@@ -1846,7 +2298,7 @@ impl MailApp {
                     .text_color(rgb(c.muted))
                     .cursor_pointer()
                     .hover(move |s| s.bg(rgb(c.raised)).text_color(rgb(c.text)))
-                    .child(format!("{hidden} more messages"))
+                    .child(t!("reader-more-messages", hidden = hidden))
                     .on_click(
                         cx.listener(|this, _, w, cx| this.handle(Action::ExpandThread, w, cx)),
                     )
@@ -1881,15 +2333,12 @@ impl MailApp {
         };
         let to = super::thread::short_names(&self.unreversed(m, &m.to), &own);
         let cc = super::thread::short_names(&self.unreversed(m, m.cc()), &own);
-        let mut line = if to.is_empty() {
-            "to undisclosed recipients".to_string()
-        } else {
-            format!("to {}", brief(to, 3))
-        };
-        if !cc.is_empty() {
-            line.push_str(&format!(" · cc {}", brief(cc, 2)));
+        match (to.is_empty(), cc.is_empty()) {
+            (true, true) => t!("reader-to-undisclosed-recipients").to_string(),
+            (true, false) => t!("reader-cc-only", cc = brief(cc, 2)),
+            (false, true) => t!("reader-to-2", to = brief(to, 3)),
+            (false, false) => t!("reader-to-cc", to = brief(to, 3), cc = brief(cc, 2)),
         }
-        line
     }
 
     /// The open HTML email with its quoted history hidden, if it has one.
@@ -1929,7 +2378,7 @@ impl MailApp {
         let body = m
             .body
             .clone()
-            .unwrap_or_else(|| "This message has no text body.".into());
+            .unwrap_or_else(|| t!("reader-this-message-has-no-text-body").into());
         let (written, quoted) = super::thread::split_quoted(&body);
         let shown = if self.quotes_open {
             body.as_str()
@@ -1978,9 +2427,9 @@ impl MailApp {
             .hover(move |s| s.text_color(rgb(c.text)))
             .child(div().font_weight(FontWeight::BOLD).child("•••"))
             .child(if open {
-                "Hide quoted text"
+                t!("reader-hide-quoted-text")
             } else {
-                "Show quoted text"
+                t!("reader-show-quoted-text")
             })
             .on_click(cx.listener(|this, _, w, cx| this.handle(Action::ToggleQuotes, w, cx)))
             .into_any_element()
@@ -2028,7 +2477,7 @@ impl MailApp {
                     .cursor_pointer()
                     .child(icon_el("tag", 11., c.accent))
                     .child(shown.clone())
-                    .tooltip(move |w, cx| Tooltip::new(format!("Show mail labeled “{shown}”")).build(w, cx))
+                    .tooltip(move |w, cx| Tooltip::new(t!("reader-show-mail-labeled", shown = shown)).build(w, cx))
                     .on_click(cx.listener(move |this, _, w, cx| this.handle(search.clone(), w, cx)))
                     .child(
                         div()

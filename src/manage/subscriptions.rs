@@ -8,7 +8,7 @@
 //! sent from the person's account, a page to open) is shown to them first.
 use crate::manage::model::{Draft, Folder, Mail};
 use crate::sync::auth::SignedUnsubscribe;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -67,21 +67,34 @@ pub fn key(account: &str, address: &str) -> String {
 /// Groups messages into subscriptions, most messages first. Copies of a
 /// message in several folders (or Gmail labels) count once.
 pub fn group(mails: impl IntoIterator<Item = Mail>) -> Vec<Subscription> {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut by: HashMap<String, Subscription> = HashMap::new();
+    let mut grouping = Grouping::default();
     for m in mails {
-        let Some(sub) = Subscription::of(&m) else {
-            continue;
+        grouping.add(&m);
+    }
+    grouping.finish()
+}
+
+/// `group`, a message at a time: a mailbox's messages needn't all be held
+/// at once to count its subscriptions (see `Store::subscriptions`).
+#[derive(Default)]
+pub struct Grouping {
+    seen: HashSet<(String, String)>,
+    by: HashMap<String, Subscription>,
+}
+impl Grouping {
+    pub fn add(&mut self, m: &Mail) {
+        let Some(sub) = Subscription::of(m) else {
+            return;
         };
         let identity = if m.message_id.is_empty() {
             m.id.clone()
         } else {
             m.message_id.clone()
         };
-        if !seen.insert((m.account.clone(), identity)) {
-            continue;
+        if !self.seen.insert((m.account.clone(), identity)) {
+            return;
         }
-        match by.get_mut(&sub.key()) {
+        match self.by.get_mut(&sub.key()) {
             Some(existing) => {
                 existing.count += 1;
                 existing.unread += sub.unread;
@@ -93,18 +106,20 @@ pub fn group(mails: impl IntoIterator<Item = Mail>) -> Vec<Subscription> {
                 }
             }
             None => {
-                by.insert(sub.key(), sub);
+                self.by.insert(sub.key(), sub);
             }
         }
     }
-    let mut list: Vec<Subscription> = by.into_values().collect();
-    list.sort_by(|a, b| {
-        b.count
-            .cmp(&a.count)
-            .then_with(|| b.latest.cmp(&a.latest))
-            .then_with(|| a.address.cmp(&b.address))
-    });
-    list
+    pub fn finish(self) -> Vec<Subscription> {
+        let mut list: Vec<Subscription> = self.by.into_values().collect();
+        list.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| b.latest.cmp(&a.latest))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        list
+    }
 }
 
 /// What makes copies of one message (in several folders, or Gmail labels)
@@ -156,7 +171,28 @@ pub enum Method {
 /// The addresses in a List-Unsubscribe header, in its order.
 pub fn targets(header: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut rest = header;
+    // Comments (RFC 2369 §2 allows them: `(Use this) <mailto:…>`) out
+    // first, so an angle bracket inside one isn't read as an address.
+    let mut plain = String::with_capacity(header.len());
+    let mut depth = 0usize;
+    let mut in_angle = false;
+    for c in header.chars() {
+        match c {
+            '<' if depth == 0 => {
+                in_angle = true;
+                plain.push(c);
+            }
+            '>' if depth == 0 => {
+                in_angle = false;
+                plain.push(c);
+            }
+            '(' if !in_angle => depth += 1,
+            ')' if !in_angle && depth > 0 => depth -= 1,
+            _ if depth == 0 => plain.push(c),
+            _ => {}
+        }
+    }
+    let mut rest = plain.as_str();
     while let Some(start) = rest.find('<') {
         let Some(end) = rest[start..].find('>') else {
             break;
@@ -260,6 +296,10 @@ impl Plan {
     }
 }
 
+/// Percent-decoding (`%XX`), for `mailto:` and `mid:` links.
+pub(crate) fn percent_decoded(s: &str) -> String {
+    decode(s)
+}
 /// Percent-decoding for mailto: parts.
 fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -291,20 +331,6 @@ pub enum Outcome {
     Open(String),
 }
 
-/// The redirects a one-click request follows: a few, and only to HTTPS,
-/// so the request is never sent on in the clear.
-fn https_redirects() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 5 {
-            attempt.error("too many redirects")
-        } else if attempt.url().scheme() != "https" {
-            attempt.error("redirected to an address that isn't HTTPS")
-        } else {
-            attempt.follow()
-        }
-    })
-}
-
 /// Carries out `plan` for `account`. Mail goes out through `send`.
 pub fn unsubscribe(
     plan: &Plan,
@@ -314,20 +340,58 @@ pub fn unsubscribe(
     match &plan.method {
         Method::OneClick(url) => {
             if !plan.verified {
-                bail!("The sender's request to unsubscribe couldn't be verified.");
+                bail!(t!("manage-subscriptions-the-senders-request-to-unsubscribe-couldnt"));
             }
-            let response = reqwest::blocking::Client::builder()
+            // The sender chose the address: it, and wherever it redirects,
+            // must be on the internet, not this computer or its network,
+            // whether it's reached directly or through a proxy.
+            let target = url::Url::parse(url).with_context(|| t!("manage-subscriptions-the-senders-unsubscribe-address-isnt-valid"))?;
+            if crate::sync::public_net::reaches_inside(&target) {
+                bail!(t!("manage-subscriptions-the-senders-unsubscribe-address-is-on"));
+            }
+            // Redirects by hand: a client follows 301, 302 and 303 as a GET,
+            // and a one-click request must stay a POST (RFC 8058 §3.2).
+            let client = reqwest::blocking::Client::builder()
+                .min_tls_version(reqwest::tls::Version::TLS_1_2)
                 .timeout(std::time::Duration::from_secs(30))
-                .redirect(https_redirects())
-                .build()?
-                .post(url)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body("List-Unsubscribe=One-Click")
-                .send()?;
-            if !response.status().is_success() {
-                bail!("The sender refused the request ({}).", response.status());
+                .dns_resolver(std::sync::Arc::new(crate::sync::public_net::PublicOnly))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let mut at = target;
+            for _ in 0..5 {
+                let response = client
+                    .post(at.clone())
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body("List-Unsubscribe=One-Click")
+                    .send()?;
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(Outcome::Done);
+                }
+                // 301–303: the POST was taken, and a page to see after is
+                // offered; nothing more to send.
+                if matches!(status.as_u16(), 301..=303) {
+                    return Ok(Outcome::Done);
+                }
+                if matches!(status.as_u16(), 307 | 308) {
+                    let next = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|l| l.to_str().ok())
+                        .and_then(|l| at.join(l).ok())
+                        .with_context(|| t!("manage-subscriptions-the-senders-redirect-had-no-address"))?;
+                    if next.scheme() != "https" {
+                        bail!(t!("manage-subscriptions-the-sender-redirected-the-request-to"));
+                    }
+                    if crate::sync::public_net::reaches_inside(&next) {
+                        bail!(t!("manage-subscriptions-the-sender-redirected-the-request-to-2"));
+                    }
+                    at = next;
+                    continue;
+                }
+                bail!(t!("manage-subscriptions-the-sender-refused-the-request", status = status));
             }
-            Ok(Outcome::Done)
+            bail!(t!("manage-subscriptions-the-sender-redirected-the-request-too"))
         }
         Method::Mail { to, subject } => {
             let draft = Draft {

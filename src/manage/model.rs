@@ -11,6 +11,9 @@ pub enum Provider {
     /// JMAP (RFC 8620/8621) over HTTPS, for reading and sending alike
     /// (`sync/jmap.rs`).
     Jmap,
+    /// Exchange Web Services: Exchange Server in an organization's own
+    /// data center, for mail, calendars and contacts (`sync/ews.rs`).
+    Ews,
 }
 impl Provider {
     pub fn label(self) -> &'static str {
@@ -21,16 +24,17 @@ impl Provider {
             Self::Pop3 => "POP3",
             Self::Proton => "Proton API",
             Self::Jmap => "JMAP",
+            Self::Ews => "Exchange",
         }
     }
     /// Whether its mail comes over IMAP (anything but POP3, Proton's API
     /// and JMAP).
     pub fn imap(self) -> bool {
-        !matches!(self, Self::Pop3 | Self::Proton | Self::Jmap)
+        !matches!(self, Self::Pop3 | Self::Proton | Self::Jmap | Self::Ews)
     }
     /// Whether it sends through its own API rather than SMTP.
     pub fn api_sending(self) -> bool {
-        matches!(self, Self::Proton | Self::Jmap)
+        matches!(self, Self::Proton | Self::Jmap | Self::Ews)
     }
 }
 /// The mail services offered when adding an account. `Provider` is the
@@ -48,6 +52,8 @@ pub enum Service {
     ProtonBridge,
     /// Proton Mail directly through Proton's API, without Bridge.
     Proton,
+    /// An organization's own Exchange Server, through Exchange Web Services.
+    Exchange,
     /// Any other server, found by autoconfiguration or entered by hand.
     #[default]
     Other,
@@ -83,6 +89,7 @@ impl Service {
         Self::Zoho,
         // Its Bridge sign-in is a tab of its own.
         Self::Proton,
+        Self::Exchange,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -94,7 +101,8 @@ impl Service {
             Self::Zoho => "Zoho Mail",
             Self::ProtonBridge => "Proton Mail Bridge",
             Self::Proton => "Proton Mail",
-            Self::Other => "Other",
+            Self::Exchange => "Exchange Server",
+            Self::Other => t!("manage-model-other"),
         }
     }
     pub fn provider(self) -> Provider {
@@ -104,6 +112,7 @@ impl Service {
             Self::Proton => Provider::Proton,
             // Fastmail made JMAP, and offers it to mail apps.
             Self::Fastmail => Provider::Jmap,
+            Self::Exchange => Provider::Ews,
             _ => Provider::Imap,
         }
     }
@@ -118,14 +127,34 @@ impl Service {
             _ => SignIn::Password,
         }
     }
+    /// What can be typed instead of signing in with the browser, named as
+    /// the service names it: Fastmail's API token (JMAP Bearer), Google's
+    /// app password (IMAP and SMTP). `None` where the browser is the only
+    /// way in: Pinal, and Microsoft, which is retiring app passwords for
+    /// most accounts and whose work accounts usually refuse them.
+    pub fn token_instead(self) -> Option<&'static str> {
+        self.token_offer(self.sign_in() == SignIn::Browser)
+    }
+    /// `token_instead`, given whether this build signs in to the service
+    /// with the browser.
+    fn token_offer(self, browser: bool) -> Option<&'static str> {
+        if !browser {
+            return None;
+        }
+        match self {
+            Self::Fastmail => Some(t!("manage-model-api-token")),
+            Self::Gmail => Some(t!("manage-model-app-password")),
+            _ => None,
+        }
+    }
     pub fn password_label(self) -> &'static str {
         match self {
-            Self::Gmail | Self::Outlook | Self::Zoho => "App password",
-            Self::Fastmail => "API token",
-            Self::ICloud => "App-specific password",
-            Self::ProtonBridge => "Bridge password",
-            Self::Proton => "Proton password",
-            _ => "Password",
+            Self::Gmail | Self::Outlook | Self::Zoho => t!("manage-model-app-password-2"),
+            Self::Fastmail => t!("manage-model-api-token"),
+            Self::ICloud => t!("manage-model-app-specific-password"),
+            Self::ProtonBridge => t!("manage-model-bridge-password"),
+            Self::Proton => t!("manage-model-proton-password"),
+            _ => t!("manage-model-password"),
         }
     }
     /// Why this build can't offer browser sign-in for a service that
@@ -137,10 +166,10 @@ impl Service {
         }
         match self {
             Self::Gmail => Some(
-                "This copy of Picacho was built without Google sign-in, so an app password is the only way to connect Gmail.",
+                t!("manage-model-this-copy-of-picacho-was-built"),
             ),
             Self::Outlook => Some(
-                "This copy of Picacho was built without Microsoft sign-in, so an app password is the only way to connect Outlook.",
+                t!("manage-model-this-copy-of-picacho-was-built-2"),
             ),
             _ => None,
         }
@@ -149,33 +178,34 @@ impl Service {
     pub fn password_help(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::Gmail => Some((
-                "Turn on 2-Step Verification in your Google Account, then make an app password and paste it here. Spaces are ignored.",
+                t!("manage-model-turn-on-2-step-verification-in"),
                 "https://myaccount.google.com/apppasswords",
             )),
             Self::ICloud => Some((
-                "iCloud needs an app-specific password, made in your Apple Account.",
+                t!("manage-model-icloud-needs-an-app-specific-password"),
                 "https://account.apple.com/account/manage",
             )),
             Self::Fastmail => Some((
-                "Picacho talks to Fastmail over JMAP. Make an API token with access to mail (and to sending and filters, to use them here), then paste it here.",
+                t!("manage-model-picacho-talks-to-fastmail-over-jmap"),
                 "https://app.fastmail.com/settings/security/tokens",
             )),
             Self::Zoho => Some((
-                "Turn on IMAP in Zoho Mail settings, then make an app password.",
+                t!("manage-model-turn-on-imap-in-zoho-mail"),
                 "https://accounts.zoho.com/home#security/app_password",
             )),
             Self::ProtonBridge => Some((
-                "Open Proton Mail Bridge, choose your account and copy its mailbox password. Bridge must be running, with its certificate trusted.",
+                t!("manage-model-open-proton-mail-bridge-choose-your"),
                 "https://proton.me/support/apple-mail-certificate",
             )),
             Self::Proton => Some((
-                "Picacho signs in to Proton directly; Proton Mail Bridge isn't needed. Mail is decrypted on this computer with your keys, which never leave it.",
+                t!("manage-model-picacho-signs-in-to-proton-directly"),
                 "https://account.proton.me/",
             )),
             Self::Outlook => Some((
-                "Turn on two-step verification in your Microsoft account, then make an app password and paste it here. Work and school accounts can use one only if their admin allows it.",
+                t!("manage-model-turn-on-two-step-verification-in"),
                 "https://account.live.com/proofs/AppPassword",
             )),
+            Self::Exchange => None,
             _ => None,
         }
     }
@@ -212,6 +242,16 @@ impl Service {
             }
             // No mail servers: everything goes through Proton's API.
             Self::Proton => ("mail-api.proton.me", 443, "mail-api.proton.me", 443),
+            // Found by Autodiscover when it signs in; `mail.` the domain
+            // until then.
+            Self::Exchange => {
+                let domain = crate::sync::discover::domain(email).unwrap_or_default();
+                a.incoming_host = format!("mail.{domain}");
+                a.smtp_host = a.incoming_host.clone();
+                a.incoming_port = 443;
+                a.smtp_port = 443;
+                return Some(a);
+            }
             Self::Other => return None,
         };
         a.incoming_host = host.into();
@@ -246,6 +286,20 @@ pub struct SyncSettings {
     /// unless turned on.
     #[serde(default)]
     pub proton_push: bool,
+    /// IMAP: only the folders subscribed to on the server are shown (as
+    /// other mail apps show them), unless none of them is.
+    #[serde(default)]
+    pub subscribed_only: bool,
+    /// POP3: delete a message from the server this many days after it was
+    /// downloaded here (0: at the next check after downloading). None keeps
+    /// everything on the server, the default. Only messages whose whole
+    /// source is saved on this computer are ever deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pop_delete_after_days: Option<u32>,
+    /// POP3: deleting a message for good here also deletes it from the
+    /// server. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pop_delete_with_local: bool,
 }
 /// `SyncSettings::offline_days`: download message contents only when opened.
 pub const OFFLINE_WHEN_OPENED: u32 = u32::MAX;
@@ -275,6 +329,9 @@ impl Default for SyncSettings {
             offline_days: default_offline_days(),
             proton_events_seconds: default_proton_events_seconds(),
             proton_push: false,
+            subscribed_only: false,
+            pop_delete_after_days: None,
+            pop_delete_with_local: false,
         }
     }
 }
@@ -296,10 +353,17 @@ pub struct Account {
     pub client_secret: String,
     #[serde(default)]
     pub service: Service,
-    /// Upgrade a plain IMAP connection with STARTTLS instead of connecting
-    /// with TLS. Only Proton Mail Bridge, on this computer, needs it.
+    /// Upgrade a plain incoming connection with STARTTLS (IMAP, RFC 3501
+    /// §6.2.1) or STLS (POP3, RFC 2595) instead of connecting with TLS:
+    /// servers that only offer port 143 or 110, and Proton Mail Bridge on
+    /// this computer. The upgrade is required; nothing is sent in the clear.
     #[serde(default)]
     pub incoming_starttls: bool,
+    /// How the outgoing server is secured: TLS from the first byte (true)
+    /// or a plain connection upgraded with STARTTLS (false). Unset: TLS on
+    /// port 465, STARTTLS elsewhere (`smtp_implicit_tls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp_tls: Option<bool>,
     #[serde(default)]
     pub sync: SyncSettings,
     /// The name the servers know this sign-in by, when it isn't the email
@@ -318,15 +382,89 @@ pub struct Account {
     /// where the sending server supports it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delivery_receipts: bool,
+    /// With `delivery_receipts`: what reports are asked for and how much
+    /// of the message a failure report returns (RFC 3461 NOTIFY and RET).
+    #[serde(default, skip_serializing_if = "DsnOptions::is_default")]
+    pub dsn: DsnOptions,
     /// Only send where every server on the way must use TLS (REQUIRETLS,
     /// RFC 8689): the outgoing server has to offer it, and mail that can't
     /// go encrypted the whole way bounces rather than going in the clear.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_tls: bool,
+    /// Give up on delivering a message after this many hours rather than
+    /// the servers' usual days (SMTP DELIVERBY, RFC 2852, with return); 0:
+    /// as long as the servers try. Only where the outgoing server has it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub deliver_within_hours: u32,
+    /// With `deliver_within_hours`: a message not delivered in time is
+    /// delivered anyway and you're told (DELIVERBY's N mode, RFC 2852 §4),
+    /// rather than coming back to you (R mode).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deliver_late_notify: bool,
+    /// With `deliver_within_hours`: each server on the way reports
+    /// relaying it (DELIVERBY's trace, RFC 2852 §4, `T`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deliver_by_trace: bool,
     /// Other addresses this mailbox sends as, each optionally through its
     /// own outgoing server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identities: Vec<Identity>,
+    /// JMAP: the mail account this one reads, when it isn't the sign-in's
+    /// own (one shared with it); its id at the server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jmap_account: String,
+    /// Signs in with another account's credentials (by its id): a JMAP
+    /// account shared with that one's sign-in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credentials_of: String,
+    /// Scheduled messages are handed to the server, which sends them at
+    /// their time even with Picacho closed (SMTP FUTURERELEASE, JMAP
+    /// HOLDUNTIL), where it can.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_send_later: bool,
+    /// Signs in to the incoming, outgoing and filter servers with Kerberos
+    /// (SASL GSSAPI, RFC 4752) using the ticket this computer already has,
+    /// instead of a password. For IMAP and POP3 accounts at organizations
+    /// whose servers use Kerberos. Off by default; never chosen on its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kerberos: bool,
+    /// An organization's own single sign-on (OpenID Connect / OAuth 2.0)
+    /// for an IMAP or POP3 account: the identity provider (Keycloak, Okta,
+    /// Entra ID, ADFS, Authentik…) that issues tokens the mail servers take
+    /// with OAUTHBEARER or XOAUTH2. The provider may itself sign people in
+    /// with SAML; Picacho only sees its browser pages. With `oauth` on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso: Option<Sso>,
+    /// Gmail and Outlook: the mailbox is reached through the provider's
+    /// own API (the Gmail API, Microsoft Graph) instead of IMAP and SMTP.
+    /// For Microsoft 365 organizations that turn IMAP off, and for what
+    /// only the API offers: Exchange calendars and contacts, the
+    /// organization's address book, and the server's own filters. Needs
+    /// browser sign-in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub api: bool,
+    /// Exchange Web Services: the server's EWS address
+    /// (`https://mail.example.com/EWS/Exchange.asmx`), as Autodiscover
+    /// found it or as entered; empty: `/EWS/Exchange.asmx` at
+    /// `incoming_host`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ews_url: String,
+    /// Exchange: sign in with Basic (the name and password themselves,
+    /// over TLS) instead of NTLM. Only where the server offers nothing
+    /// else, and only as the person chose; never a silent fallback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ews_basic: bool,
+}
+/// Where an account's single sign-on happens and how Picacho is known there.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sso {
+    /// The identity provider's issuer (`https://login.example.com/realms/mail`):
+    /// its endpoints come from the issuer's metadata.
+    pub issuer: String,
+    /// What to ask for; empty: `openid email offline_access`, plus what the
+    /// mail domain's configuration names.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 /// An address a mailbox sends as besides its own (a sending identity): the
 /// name and address recipients see, where replies go, and the outgoing
@@ -350,6 +488,16 @@ pub struct OutgoingServer {
     pub port: u16,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub username: String,
+    /// TLS from the first byte (true) or STARTTLS (false); unset, by port
+    /// as `Account::smtp_tls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
+}
+/// Whether an outgoing server on `port` takes TLS from its first byte:
+/// `setting` when chosen, else by the port (465 is submission over TLS,
+/// RFC 8314; the others start plain and upgrade with STARTTLS).
+pub fn smtp_implicit_tls(setting: Option<bool>, port: u16) -> bool {
+    setting.unwrap_or(port == 465)
 }
 impl Identity {
     /// Where its outgoing server's password is kept in the keychain.
@@ -366,23 +514,23 @@ impl Identity {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.email.trim().parse::<lettre::Address>().is_ok(),
-            "Enter a valid email address."
+            t!("manage-model-enter-a-valid-email-address")
         );
         anyhow::ensure!(
             !self.name.contains(['\r', '\n']),
-            "Enter a name without line breaks."
+            t!("manage-model-enter-a-name-without-line-breaks")
         );
         crate::sync::smtp::recipients(&self.reply_to)
-            .map_err(|_| anyhow::anyhow!("Enter a valid Reply-To address."))?;
+            .map_err(|_| anyhow::anyhow!(t!("manage-model-enter-a-valid-reply-to-address")))?;
         if let Some(s) = &self.smtp {
             anyhow::ensure!(
                 !s.host.is_empty() && !s.host.contains(['\r', '\n', ' ', '/', ':']),
-                "Enter a valid outgoing server hostname."
+                t!("manage-model-enter-a-valid-outgoing-server-hostname")
             );
-            anyhow::ensure!(s.port > 0, "Ports must be between 1 and 65535.");
+            anyhow::ensure!(s.port > 0, t!("manage-model-ports-must-be-between-1-and"));
             anyhow::ensure!(
                 !s.username.contains(['\r', '\n']),
-                "Enter a sign-in name without line breaks."
+                t!("manage-model-enter-a-sign-in-name-without")
             );
         }
         Ok(())
@@ -426,7 +574,7 @@ impl Account {
             incoming_host: host.into(),
             incoming_port: match provider {
                 Provider::Pop3 => 995,
-                Provider::Proton | Provider::Jmap => 443,
+                Provider::Proton | Provider::Jmap | Provider::Ews => 443,
                 _ => 993,
             },
             smtp_host: smtp.into(),
@@ -441,14 +589,91 @@ impl Account {
                 _ => Service::Other,
             },
             incoming_starttls: false,
+            smtp_tls: None,
             sync: SyncSettings::default(),
             username: String::new(),
             reply_to: String::new(),
             read_receipts: false,
             delivery_receipts: false,
+            dsn: DsnOptions::default(),
             require_tls: false,
+            deliver_within_hours: 0,
+            deliver_late_notify: false,
+            deliver_by_trace: false,
             identities: Vec::new(),
+            jmap_account: String::new(),
+            credentials_of: String::new(),
+            server_send_later: false,
+            kerberos: false,
+            sso: None,
+            api: false,
+            ews_url: String::new(),
+            ews_basic: false,
         }
+    }
+    /// An Exchange account's server as typed: its whole EWS address
+    /// (`https://…/EWS/Exchange.asmx`), or a server name.
+    pub fn set_ews_server(&mut self, typed: &str) {
+        let typed = typed.trim();
+        if typed.starts_with("https://") || typed.starts_with("http://") {
+            self.ews_url = typed.to_owned();
+            if let Ok(url) = url::Url::parse(typed) {
+                self.incoming_host = url.host_str().unwrap_or_default().to_owned();
+                self.incoming_port = url.port_or_known_default().unwrap_or(443);
+            }
+        } else if !typed.is_empty() {
+            self.incoming_host = typed.trim_end_matches('/').to_owned();
+            self.ews_url.clear();
+        }
+        self.smtp_host = self.incoming_host.clone();
+        self.smtp_port = self.incoming_port;
+    }
+    /// What an organization's sign-in is asked for beyond who you are: the
+    /// scopes the account names, or, for Exchange Server signed in through
+    /// Microsoft Entra (hybrid modern authentication), EWS on its server.
+    pub fn sso_scope(&self) -> String {
+        let Some(sso) = &self.sso else { return String::new() };
+        if !sso.scope.trim().is_empty() || !self.ews() {
+            return sso.scope.trim().to_owned();
+        }
+        let host = url::Url::parse(&self.ews_endpoint()).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
+        format!("https://{host}/EWS.AccessAsUser.All")
+    }
+    /// Exchange Web Services: where its requests go.
+    pub fn ews_endpoint(&self) -> String {
+        if !self.ews_url.trim().is_empty() {
+            return self.ews_url.trim().to_owned();
+        }
+        let scheme = if cfg!(test) && self.incoming_host == "127.0.0.1" { "http" } else { "https" };
+        match self.incoming_port {
+            443 | 0 => format!("{scheme}://{}/EWS/Exchange.asmx", self.incoming_host),
+            port => format!("{scheme}://{}:{port}/EWS/Exchange.asmx", self.incoming_host),
+        }
+    }
+    /// Whether it reads and sends through the Gmail API.
+    pub fn gmail_api(&self) -> bool {
+        self.api && self.provider == Provider::Gmail && self.sso.is_none()
+    }
+    /// Whether it reads and sends through Microsoft Graph.
+    pub fn graph(&self) -> bool {
+        self.api && self.provider == Provider::Outlook && self.sso.is_none()
+    }
+    /// Whether it is an Exchange Server account (Exchange Web Services).
+    pub fn ews(&self) -> bool {
+        self.provider == Provider::Ews
+    }
+    /// Whether it uses its provider's own API (`api`).
+    pub fn native_api(&self) -> bool {
+        self.gmail_api() || self.graph()
+    }
+    /// Whether its mail comes over IMAP (`Provider::imap`, unless it uses
+    /// its provider's API).
+    pub fn imap(&self) -> bool {
+        self.provider.imap() && !self.native_api()
+    }
+    /// Whether it sends through an API rather than SMTP.
+    pub fn api_sending(&self) -> bool {
+        self.provider.api_sending() || self.native_api()
     }
     /// The name shown for the account: its nickname, if it has one.
     pub fn label(&self) -> &str {
@@ -468,25 +693,28 @@ impl Account {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.email.parse::<lettre::Address>().is_ok(),
-            "Enter a valid email address."
+            t!("manage-model-enter-a-valid-email-address")
         );
-        // JMAP sends through the same server it reads from.
-        let smtp = (self.provider != Provider::Jmap).then_some(&self.smtp_host);
+        // JMAP and Exchange send through the server they read from.
+        let smtp = (!matches!(self.provider, Provider::Jmap | Provider::Ews)).then_some(&self.smtp_host);
         for host in std::iter::once(&self.incoming_host).chain(smtp) {
             anyhow::ensure!(
                 !host.is_empty() && !host.contains(['\r', '\n', ' ', '/', ':']),
-                "Enter valid incoming and SMTP server hostnames."
+                t!("manage-model-enter-valid-incoming-and-smtp-server")
             );
         }
         anyhow::ensure!(
             self.incoming_port > 0 && self.smtp_port > 0,
-            "Ports must be between 1 and 65535."
+            t!("manage-model-ports-must-be-between-1-and")
         );
-        // A JMAP server may register Picacho as it signs in.
+        // A JMAP server or an organization's sign-in may register Picacho
+        // as it signs in.
         anyhow::ensure!(
-            !self.oauth || !self.client_id.is_empty() || self.provider == Provider::Jmap,
-            "Browser sign-in isn't set up for {} in this build.",
-            self.provider.label()
+            !self.oauth
+                || !self.client_id.is_empty()
+                || self.provider == Provider::Jmap
+                || self.sso.is_some(),
+            t!("manage-model-browser-sign-in-isnt-set-up", label = self.provider.label())
         );
         anyhow::ensure!(
             !self.oauth
@@ -494,24 +722,70 @@ impl Account {
                     self.provider,
                     Provider::Gmail | Provider::Outlook | Provider::Jmap
                 )
-                || self.service == Service::Pinal,
-            "OAuth is available for Pinal Mail, Gmail, Outlook and JMAP servers."
+                || self.service == Service::Pinal
+                || (self.sso.is_some() && matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews)),
+            t!("manage-model-oauth-is-available-for-pinal-mail")
         );
-        // STARTTLS is only accepted from Bridge on this computer, where the
-        // first, unencrypted exchange never leaves the machine.
         anyhow::ensure!(
-            !self.incoming_starttls
-                || matches!(self.incoming_host.as_str(), "127.0.0.1" | "localhost"),
-            "STARTTLS is only used with Proton Mail Bridge on this computer."
+            !self.api || (matches!(self.provider, Provider::Gmail | Provider::Outlook) && self.oauth && self.sso.is_none()),
+            t!("manage-model-the-gmail-api-and-microsoft-graph")
+        );
+        if let Some(sso) = &self.sso {
+            anyhow::ensure!(self.oauth, t!("manage-model-single-sign-on-needs-browser-sign"));
+            anyhow::ensure!(
+                matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews),
+                t!("manage-model-single-sign-on-is-for-imap")
+            );
+            // Exchange's token is for its own server, which has to be known
+            // before signing in (Autodiscover needs the sign-in).
+            anyhow::ensure!(
+                !self.ews() || !self.incoming_host.trim().is_empty() || !self.ews_url.trim().is_empty() || !sso.scope.trim().is_empty(),
+                t!("manage-model-enter-the-exchange-server-to-sign-in")
+            );
+            anyhow::ensure!(!self.kerberos, t!("manage-model-choose-kerberos-or-single-sign-on"));
+            let issuer = url::Url::parse(sso.issuer.trim())
+                .map_err(|_| anyhow::anyhow!(t!("manage-model-enter-the-sign-in-services-address")))?;
+            anyhow::ensure!(
+                issuer.scheme() == "https" && issuer.host_str().is_some(),
+                t!("manage-model-the-sign-in-services-address-must")
+            );
+            anyhow::ensure!(
+                !sso.scope.chars().any(char::is_control),
+                t!("manage-model-the-sign-in-scopes-cant-contain")
+            );
+        }
+        // STARTTLS is an upgrade of IMAP or POP3; other protocols start
+        // with TLS (JMAP is HTTPS).
+        anyhow::ensure!(
+            !self.incoming_starttls || !matches!(self.provider, Provider::Proton | Provider::Jmap | Provider::Ews),
+            t!("manage-model-starttls-is-only-used-for-imap")
         );
         anyhow::ensure!(
             !self.username.chars().any(char::is_control),
-            "The sign-in name can't contain line breaks."
+            t!("manage-model-the-sign-in-name-cant-contain")
+        );
+        anyhow::ensure!(
+            self.ews_url.is_empty()
+                || url::Url::parse(self.ews_url.trim()).is_ok_and(|u| u.scheme() == "https" || cfg!(test)),
+            t!("manage-model-the-exchange-address-must-start-with")
+        );
+        anyhow::ensure!(
+            !self.kerberos
+                || (matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews) && !self.oauth),
+            t!("manage-model-kerberos-sign-in-is-for-imap")
+        );
+        anyhow::ensure!(
+            !self.kerberos || !cfg!(any(target_os = "android", target_os = "ios")),
+            t!("manage-model-kerberos-sign-in-isnt-available-on")
+        );
+        anyhow::ensure!(
+            !self.ews_basic || (self.ews() && !self.oauth && !self.kerberos && self.sso.is_none()),
+            t!("manage-model-basic-sign-in-is-for-exchange")
         );
         anyhow::ensure!(
             self.reply_to.trim().is_empty()
                 || crate::sync::smtp::recipients(&self.reply_to).is_ok_and(|r| !r.is_empty()),
-            "Enter a valid Reply-To address."
+            t!("manage-model-enter-a-valid-reply-to-address")
         );
         Ok(())
     }
@@ -550,15 +824,15 @@ impl Folder {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Inbox => "Inbox",
-            Self::Starred => "Starred",
-            Self::Sent => "Sent",
-            Self::Drafts => "Drafts",
-            Self::Archive => "Archive",
-            Self::Junk => "Spam",
-            Self::Trash => "Trash",
-            Self::Other => "Folder",
-            Self::All => "All Mail",
+            Self::Inbox => t!("manage-model-inbox"),
+            Self::Starred => t!("manage-model-starred"),
+            Self::Sent => t!("manage-model-sent"),
+            Self::Drafts => t!("manage-model-drafts"),
+            Self::Archive => t!("manage-model-archive"),
+            Self::Junk => t!("manage-model-spam"),
+            Self::Trash => t!("manage-model-trash"),
+            Self::Other => t!("manage-model-folder"),
+            Self::All => t!("manage-model-all-mail"),
         }
     }
     pub fn key(self) -> &'static str {
@@ -608,7 +882,7 @@ impl From<&Mailbox> for Mailbox {
 }
 
 /// A server folder that is not one of the standard mailboxes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteFolder {
     pub name: String,
     pub label: String,
@@ -710,6 +984,21 @@ pub struct MailExtra {
     saved: i64,
     /// Where the sender asked for a read receipt (Disposition-Notification-To).
     receipt_to: String,
+    /// The mailing list it came through (List-Id, RFC 2919), lowercase.
+    list_id: String,
+    /// The list's other addresses (RFC 2369: List-Help, -Subscribe,
+    /// -Post, -Owner, -Archive), stored only, never opened by themselves.
+    list_links: Vec<crate::manage::list_headers::ListLink>,
+    /// The server's id for the message itself (OBJECTID's EMAILID, RFC
+    /// 8474 §5.1): the same in every mailbox of the account.
+    email_id: String,
+    /// The inbox category the server sorted it into, where it does
+    /// (`categories::gmail_category`, `categories::outlook_category`).
+    category: String,
+    /// Sent by a machine, as its headers say (Auto-Submitted, X-Autoreply,
+    /// X-Autorespond, Precedence: auto_reply): an out-of-office answer, a
+    /// report, a notification.
+    automatic: bool,
 }
 impl MailExtra {
     fn is_empty(&self) -> bool {
@@ -720,6 +1009,11 @@ impl MailExtra {
             && self.thread_id.is_empty()
             && self.saved == 0
             && self.receipt_to.is_empty()
+            && self.list_id.is_empty()
+            && self.list_links.is_empty()
+            && self.email_id.is_empty()
+            && self.category.is_empty()
+            && !self.automatic
     }
 }
 
@@ -775,6 +1069,45 @@ impl Mail {
     pub fn set_receipt_to(&mut self, receipt_to: impl Into<String>) {
         let receipt_to = receipt_to.into();
         self.change_extra(receipt_to.is_empty(), |e| e.receipt_to = receipt_to);
+    }
+    /// The mailing list it came through (List-Id), lowercase; empty if none.
+    pub fn list_id(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.list_id)
+    }
+    pub fn set_list_id(&mut self, list_id: impl Into<String>) {
+        let list_id = list_id.into();
+        self.change_extra(list_id.is_empty(), |e| e.list_id = list_id);
+    }
+    /// The list's help, subscribe, post, owner and archive addresses.
+    pub fn list_links(&self) -> &[crate::manage::list_headers::ListLink] {
+        self.extra.as_ref().map_or(&[], |e| &e.list_links)
+    }
+    pub fn set_list_links(&mut self, links: Vec<crate::manage::list_headers::ListLink>) {
+        self.change_extra(links.is_empty(), |e| e.list_links = links);
+    }
+    /// The server's EMAILID for it (OBJECTID); empty where unknown.
+    pub fn email_id(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.email_id)
+    }
+    pub fn set_email_id(&mut self, email_id: impl Into<String>) {
+        let email_id = email_id.into();
+        self.change_extra(email_id.is_empty(), |e| e.email_id = email_id);
+    }
+    /// The inbox category the server sorted it into ("promotions",
+    /// "focused"…); empty where it doesn't say.
+    pub fn server_category(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.category)
+    }
+    pub fn set_server_category(&mut self, category: impl Into<String>) {
+        let category = category.into();
+        self.change_extra(category.is_empty(), |e| e.category = category);
+    }
+    /// Sent by a machine, as its headers say (see `MailExtra::automatic`).
+    pub fn automatic(&self) -> bool {
+        self.extra.as_ref().is_some_and(|e| e.automatic)
+    }
+    pub fn set_automatic(&mut self, automatic: bool) {
+        self.change_extra(!automatic, |e| e.automatic = automatic);
     }
     /// Takes the attachments out, leaving none.
     pub fn take_attachments(&mut self) -> Vec<Attachment> {
@@ -854,6 +1187,16 @@ struct MailRecord {
     #[serde(default)]
     receipt_to: String,
     #[serde(default)]
+    list_id: String,
+    #[serde(default)]
+    list_links: Vec<crate::manage::list_headers::ListLink>,
+    #[serde(default)]
+    email_id: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    automatic: bool,
+    #[serde(default)]
     mdn_sent: bool,
     #[serde(default)]
     partial: bool,
@@ -902,6 +1245,16 @@ struct MailRecordRef<'a> {
     saved: i64,
     #[serde(skip_serializing_if = "no_text")]
     receipt_to: &'a str,
+    #[serde(skip_serializing_if = "no_text")]
+    list_id: &'a str,
+    #[serde(skip_serializing_if = "no_items")]
+    list_links: &'a [crate::manage::list_headers::ListLink],
+    #[serde(skip_serializing_if = "no_text")]
+    email_id: &'a str,
+    #[serde(skip_serializing_if = "no_text")]
+    category: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    automatic: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mdn_sent: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -923,6 +1276,11 @@ impl From<MailRecord> for Mail {
             thread_id: r.thread_id,
             saved: r.saved,
             receipt_to: r.receipt_to,
+            list_id: r.list_id,
+            list_links: r.list_links,
+            email_id: r.email_id,
+            category: r.category,
+            automatic: r.automatic,
         };
         Mail {
             id: r.id,
@@ -991,6 +1349,11 @@ impl Serialize for Mail {
             thread_id: self.thread_id(),
             saved: self.saved(),
             receipt_to: self.receipt_to(),
+            list_id: self.list_id(),
+            list_links: self.list_links(),
+            email_id: self.email_id(),
+            category: self.server_category(),
+            automatic: self.automatic(),
             mdn_sent: self.mdn_sent,
             partial: self.partial,
         }
@@ -1001,6 +1364,9 @@ impl<'de> Deserialize<'de> for Mail {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         MailRecord::deserialize(deserializer).map(Mail::from)
     }
+}
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 fn is_zero(v: &u64) -> bool {
     *v == 0
@@ -1014,6 +1380,10 @@ fn is_zero_i64(v: &i64) -> bool {
 pub struct InlineParts {
     /// By Content-ID, lowercase, without its angle brackets.
     parts: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+    /// The parts' bytes in all, kept as they are added and replaced, so
+    /// adding one needn't add up all the others (a message of thousands
+    /// of small parts made that quadratic).
+    bytes: usize,
 }
 impl InlineParts {
     /// No parts, shared: every message read from the cache starts with
@@ -1031,8 +1401,11 @@ impl InlineParts {
     }
     /// At most this much is kept per message.
     pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+    /// At most this many parts are kept per message.
+    pub const MAX_PARTS: usize = 1024;
     /// Adds a part under its Content-ID header (`<id>`). Returns false,
-    /// adding nothing, once the message's parts would grow too large.
+    /// adding nothing, once the message's parts would grow too large or
+    /// too many.
     pub fn insert(&mut self, content_id: &str, bytes: Vec<u8>) -> bool {
         let id = content_id
             .trim()
@@ -1040,12 +1413,34 @@ impl InlineParts {
             .trim_end_matches('>')
             .trim()
             .to_lowercase();
-        let total: usize = self.parts.values().map(|b| b.len()).sum();
-        if id.is_empty() || total + bytes.len() > Self::MAX_BYTES {
+        if id.is_empty() {
             return false;
         }
+        let replaced = self.parts.get(&id).map(|b| b.len());
+        let total = self.bytes - replaced.unwrap_or(0) + bytes.len();
+        if total > Self::MAX_BYTES || (replaced.is_none() && self.parts.len() >= Self::MAX_PARTS) {
+            return false;
+        }
+        self.bytes = total;
         self.parts.insert(id, std::sync::Arc::new(bytes));
         true
+    }
+    /// Adds a part under its Content-Location (RFC 2557): an absolute
+    /// URL the HTML refers to it by, kept apart from Content-IDs.
+    pub fn insert_location(&mut self, location: &str, bytes: Vec<u8>) -> bool {
+        let location = location.trim();
+        if !location.contains(':') || location.len() > 2048 {
+            return false;
+        }
+        self.insert(&format!("loc:{location}"), bytes)
+    }
+    /// The part at a Content-Location the message gave, if any: the
+    /// message's own copy, served without fetching anything.
+    pub fn at_location(&self, url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        if self.parts.is_empty() {
+            return None;
+        }
+        self.parts.get(&format!("loc:{}", url.trim()).to_lowercase()).cloned()
     }
     /// The part a `cid:` URL names, if the message has it. The URL's id
     /// may be percent-encoded (RFC 2392).
@@ -1134,7 +1529,7 @@ pub fn initials(name: &str) -> String {
         .to_uppercase()
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Secret {
     pub password: String,
     pub access_token: String,
@@ -1157,6 +1552,30 @@ pub struct Secret {
     /// account's keys. The password itself isn't kept.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proton_key: String,
+    /// Microsoft: scopes granted besides the mail ones (OneDrive, for
+    /// sharing large attachments), asked for again with each renewal, as
+    /// Microsoft renews only what is named.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra_scopes: String,
+}
+/// Says which secrets are there, never what they are: one printed for
+/// debugging (`{:?}`, an error's details) would otherwise put passwords
+/// and tokens in a log.
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kept = |s: &str| if s.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("Secret")
+            .field("password", &kept(&self.password))
+            .field("access_token", &kept(&self.access_token))
+            .field("refresh_token", &kept(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("client_secret", &kept(&self.client_secret))
+            .field("mail_bundle", &kept(&self.mail_bundle))
+            .field("mail_key", &kept(&self.mail_key))
+            .field("proton_uid", &self.proton_uid)
+            .field("proton_key", &kept(&self.proton_key))
+            .finish()
+    }
 }
 impl Secret {
     pub(crate) fn proton(&self) -> crate::sync::proton::Saved {
@@ -1187,6 +1606,14 @@ pub struct Draft {
     /// sent as; empty to send as the account (or `send_as`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub identity: String,
+    /// Set only while sending: the address From names, when routing made
+    /// it one of the account's own addresses at its provider (a Proton
+    /// address listed as an alias), which the provider sends from itself.
+    #[serde(skip)]
+    pub from_address: String,
+    /// The name From gives `from_address`; empty for the account's.
+    #[serde(skip)]
+    pub from_name: String,
     /// When to send it (seconds since the epoch), for a message scheduled
     /// with Send Later; it waits in Drafts until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1194,17 +1621,27 @@ pub struct Draft {
     /// Why it couldn't be sent when it was scheduled to be, if it couldn't.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub send_error: String,
+    /// "Remind me if no reply": how long after it is sent (seconds) to
+    /// remind, if nobody has replied by then (`backend::follow_up`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<i64>,
     pub to: String,
     #[serde(default)]
     pub cc: String,
     #[serde(default)]
     pub bcc: String,
     pub subject: String,
-    /// Plain text, or Markdown when `formatted`.
+    /// Plain text; when `formatted`, the text version of `html` (or, in
+    /// drafts kept before the formatted composer wrote HTML, Markdown).
     pub body: String,
-    /// The body is Markdown and is sent with an HTML version.
+    /// It is sent with an HTML version: `html`, or else `body` as Markdown.
     #[serde(default)]
     pub formatted: bool,
+    /// A formatted message's HTML as the composer edits it (without the
+    /// document around it), its pictures `file:<attachment name>`. Empty
+    /// for plain messages and Markdown drafts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub html: String,
     pub reply_id: String,
     /// The thread's message ids, oldest first, for the References header.
     #[serde(default)]
@@ -1227,6 +1664,117 @@ pub struct Draft {
     /// It forwards `original`, rather than replying to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forwarding: bool,
+    /// Sign it with your OpenPGP key (PGP/MIME).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign: bool,
+    /// Encrypt it to every recipient's OpenPGP key (PGP/MIME).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub encrypt: bool,
+    /// When encrypting, hide the subject too (protected headers).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub encrypt_subject: bool,
+    /// Sign and encrypt it with S/MIME instead of OpenPGP.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub smime: bool,
+    /// Sign and encrypt it with OpenPGP as inline PGP rather than
+    /// PGP/MIME, for recipients whose apps read only that (plain text).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pgp_inline: bool,
+    /// How urgent it is: shown to recipients (Importance, X-Priority) and,
+    /// where the outgoing server has MT-PRIORITY (RFC 6710), given to it.
+    #[serde(default, skip_serializing_if = "Priority::is_normal")]
+    pub priority: Priority,
+    /// An HTML signature, as written in Settings: the body holds its text
+    /// (`composing::signature_text`) after the `-- ` line, and a formatted
+    /// message's HTML shows the signature's own HTML in its place while
+    /// that text is there unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature_html: String,
+    /// How large its attached pictures are sent, when chosen for it;
+    /// otherwise as Settings → Composing says (`ComposeOptions::image_size`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<crate::manage::composing::ImageSize>,
+}
+/// Delivery report options (RFC 3461 §4.1, §4.3). The defaults ask for
+/// every report and only the headers back, as Picacho always did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DsnOptions {
+    /// Report delivery (NOTIFY=SUCCESS).
+    pub success: bool,
+    /// Report failure (NOTIFY=FAILURE).
+    pub failure: bool,
+    /// Report a delay (NOTIFY=DELAY).
+    pub delay: bool,
+    /// A failure report returns the whole message (RET=FULL) rather than
+    /// its headers (RET=HDRS).
+    pub return_full: bool,
+}
+impl Default for DsnOptions {
+    fn default() -> Self {
+        Self {
+            success: true,
+            failure: true,
+            delay: true,
+            return_full: false,
+        }
+    }
+}
+impl DsnOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    /// The NOTIFY value (RFC 3461 §4.1): the reports asked for, or NEVER.
+    pub fn notify(&self) -> String {
+        let asked: Vec<&str> = [
+            (self.success, "SUCCESS"),
+            (self.failure, "FAILURE"),
+            (self.delay, "DELAY"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+        if asked.is_empty() {
+            "NEVER".into()
+        } else {
+            asked.join(",")
+        }
+    }
+    /// The RET value (RFC 3461 §4.3).
+    pub fn ret(&self) -> &'static str {
+        if self.return_full { "FULL" } else { "HDRS" }
+    }
+}
+/// A message's urgency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+impl Priority {
+    pub fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
+    /// The next one, for a button that cycles them.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::High,
+            Self::High => Self::Low,
+            Self::Low => Self::Normal,
+        }
+    }
+    /// MT-PRIORITY's level (RFC 6710 §3: -9..9; the MIXER profile's -4, 0
+    /// and 4 are used).
+    pub fn mt_priority(self) -> i8 {
+        match self {
+            Self::Low => -4,
+            Self::Normal => 0,
+            Self::High => 4,
+        }
+    }
 }
 /// Where a draft is in the server's Drafts folder.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1269,9 +1817,30 @@ impl Draft {
             h.update(b"identity\0");
             h.update(self.identity.as_bytes());
         }
+        // Added later, likewise.
+        if !self.priority.is_normal() {
+            h.update(b"priority\0");
+            h.update([self.priority.mt_priority() as u8]);
+        }
+        // Added later, likewise.
+        if !self.html.is_empty() {
+            h.update(b"html\0");
+            h.update(self.html.as_bytes());
+        }
+        // Added later, likewise: how it is protected changes what's uploaded.
+        if self.encrypt || self.sign || self.smime || self.encrypt_subject {
+            h.update(b"protect\0");
+            h.update([
+                u8::from(self.sign),
+                u8::from(self.encrypt),
+                u8::from(self.smime),
+                u8::from(self.encrypt_subject),
+            ]);
+        }
         for path in &self.attachments {
             h.update(path.to_string_lossy().as_bytes());
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            // The contents' size, the same sealed or not (`sealed_files`).
+            let size = crate::manage::sealed_files::len(path).unwrap_or(0);
             h.update(size.to_le_bytes());
         }
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -1306,7 +1875,7 @@ pub fn demo_mail() -> Vec<Mail> {
             "Figma",
             "news@figma.com",
             "Made for your next big idea",
-            "A fresh set of tools to help you bring your next idea to life. Here's what's new.",
+            "A fresh set of tools to help you bring your next idea to life. Here's what's new, and 30% off Professional this month.",
             true,
         ),
         (
@@ -1406,6 +1975,131 @@ pub fn demo_mail() -> Vec<Mail> {
 
 #[cfg(test)]
 mod tests {
+    /// What's typed for an Exchange server: a whole EWS address, or a name.
+    #[test]
+    fn exchange_servers_are_addresses_or_names() {
+        let mut a = Service::Exchange.account("qa@corp.example").unwrap();
+        assert_eq!((a.provider, a.incoming_host.as_str(), a.incoming_port), (Provider::Ews, "mail.corp.example", 443));
+        a.set_ews_server("https://owa.corp.example:8443/EWS/Exchange.asmx");
+        assert_eq!(a.ews_url, "https://owa.corp.example:8443/EWS/Exchange.asmx");
+        assert_eq!((a.incoming_host.as_str(), a.incoming_port, a.smtp_host.as_str()), ("owa.corp.example", 8443, "owa.corp.example"));
+        assert_eq!(a.ews_endpoint(), "https://owa.corp.example:8443/EWS/Exchange.asmx");
+        a.set_ews_server("exchange.corp.example/");
+        assert!(a.ews_url.is_empty());
+        a.incoming_port = 443;
+        assert_eq!(a.ews_endpoint(), "https://exchange.corp.example/EWS/Exchange.asmx");
+        a.email = "qa@corp.example".into();
+        assert!(a.validate().is_ok());
+        a.ews_url = "http://plain.example/EWS/Exchange.asmx".into();
+        assert!(cfg!(test) || a.validate().is_err());
+    }
+    /// Where the browser is how a service signs in, Fastmail offers an API
+    /// token and Google an app password instead; Microsoft and services
+    /// without one, or typed already, offer nothing.
+    #[test]
+    fn tokens_are_offered_instead_of_the_browser_where_taken() {
+        assert_eq!(Service::Fastmail.token_offer(true), Some("API token"));
+        assert_eq!(Service::Gmail.token_offer(true), Some("app password"));
+        for none in [Service::Outlook, Service::Pinal, Service::ICloud, Service::Zoho, Service::Proton, Service::Other] {
+            assert_eq!(none.token_offer(true), None, "{none:?}");
+        }
+        // Without browser sign-in in this build, the token is the only way,
+        // not an alternative.
+        assert_eq!(Service::Gmail.token_offer(false), None);
+    }
+
+    #[test]
+    fn single_sign_on_is_for_imap_and_pop3_over_https() {
+        let mut a = Account::new(Provider::Imap);
+        a.email = "ana@example.edu".into();
+        a.incoming_host = "imap.example.edu".into();
+        a.smtp_host = "smtp.example.edu".into();
+        a.oauth = true;
+        // No client id: the identity provider may register Picacho.
+        a.sso = Some(Sso {
+            issuer: "https://login.example.edu/realms/mail".into(),
+            scope: String::new(),
+        });
+        assert!(a.validate().is_ok());
+        a.provider = Provider::Pop3;
+        assert!(a.validate().is_ok());
+        let mut plain = a.clone();
+        plain.sso.as_mut().unwrap().issuer = "http://login.example.edu".into();
+        assert!(plain.validate().is_err());
+        let mut both = a.clone();
+        both.kerberos = true;
+        assert!(both.validate().is_err());
+        let mut no_browser = a.clone();
+        no_browser.oauth = false;
+        assert!(no_browser.validate().is_err());
+        // Without single sign-on, IMAP still can't use browser sign-in.
+        let mut none = a.clone();
+        none.sso = None;
+        assert!(none.validate().is_err());
+    }
+    #[test]
+    fn exchange_signs_in_through_entra_for_its_own_server() {
+        let mut a = Service::Exchange.account("ana@corp.example").unwrap();
+        a.oauth = true;
+        a.client_id = "app".into();
+        a.sso = Some(Sso { issuer: "https://login.microsoftonline.com/tenant/v2.0".into(), scope: String::new() });
+        // The token is for the server (guessed as mail.domain), which must
+        // be known first.
+        assert_eq!(a.sso_scope(), "https://mail.corp.example/EWS.AccessAsUser.All");
+        a.incoming_host.clear();
+        assert!(a.validate().is_err());
+        a.set_ews_server("mail.corp.example");
+        assert!(a.validate().is_ok());
+        assert_eq!(a.sso_scope(), "https://mail.corp.example/EWS.AccessAsUser.All");
+        a.set_ews_server("https://webmail.corp.example/EWS/Exchange.asmx");
+        assert_eq!(a.sso_scope(), "https://webmail.corp.example/EWS.AccessAsUser.All");
+        // A scope the account names is used as given.
+        a.sso.as_mut().unwrap().scope = "https://other.example/EWS.AccessAsUser.All".into();
+        assert_eq!(a.sso_scope(), "https://other.example/EWS.AccessAsUser.All");
+    }
+    #[test]
+    fn basic_sign_in_is_only_for_exchange_password_accounts() {
+        let mut a = Service::Exchange.account("ana@corp.example").unwrap();
+        a.ews_basic = true;
+        assert!(a.validate().is_ok());
+        let mut kerberos = a.clone();
+        kerberos.kerberos = true;
+        assert!(kerberos.validate().is_err());
+        let mut imap = Account::new(Provider::Imap);
+        imap.email = "ana@example.com".into();
+        imap.incoming_host = "mail.example.com".into();
+        imap.smtp_host = "mail.example.com".into();
+        imap.ews_basic = true;
+        assert!(imap.validate().is_err());
+        // Saved accounts from before read without it, and it stays off.
+        let old: Account = serde_json::from_str(&serde_json::to_string(&Service::Exchange.account("ana@corp.example").unwrap()).unwrap()).unwrap();
+        assert!(!old.ews_basic);
+        assert!(!serde_json::to_string(&old).unwrap().contains("ews_basic"));
+    }
+    #[test]
+    fn kerberos_is_only_for_imap_and_pop3_password_accounts() {
+        let mut a = Account::new(Provider::Imap);
+        a.email = "ana@example.com".into();
+        a.incoming_host = "mail.example.com".into();
+        a.smtp_host = "mail.example.com".into();
+        a.kerberos = true;
+        assert!(a.validate().is_ok());
+        a.provider = Provider::Pop3;
+        assert!(a.validate().is_ok());
+        a.provider = Provider::Jmap;
+        assert!(a.validate().is_err());
+        let mut g = Account::new(Provider::Gmail);
+        g.email = "ana@gmail.com".into();
+        g.kerberos = true;
+        assert!(g.validate().is_err());
+        // Saved accounts from before read without it.
+        let old: Account =
+            serde_json::from_str(&serde_json::to_string(&Account::new(Provider::Imap)).unwrap())
+                .unwrap();
+        assert!(!old.kerberos);
+        assert!(!serde_json::to_string(&old).unwrap().contains("kerberos"));
+    }
+
     use super::*;
 
     /// A message with every field set, as the cache stores it.
@@ -1424,6 +2118,30 @@ mod tests {
         );
     }
 
+    /// A mailing list's identity and links are kept (by name, the kind as
+    /// a word), and mail cached before them reads and writes as it did.
+    #[test]
+    fn list_headers_are_kept_in_the_cache() {
+        use crate::manage::list_headers::{ListLink, ListLinkKind};
+        let old: Mail = serde_json::from_str(full_mail_json()).unwrap();
+        assert_eq!(old.list_id(), "");
+        assert!(old.list_links().is_empty());
+        let mut m = old.clone();
+        m.set_list_id("users.example.org");
+        m.set_list_links(vec![ListLink {
+            kind: ListLinkKind::Archive,
+            uri: "https://example.org/archive".into(),
+        }]);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains(r#""list_id":"users.example.org","list_links":[{"kind":"Archive","uri":"https://example.org/archive"}]"#),
+            "{json}"
+        );
+        let back: Mail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.list_id(), "users.example.org");
+        assert_eq!(back.list_links(), m.list_links());
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
     /// Accounts saved before Proton's event pace was a setting keep the
     /// pace they had: about every 30 seconds.
     #[test]

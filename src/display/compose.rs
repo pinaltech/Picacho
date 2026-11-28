@@ -39,21 +39,114 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.compose_with(mode, original, placement, None, w, cx);
+        self.compose_with(mode, original, placement, None, None, w, cx);
+    }
+
+    /// Answers the open message with `text` (a suggested reply) written in:
+    /// a reply (to everyone, if Reply does that) where replies open, ready
+    /// to send or go on writing. A reply already open to the message gets
+    /// the text instead.
+    pub(super) fn reply_with_text(&mut self, text: String, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(original) = self.selected_mail() else {
+            return;
+        };
+        if let Some(open) = self.open_answer(&original, false, cx) {
+            // Typed into that reply, brought into view as Reply would.
+            open.update(cx, |c, cx| {
+                c.minimized = false;
+                cx.notify();
+            });
+            match open.read(cx).window {
+                Some(handle) => {
+                    let _ = handle.update(cx, |_, w, cx| {
+                        open.update(cx, |c, cx| c.insert_reply_text(&text, w, cx));
+                        w.activate_window();
+                    });
+                }
+                None => {
+                    open.update(cx, |c, cx| c.insert_reply_text(&text, w, cx));
+                    if open.read(cx).placement == Placement::Inline {
+                        self.scroll_reader_to_end(w);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let mode = if self.compose_options.default_reply_all {
+            2
+        } else {
+            1
+        };
+        let end = text.len();
+        self.compose_with(mode, Some(original.clone()), None, None, Some(text), w, cx);
+        // Writing goes on after the suggested reply, not before it.
+        if let Some(open) = self.open_answer(&original, false, cx) {
+            match open.read(cx).window {
+                Some(handle) => {
+                    let _ = handle.update(cx, |_, w, cx| {
+                        open.update(cx, |c, cx| c.put_cursor(end, w, cx))
+                    });
+                }
+                None => open.update(cx, |c, cx| c.put_cursor(end, w, cx)),
+            }
+        }
     }
 
     /// A new message to `to` (an address list), sent from the account of
     /// the open message, as from a reader's address menu.
     pub(super) fn compose_to(&mut self, to: String, w: &mut Window, cx: &mut Context<Self>) {
-        self.compose_with(0, None, None, Some(to), w, cx);
+        self.compose_with(0, None, None, Some(to), None, w, cx);
     }
 
-    fn compose_with(
+    /// A new message from a `mailto:` link (RFC 6068), in Picacho's own
+    /// composer: its recipients, Cc, Bcc, subject and body. Other header
+    /// fields the link names are left out (§4: In-Reply-To aside, a link
+    /// mustn't set what isn't shown).
+    pub(super) fn compose_mailto(&mut self, link: &str, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = super::links::Mailto::parse(link) else {
+            self.notice(t!("compose-that-email-link-isnt-valid"), true, cx);
+            return;
+        };
+        self.compose_with(0, None, None, Some(m.to.clone()), None, w, cx);
+        // The composer just opened is the newest.
+        if let Some(composer) = self.composers.last().cloned() {
+            composer.update(cx, |c, cx| {
+                if !m.cc.is_empty() {
+                    c.draft.cc = m.cc.clone();
+                }
+                if !m.bcc.is_empty() {
+                    c.draft.bcc = m.bcc.clone();
+                }
+                if !m.subject.is_empty() {
+                    c.draft.subject = m.subject.clone();
+                }
+                if !m.body.is_empty() && !c.draft.formatted {
+                    c.draft.body = format!("{}{}", m.body, c.draft.body);
+                }
+                if !m.in_reply_to.is_empty() {
+                    c.draft.reply_id = m.in_reply_to.clone();
+                }
+                c.reload_fields(w, cx);
+                // A formatted draft gets the link's text written in.
+                if !m.body.is_empty() && c.draft.formatted {
+                    c.insert_reply_text(&m.body, w, cx);
+                }
+                cx.notify();
+            });
+        }
+    }
+
+    /// `intro` (a suggested reply) starts the body, above the signature and
+    /// quote.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compose_with(
         &mut self,
         mode: u8,
         original: Option<Mail>,
         placement: Option<Placement>,
         to: Option<String>,
+        intro: Option<String>,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -102,18 +195,31 @@ impl MailApp {
                     .and_then(|_| self.selected_mail())
                     .and_then(|m| self.account_of(&m))
             })
+            // All Accounts: the workspace's account to write from, if set.
+            .or_else(|| self.workspace_from())
             .or_else(|| self.current_account());
         let own = account
             .as_ref()
             .map(|a| a.email.clone())
             .unwrap_or_default();
-        let signature = options.signature.trim();
-        let sign = |reply: bool| -> String {
-            if signature.is_empty() || (reply && !options.signature_on_replies) {
-                String::new()
+        // The sending address's signature, or its mailbox's, or everyone's.
+        // An HTML signature's HTML is kept with the draft, for its HTML.
+        let sign = |reply: bool, draft: &mut Draft| -> String {
+            let address = if !draft.send_as.is_empty() {
+                draft.send_as.clone()
             } else {
-                format!("\n\n-- \n{signature}")
+                account
+                    .as_ref()
+                    .and_then(|a| a.identities.iter().find(|i| i.id == draft.identity))
+                    .map(|i| i.email.clone())
+                    .unwrap_or_else(|| own.clone())
+            };
+            if reply && !options.signature_on_replies {
+                return String::new();
             }
+            let signature = options.signature(&draft.account, &address);
+            draft.signature_html = signature.html.clone();
+            signature.block()
         };
         let mut draft = Draft {
             id: uuid::Uuid::new_v4().to_string(),
@@ -125,13 +231,20 @@ impl MailApp {
             ..Draft::default()
         };
         match &original {
-            None => draft.body = sign(false),
+            None => draft.body = sign(false, &mut draft),
             Some(m) => {
                 let forward = mode >= 3;
-                draft.subject = reply_subject(&m.subject, forward);
+                // RFC 9788 §6.1: the real subject, not a hidden one's "...".
+                draft.subject = reply_subject(&self.backend.real_subject(m), forward);
                 // Marked answered or forwarded once this is sent.
                 draft.original = m.id.clone();
                 draft.forwarding = forward;
+                // RFC 9788 §6.1: as protected as what it answers.
+                let start = self.backend.answering(m).start();
+                if start.encrypt {
+                    draft.encrypt = true;
+                    draft.encrypt_subject = start.hide_subject;
+                }
                 // Answer as the alias the message was sent to.
                 let aliases = fwd::sendable(&self.forwarding);
                 if let Some(alias) = alias_addressed(m, &aliases) {
@@ -192,25 +305,31 @@ impl MailApp {
                     // The message itself goes as an attachment.
                     String::new()
                 } else if forward {
-                    format!(
-                        "\n\n---------- Forwarded message ----------\nFrom: {} <{}>\nDate: {}\nSubject: {}\nTo: {}\n{}\n{}",
-                        sender,
-                        masked(&m.from),
-                        date_full(m.date),
-                        m.subject,
-                        recipients(&m.to),
-                        if m.cc().is_empty() {
-                            String::new()
-                        } else {
-                            format!("Cc: {}\n", recipients(m.cc()))
-                        },
-                        quoted
-                    )
+                    // In the language of mail Picacho writes (Settings).
+                    let header = crate::i18n::in_outgoing(|| {
+                        let mut lines = vec![
+                            t!("outgoing-forwarded-message").to_owned(),
+                            t!(
+                                "outgoing-forward-header",
+                                name = sender,
+                                address = masked(&m.from),
+                                date = date_full(m.date),
+                                subject = m.subject,
+                                to = recipients(&m.to),
+                            ),
+                        ];
+                        if !m.cc().is_empty() {
+                            lines.push(t!("outgoing-forward-cc", cc = recipients(m.cc())));
+                        }
+                        lines.join("\n")
+                    });
+                    format!("\n\n{header}\n\n{quoted}")
                 } else if options.quote_original {
+                    let intro = crate::i18n::in_outgoing(|| {
+                        t!("outgoing-wrote", date = date_full(m.date), name = sender)
+                    });
                     format!(
-                        "\n\nOn {}, {} wrote:\n{}",
-                        date_full(m.date),
-                        sender,
+                        "\n\n{intro}\n{}",
                         quoted
                             .lines()
                             // Nested quotes stay compact: ">>", not "> >".
@@ -225,11 +344,15 @@ impl MailApp {
                 } else {
                     String::new()
                 };
-                draft.body = format!("{}{quote}", sign(true));
+                let signature = sign(true, &mut draft);
+                draft.body = format!("{signature}{quote}");
             }
         }
         if let Some(to) = to {
             draft.to = to;
+        }
+        if let Some(intro) = intro {
+            draft.body = format!("{intro}{}", draft.body);
         }
         // A mailbox kept to its aliases writes as one of them.
         if draft.send_as.is_empty()
@@ -263,10 +386,12 @@ impl MailApp {
     /// Opens a saved draft where new messages open.
     pub(super) fn open_draft(&mut self, draft: Draft, w: &mut Window, cx: &mut Context<Self>) {
         // Here, or by the background monitor as the window opened.
-        if self.scheduled_sending.contains(&draft.id)
-            || self.backend.sending_scheduled(&draft.id)
-        {
-            self.notice("This scheduled message is being sent now.", false, cx);
+        if self.scheduled_sending.contains(&draft.id) || self.backend.sending_scheduled(&draft.id) {
+            self.notice(
+                t!("compose-this-scheduled-message-is-being-sent"),
+                false,
+                cx,
+            );
             return;
         }
         if let Some(open) = self
@@ -355,7 +480,7 @@ impl MailApp {
                 .open_window(
                     window::detached_options(
                         SharedString::from(if draft.subject.is_empty() {
-                            "New Message".to_string()
+                            t!("compose-new-message").to_string()
                         } else {
                             draft.subject.clone()
                         }),
@@ -451,7 +576,9 @@ impl MailApp {
                     let d = &composer.read(cx).draft;
                     (d.id.clone(), d.account.clone())
                 };
-                let _ = self.backend.discard_draft(&id);
+                // After its saves, in order (`queue_draft_write`).
+                let backend = self.backend.clone();
+                drop(super::composer::queue_draft_write(move || backend.discard_draft(&id)));
                 self.close_composer(&composer, cx);
                 self.refresh_drafts(cx);
                 self.sync_drafts_soon(&account, cx);
@@ -462,6 +589,9 @@ impl MailApp {
                 self.handle(Action::NewAliasFor(service.clone(), mailbox.clone()), w, cx);
             }
             ComposerEvent::Schedule(at) => self.schedule_send(composer, *at, cx),
+            ComposerEvent::SaveTemplate(t) => self.save_template(t.clone(), cx),
+            ComposerEvent::Merge(drafts) => self.merge_send(composer, drafts.clone(), cx),
+            ComposerEvent::SaveSnippet(snippet) => self.save_snippet(snippet.clone(), cx),
         }
         cx.notify();
     }
@@ -510,7 +640,11 @@ impl MailApp {
         let id = a.id.clone();
         self.task(
             cx,
-            move |b| b.sync_drafts(&a),
+            move |b| {
+                // With the drafts saved just before.
+                super::composer::wait_for_draft_writes(None);
+                b.sync_drafts(&a)
+            },
             move |this, result, cx| {
                 this.draft_syncs.remove(&id);
                 this.account_result(&id, IssueSource::Sync(Folder::Drafts.key().into()), &result);
@@ -584,10 +718,17 @@ impl MailApp {
         }
     }
 
-    /// Saves every open draft now, on this thread: before quitting.
+    /// Saves every open draft before quitting, and waits for every draft
+    /// write queued (`composer::queue_draft_write`) to be done: the app
+    /// ends right after. At most `QUIT_WAIT`: a cache held longer than that
+    /// (by a sync) doesn't keep Picacho from quitting.
     pub(super) fn persist_draft(&mut self, cx: &mut App) {
+        const QUIT_WAIT: Duration = Duration::from_secs(10);
         for composer in self.composers.clone() {
             composer.update(cx, |c, cx| c.save_now(cx));
+        }
+        if !super::composer::wait_for_draft_writes(Some(QUIT_WAIT)) {
+            eprintln!("Picacho: quitting before every draft was saved");
         }
     }
 
@@ -596,7 +737,7 @@ impl MailApp {
     /// People to suggest in a composer's address fields: everyone in the
     /// listed mail, newest first, up to 2,000, not counting your own
     /// addresses. Kept until the list or your addresses change.
-    fn contacts(&self) -> Rc<Vec<(String, String)>> {
+    pub(super) fn contacts(&self) -> Rc<Vec<(String, String)>> {
         let mut own: Vec<String> = self
             .accounts
             .iter()
@@ -612,7 +753,18 @@ impl MailApp {
         {
             return contacts.clone();
         }
-        let contacts = Rc::new(gather_contacts(&self.messages, &own));
+        // The address book first, then people seen in mail.
+        // The workspace's address books.
+        let mut people = crate::manage::backend::contacts::people(&self.workspace_contacts());
+        let mut seen: HashSet<String> = people.iter().map(|(_, e)| e.to_lowercase()).collect();
+        seen.extend(own.iter().cloned());
+        people.retain(|(_, e)| !own.contains(&e.to_lowercase()));
+        people.extend(
+            gather_contacts(&self.messages, &own)
+                .into_iter()
+                .filter(|(_, e)| seen.insert(e.to_lowercase())),
+        );
+        let contacts = Rc::new(people);
         *self.contacts_cache.borrow_mut() = Some((self.list_revision, own, contacts.clone()));
         contacts
     }
@@ -684,7 +836,7 @@ impl MailApp {
         else {
             self.send_failed(
                 id,
-                "Connect an account before sending. Your draft is saved.".into(),
+                t!("compose-connect-an-account-before-sending-your").into(),
                 cx,
             );
             return;
@@ -695,9 +847,15 @@ impl MailApp {
         };
         self.sending = true;
         let account_id = a.id.clone();
+        let follow_up = draft.follow_up;
         self.task(
             cx,
-            move |b| b.send_noting(&a, &draft),
+            move |b| {
+                // Its saves first: sending discards the draft, and a save
+                // landing after would bring it back.
+                super::composer::wait_for_draft_writes(None);
+                b.send_noting(&a, &draft)
+            },
             move |this, result, cx| {
                 let gone = result
                     .as_ref()
@@ -715,13 +873,23 @@ impl MailApp {
                         this.reverse_contacts =
                             Arc::new(fwd::reverse_contacts(&this.backend.store));
                         this.outbox.retain(|o| o.id != id);
-                        if notes.is_empty() {
-                            this.notice("Message sent", false, cx);
+                        if notes.is_empty() && follow_up.is_some() {
+                            this.notice(t!("compose-message-sent-waiting"), false, cx);
+                        } else if notes.is_empty() {
+                            this.notice(t!("compose-message-sent"), false, cx);
                         } else {
-                            this.notice(format!("Message sent. {}", notes.join(" ")), false, cx);
+                            this.notice(
+                                t!("compose-message-sent-2", notes = notes.join(" ")),
+                                false,
+                                cx,
+                            );
                         }
                         this.refresh_drafts(cx);
                         this.sync_drafts_soon(&account_id, cx);
+                        // Waited on for a reply: Waiting For lists it.
+                        if follow_up.is_some() {
+                            this.recheck_follow_ups(cx);
+                        }
                     }
                     (Err(_), Some(gone)) => this.alias_gone(id, gone, cx),
                     (Err(e), None) => this.send_failed(id, format!("{e:#}"), cx),
@@ -730,6 +898,158 @@ impl MailApp {
             },
         );
         cx.notify();
+    }
+
+    /// Sends a mail merge's messages one after another, a moment apart (as
+    /// servers limit how fast mail may go), the composer saying how far it
+    /// got. Closing the composer doesn't stop it, and what's left is kept:
+    /// quitting, the rest go when Picacho starts again. All sent, the draft
+    /// goes; otherwise it stays, saying to whom they couldn't be sent.
+    fn merge_send(&mut self, composer: Entity<Composer>, drafts: Vec<Draft>, cx: &mut Context<Self>) {
+        if self.merge_queue.is_some() {
+            composer.update(cx, |c, cx| {
+                c.error = Some(t!("compose-merge-already-sending").into());
+                cx.notify();
+            });
+            return;
+        }
+        let (id, account) = {
+            let d = &composer.read(cx).draft;
+            (d.id.clone(), d.account.clone())
+        };
+        let queue = crate::manage::authoring::merge::Queue { draft: id, account, total: drafts.len(), remaining: drafts, failed: vec![] };
+        if let Err(e) = queue.save(&self.backend.store) {
+            composer.update(cx, |c, cx| {
+                c.error = Some(format!("{e:#}"));
+                cx.notify();
+            });
+            return;
+        }
+        composer.update(cx, |c, cx| {
+            c.save_now(cx);
+            c.sending = true;
+            c.error = None;
+            c.merge_progress = Some((0, queue.total));
+            cx.notify();
+        });
+        self.merge_queue = Some(queue);
+        self.merge_composer = Some(composer);
+        self.merge_next(true, cx);
+    }
+
+    /// A mail merge left unfinished when Picacho last stopped: the rest go.
+    pub(super) fn resume_merge(&mut self, cx: &mut Context<Self>) {
+        if self.merge_queue.is_some() {
+            return;
+        }
+        let Some(queue) = crate::manage::authoring::merge::Queue::load(&self.backend.store) else { return };
+        let left = queue.remaining.len();
+        if left > 0 {
+            self.notice(t!("compose-merge-resuming", count = left), false, cx);
+        }
+        self.merge_composer = self.composers.iter().find(|c| c.read(cx).draft.id == queue.draft).cloned();
+        self.merge_queue = Some(queue);
+        self.merge_next(true, cx);
+    }
+
+    fn merge_next(&mut self, first: bool, cx: &mut Context<Self>) {
+        let Some(queue) = &self.merge_queue else { return };
+        let Some(d) = queue.remaining.first().cloned() else {
+            return self.merge_done(cx);
+        };
+        let (total, left) = (queue.total, queue.remaining.len());
+        let Some(a) = self.accounts.iter().find(|a| a.id == queue.account).or(self.accounts.first()).cloned() else {
+            // Without an account, nothing more can go.
+            let error = t!("compose-connect-an-account-before-sending-your");
+            if let Some(q) = &mut self.merge_queue {
+                for d in q.remaining.drain(..) {
+                    q.failed.push(format!("{} ({error})", d.to));
+                }
+            }
+            return self.merge_done(cx);
+        };
+        if let Some(c) = &self.merge_composer {
+            c.update(cx, |c, cx| {
+                c.merge_progress = Some((total - left, total));
+                cx.notify();
+            });
+        }
+        let d = Draft { account: a.id.clone(), ..d };
+        let to = d.to.clone();
+        self.task(
+            cx,
+            move |b| {
+                if first {
+                    super::composer::wait_for_draft_writes(None);
+                }
+                use crate::manage::authoring::merge::Queue;
+                Queue::take(&b.store, &d.id)?;
+                let result = b.send_noting(&a, &d).map(|_| ()).map_err(|e| format!("{e:#}"));
+                Queue::done(&b.store, &to, result.clone().err())?;
+                Ok((to, result))
+            },
+            move |this, result, cx| {
+                let failure = match result {
+                    Ok((_, Ok(()))) => None,
+                    Ok((to, Err(e))) => Some(format!("{to} ({e})")),
+                    // Keeping the queue failed: stop here, as kept.
+                    Err(e) => {
+                        this.merge_queue = None;
+                        this.merge_composer = None;
+                        this.notice(format!("{e:#}"), true, cx);
+                        return;
+                    }
+                };
+                let more = this.merge_queue.as_mut().is_some_and(|q| {
+                    q.remaining.remove(0);
+                    q.failed.extend(failure);
+                    !q.remaining.is_empty()
+                });
+                if !more {
+                    return this.merge_next(false, cx);
+                }
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(800)).await;
+                    let _ = this.update(cx, |this, cx| this.merge_next(false, cx));
+                })
+                .detach();
+            },
+        );
+    }
+
+    fn merge_done(&mut self, cx: &mut Context<Self>) {
+        let Some(queue) = self.merge_queue.take() else { return };
+        let composer = self.merge_composer.take();
+        let _ = crate::manage::authoring::merge::Queue::clear(&self.backend.store);
+        let (count, failed) = (queue.total, queue.failed);
+        let open = composer.as_ref().is_some_and(|c| self.composers.contains(c));
+        if failed.is_empty() {
+            let backend = self.backend.clone();
+            let id = queue.draft.clone();
+            drop(super::composer::queue_draft_write(move || backend.discard_draft(&id)));
+            if let Some(c) = &composer {
+                self.close_composer(c, cx);
+            }
+            self.notice(t!("compose-merge-sent", count = count), false, cx);
+        } else {
+            let sent = count.saturating_sub(failed.len());
+            let error = t!("compose-merge-some-failed", sent = sent, count = count, failed = failed.join("; "));
+            if let Some(c) = &composer {
+                c.update(cx, |c, cx| {
+                    c.sending = false;
+                    c.merge_progress = None;
+                    c.error = Some(error.clone());
+                    cx.notify();
+                });
+            }
+            // Closed meanwhile (or after a restart): the draft waits in
+            // Drafts, and this says why.
+            if !open {
+                self.notice(error, true, cx);
+            }
+        }
+        self.refresh_drafts(cx);
+        self.sync_drafts_soon(&queue.account, cx);
     }
 
     /// Puts a checked draft aside to be sent at `at` (Send Later): it is
@@ -741,12 +1061,52 @@ impl MailApp {
             c.save_now(cx);
         });
         let account = composer.read(cx).draft.account.clone();
-        self.scheduled_retry.remove(&composer.read(cx).draft.id);
+        let id = composer.read(cx).draft.id.clone();
+        self.scheduled_retry.remove(&id);
         self.close_composer(&composer, cx);
         let when = crate::manage::composing::describe_later(at, chrono::Local::now());
-        self.notice(format!("Scheduled to send {when}."), false, cx);
+        self.notice(t!("compose-scheduled-to-send", when = when), false, cx);
         self.refresh_drafts(cx);
         self.sync_drafts_soon(&account, cx);
+        // Handed to a server that holds it until then, where the account
+        // lets it; otherwise it stays scheduled here.
+        if let Some(a) = self
+            .accounts
+            .iter()
+            .find(|a| a.id == account && a.server_send_later)
+            .cloned()
+        {
+            self.scheduled_sending.insert(id.clone());
+            let handed = id.clone();
+            self.task(
+                cx,
+                move |b| b.hand_to_server(&a, &handed),
+                move |this, result, cx| {
+                    match result {
+                        Ok(true) => {
+                            this.notice(
+                                t!("compose-handed-to-the-server-which-sends", when = when),
+                                false,
+                                cx,
+                            );
+                            this.recheck_follow_ups(cx);
+                        }
+                        Ok(false) => {}
+                        Err(e) => this.notice(
+                            t!(
+                                "compose-the-server-couldnt-take-it-picacho",
+                                e = format!("{:#}", e),
+                                when = when
+                            ),
+                            true,
+                            cx,
+                        ),
+                    }
+                    this.scheduled_sending.remove(&id);
+                    this.refresh_drafts(cx);
+                },
+            );
+        }
     }
 
     /// Sends the scheduled drafts whose time has come, except any open in
@@ -755,6 +1115,8 @@ impl MailApp {
     /// passed while Picacho wasn't running go at the next check after it
     /// starts.
     pub(super) fn send_due(&mut self, cx: &mut Context<Self>) {
+        // A mail merge Picacho stopped in the middle of goes on.
+        self.resume_merge(cx);
         let mut open: HashSet<String> = self
             .composers
             .iter()
@@ -767,7 +1129,10 @@ impl MailApp {
         );
         self.task(
             cx,
-            |b| b.store.scheduled_drafts(),
+            |b| {
+                super::composer::wait_for_draft_writes(None);
+                b.store.scheduled_drafts()
+            },
             move |this, result, cx| {
                 let Ok(drafts) = result else {
                     return;
@@ -795,7 +1160,7 @@ impl MailApp {
 
     fn send_scheduled(&mut self, d: Draft, cx: &mut Context<Self>) {
         let Some(a) = self.accounts.iter().find(|a| a.id == d.account).cloned() else {
-            self.schedule_failed(d.id, "Its account was removed.".into(), cx);
+            self.schedule_failed(d.id, t!("compose-its-account-was-removed").into(), cx);
             return;
         };
         if self.account_blocked(&a.id) {
@@ -806,7 +1171,10 @@ impl MailApp {
         self.scheduled_sending.insert(id.clone());
         self.task(
             cx,
-            move |b| b.send_scheduled(&a, &d.id),
+            move |b| {
+                super::composer::wait_for_draft_writes(None);
+                b.send_scheduled(&a, &d.id)
+            },
             move |this, result, cx| {
                 this.scheduled_sending.remove(&id);
                 match result {
@@ -816,7 +1184,7 @@ impl MailApp {
                     Ok(Some((_, notes))) => {
                         this.scheduled_retry.remove(&id);
                         this.notice(
-                            format!("Scheduled message sent. {}", notes.join(" "))
+                            t!("compose-scheduled-message-sent", notes = notes.join(" "))
                                 .trim()
                                 .to_owned(),
                             false,
@@ -825,6 +1193,7 @@ impl MailApp {
                         this.alias_routes = fwd::routes(&this.backend.store);
                         this.refresh_drafts(cx);
                         this.sync_drafts_soon(&account_id, cx);
+                        this.recheck_follow_ups(cx);
                     }
                     // Offline, or the server's away: nothing went; try again
                     // in a few minutes.
@@ -844,7 +1213,7 @@ impl MailApp {
         self.scheduled_retry.remove(&id);
         self.backend.schedule_failed(&id, &error);
         self.notice(
-            format!("A scheduled message wasn't sent: {error} It's in Drafts."),
+            t!("compose-a-scheduled-message-wasnt-sent-its", error = error),
             true,
             cx,
         );
@@ -877,7 +1246,11 @@ impl MailApp {
         }
         self.send_failed(
             id,
-            format!("{gone} From was reset to {from}."),
+            t!(
+                "compose-from-was-reset-to",
+                gone = gone.to_string(),
+                from = from
+            ),
             cx,
         );
         // It was out of the list of open composers while sending.
@@ -945,7 +1318,9 @@ impl MailApp {
                         let d = &composer.read(cx).draft;
                         (d.id.clone(), d.account.clone())
                     };
-                    let _ = this.backend.discard_draft(&id);
+                    // After its saves, in order (`queue_draft_write`).
+                    let backend = this.backend.clone();
+                    drop(super::composer::queue_draft_write(move || backend.discard_draft(&id)));
                     this.close_composer(&composer, cx);
                     this.refresh_drafts(cx);
                     this.sync_drafts_soon(&account, cx);
@@ -960,6 +1335,9 @@ impl MailApp {
                     this.pending_new_alias = Some((service.clone(), mailbox.clone()));
                 }
                 ComposerEvent::Schedule(at) => this.schedule_send(composer, *at, cx),
+                ComposerEvent::SaveTemplate(t) => this.save_template(t.clone(), cx),
+                ComposerEvent::Merge(drafts) => this.merge_send(composer, drafts.clone(), cx),
+                ComposerEvent::SaveSnippet(snippet) => this.save_snippet(snippet.clone(), cx),
             }
             cx.notify();
         });
@@ -1097,9 +1475,9 @@ impl MailApp {
                 .text_size(px(13.))
                 .child(spinner(14., c.bg))
                 .child(if count > 1 {
-                    format!("Sending {count} messages…")
+                    t!("compose-sending-messages", count = count)
                 } else {
-                    "Sending…".to_string()
+                    t!("compose-sending").to_string()
                 })
                 .when(waiting, |d| {
                     d.child(
@@ -1115,7 +1493,7 @@ impl MailApp {
                             .text_color(rgb(c.soft))
                             .cursor_pointer()
                             .hover(|s| s.opacity(0.8))
-                            .child("Undo")
+                            .child(t!("compose-undo"))
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 this.handle(Action::UndoSend(id), w, cx)
                             })),
@@ -1262,6 +1640,44 @@ pub(super) fn identity_addressed<'a>(
         .find(|i| addressed.contains(&i.email.to_lowercase()))
 }
 
+/// Everyone in `messages`, newest first, up to 2,000, but those in `own`
+/// (lowercase). Recipient lists already read are skipped: mail from lists
+/// is sent to the same few addresses over and over, and parsing every
+/// list of tens of thousands of messages took most of the time.
+pub(super) fn gather_contacts(messages: &[Mail], own: &[String]) -> Vec<(String, String)> {
+    let own: HashSet<&str> = own.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    let mut lists_read: HashSet<&str> = HashSet::new();
+    let mut out = vec![];
+    let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
+    by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
+    for m in by_date {
+        let mut people = vec![(m.sender.clone(), m.from.clone())];
+        for list in [m.to.as_str(), m.cc()] {
+            if !lists_read.insert(list) {
+                continue;
+            }
+            if let Ok(parsed) = crate::sync::smtp::recipients(list) {
+                people.extend(
+                    parsed
+                        .into_iter()
+                        .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
+                );
+            }
+        }
+        for (name, email) in people {
+            let key = email.to_lowercase();
+            if email.contains('@') && !own.contains(key.as_str()) && seen.insert(key) {
+                out.push((name, email));
+            }
+        }
+        if out.len() >= 2000 {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,42 +1789,4 @@ mod tests {
         );
         assert!(alias_addressed(&Mail::default(), &aliases).is_none());
     }
-}
-
-/// Everyone in `messages`, newest first, up to 2,000, but those in `own`
-/// (lowercase). Recipient lists already read are skipped: mail from lists
-/// is sent to the same few addresses over and over, and parsing every
-/// list of tens of thousands of messages took most of the time.
-pub(super) fn gather_contacts(messages: &[Mail], own: &[String]) -> Vec<(String, String)> {
-    let own: HashSet<&str> = own.iter().map(String::as_str).collect();
-    let mut seen = HashSet::new();
-    let mut lists_read: HashSet<&str> = HashSet::new();
-    let mut out = vec![];
-    let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
-    by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
-    for m in by_date {
-        let mut people = vec![(m.sender.clone(), m.from.clone())];
-        for list in [m.to.as_str(), m.cc()] {
-            if !lists_read.insert(list) {
-                continue;
-            }
-            if let Ok(parsed) = crate::sync::smtp::recipients(list) {
-                people.extend(
-                    parsed
-                        .into_iter()
-                        .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
-                );
-            }
-        }
-        for (name, email) in people {
-            let key = email.to_lowercase();
-            if email.contains('@') && !own.contains(key.as_str()) && seen.insert(key) {
-                out.push((name, email));
-            }
-        }
-        if out.len() >= 2000 {
-            break;
-        }
-    }
-    out
 }

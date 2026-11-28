@@ -550,6 +550,7 @@ fn banner_actions_stay_inside_their_banners_as_the_reader_narrows(cx: &mut TestA
                 until: chrono::Local::now().timestamp() + 3 * 86_400,
                 folder: "Snoozed".into(),
                 ids: vec![],
+                changed: 0,
             }],
         );
         this.selected = Some(m.id.clone());
@@ -685,4 +686,171 @@ fn a_long_press_selects_a_word_in_an_email_and_offers_to_copy_it(cx: &mut TestAp
             "the pressed word is offered to copy"
         );
     });
+}
+
+#[test]
+fn text_zoom_steps_like_a_browsers_and_stops_at_its_ends() {
+    assert_eq!(next_text_zoom(1., 1), 1.1);
+    assert_eq!(next_text_zoom(1.1, -1), 1.);
+    assert_eq!(next_text_zoom(2., 1), 3.);
+    assert_eq!(next_text_zoom(3., 1), 3., "no larger than 300%");
+    assert_eq!(next_text_zoom(0.5, -1), 0.5, "no smaller than 50%");
+    assert_eq!(next_text_zoom(1.75, 0), 1.);
+    assert_eq!(
+        next_text_zoom(1.3, 1),
+        1.1,
+        "a zoom between steps moves from 100%"
+    );
+}
+
+/// Touch screens have no ⌘+ and ⌘−: the email's menu (a long press, or a
+/// secondary click) zooms it, with the same steps and the same saved zoom.
+#[gpui::test]
+fn the_emails_menu_zooms_its_text(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html =
+            Some("<body style=\"margin:0\"><p style=\"height:300px\">Hello</p></body>".into());
+        this.selected = Some(this.messages[0].id.clone());
+        cx.notify();
+    });
+    let settle = |cx: &mut VisualTestContext| {
+        for _ in 0..15 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame(cx);
+            cx.run_until_parked();
+        }
+    };
+    settle(cx);
+    let choose = |label: &str, cx: &mut VisualTestContext| {
+        let email = cx.debug_bounds("html-email").expect("the email is shown");
+        let at = point(email.left() + px(40.), email.top() + px(30.));
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        settle(cx);
+        let (index, labels) = view.read_with(cx, |this, _| {
+            let menu = this.menu.as_ref().expect("the email's menu opens");
+            let labels: Vec<String> = menu
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    Entry::Separator => None,
+                })
+                .collect();
+            let index = menu
+                .entries
+                .iter()
+                .position(|e| matches!(e, Entry::Item { label: l, .. } if l.as_ref() == label));
+            (index, labels)
+        });
+        let index = index.unwrap_or_else(|| panic!("{label} in {labels:?}"));
+        let item: &'static str = Box::leak(format!("menu-item-{index}").into_boxed_str());
+        let item = cx.debug_bounds(item).expect("the menu is drawn").center();
+        cx.simulate_mouse_move(item, None, Modifiers::none());
+        cx.simulate_click(item, Modifiers::none());
+        settle(cx);
+        labels
+    };
+    let zoom = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |this, cx| this.html_view.read(cx).text_zoom())
+    };
+    let labels = choose("Larger Text", cx);
+    assert!(
+        !labels.iter().any(|l| l == "Actual Size"),
+        "at 100%: {labels:?}"
+    );
+    assert_eq!(zoom(cx), 1.1);
+    choose("Larger Text", cx);
+    assert_eq!(zoom(cx), 1.25);
+    assert_eq!(
+        store.preference(TEXT_ZOOM).as_deref(),
+        Some("1.25"),
+        "kept for every email"
+    );
+    choose("Smaller Text", cx);
+    assert_eq!(zoom(cx), 1.1);
+    choose("Actual Size", cx);
+    assert_eq!(zoom(cx), 1.);
+    view.read_with(cx, |this, _| assert!(this.menu.is_none()));
+}
+
+/// A downloaded delivery report (RFC 3464) shows each recipient's outcome
+/// above its text; an ordinary message shows no such panel.
+#[gpui::test]
+fn delivery_reports_show_each_recipients_outcome(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let ids = view.update_in(cx, |this, _, _| {
+        this.messages.iter().take(2).map(|m| m.id.clone()).collect::<Vec<_>>()
+    });
+    let source = b"From: MAILER-DAEMON@mx.example\r\nSubject: Undelivered\r\nContent-Type: multipart/report; report-type=delivery-status; boundary=z\r\n\r\n--z\r\nContent-Type: text/plain\r\n\r\nIt failed.\r\n--z\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; mx.example\r\n\r\nFinal-Recipient: rfc822; gone@example.org\r\nAction: failed\r\nStatus: 5.1.1\r\nDiagnostic-Code: smtp; 550 5.1.1 User unknown\r\n\r\n--z--\r\n";
+    store.save_raw(&ids[0], source).unwrap();
+    view.update_in(cx, |this, _, cx| this.reload_cached(cx));
+    let show = |cx: &mut VisualTestContext, id: &str| {
+        view.update_in(cx, |this, _, cx| {
+            this.selected = Some(id.to_owned());
+            cx.notify();
+        });
+        for _ in 0..4 {
+            frame(cx);
+            cx.run_until_parked();
+        }
+    };
+    show(cx, &ids[0]);
+    assert!(cx.debug_bounds("delivery-report").is_some());
+    view.read_with(cx, |this, _| {
+        let report = this.delivery_reports[&ids[0]].as_ref().unwrap();
+        assert_eq!(report.recipients[0].recipient, "gone@example.org");
+        assert_eq!(report.recipients[0].diagnostic, "550 5.1.1 User unknown");
+    });
+    show(cx, &ids[1]);
+    assert!(cx.debug_bounds("delivery-report").is_none());
+}
+
+/// Drawn again (a hover, a scroll, a spinner), the reader hands the HTML
+/// view the HTML it prepared once, which the view knows by its pointer: the
+/// document isn't started again, nor the HTML compared. Changed, it is.
+#[gpui::test]
+fn the_reader_hands_the_same_html_to_the_view_each_frame(cx: &mut TestAppContext) {
+    let (view, cx, _store) = two_accounts(cx);
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html = Some("<p>First version of a long message</p>".into());
+        this.selected = Some(this.messages[0].id.clone());
+        cx.notify();
+    });
+    frame(cx);
+    frame(cx);
+    let prepared = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |this, _| this.prepared_html.borrow().as_ref().map(|p| p.1.clone()).unwrap())
+    };
+    let html = prepared(&view, cx);
+    let (started, same) = view.read_with(cx, |this, cx| this.html_view.read(cx).started(&html));
+    assert!(same, "the view holds the reader's HTML itself");
+    for _ in 0..3 {
+        view.update(cx, |_, cx| cx.notify());
+        frame(cx);
+    }
+    assert_eq!(view.read_with(cx, |this, cx| this.html_view.read(cx).started(&html)), (started, true));
+    // Changed: a new document.
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html = Some("<p>Second version, longer than the first one</p>".into());
+        cx.notify();
+    });
+    frame(cx);
+    let next = prepared(&view, cx);
+    let (later, same) = view.read_with(cx, |this, cx| this.html_view.read(cx).started(&next));
+    assert!(same && later > started);
 }

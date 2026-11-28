@@ -27,7 +27,7 @@ impl Backend {
     /// `source` records where it came from ("custom", "preset", "google",
     /// "gravatar"); any but "google" stops the Google picture replacing it.
     pub fn set_avatar(&self, id: &str, bytes: &[u8], source: &str) -> Result<PathBuf> {
-        let image = image::load_from_memory(bytes).context("This image could not be read.")?;
+        let image = image::load_from_memory(bytes).with_context(|| t!("manage-avatar-this-image-could-not-be-read"))?;
         let square = image.resize_to_fill(SIZE, SIZE, image::imageops::FilterType::Lanczos3);
         let dir = self.store.path.join("avatars");
         std::fs::create_dir_all(&dir)?;
@@ -122,6 +122,8 @@ mod tests {
         assert!(backend.set_avatar("a", b"not an image", "custom").is_err());
         backend.remove_avatar("a")?;
         assert_eq!(backend.avatar("a"), None);
+        // Closes the database first: Windows can't delete an open file.
+        drop(backend);
         std::fs::remove_dir_all(path)?;
         Ok(())
     }

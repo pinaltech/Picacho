@@ -19,7 +19,12 @@ pub(super) struct MessageWindow {
     focus: FocusHandle,
     /// The link under the pointer, shown at the bottom left.
     hovered: Option<String>,
+    /// The HTML as shown (quotes hidden, alias and codes masked), with what
+    /// it was made from: made again on every frame, it was the whole body
+    /// read and copied several times over for each move of the pointer.
+    shown_html: Option<(u64, Rc<String>, bool)>,
     _links: Subscription,
+    _reveals: Subscription,
 }
 
 impl MessageWindow {
@@ -48,10 +53,25 @@ impl MessageWindow {
                 } else {
                     url.clone()
                 };
-                if let Some(url) = crate::display::html::openable_url(&url) {
-                    cx.open_url(url.as_str());
+                if let Some(parsed) = crate::display::html::openable_url(&url) {
+                    // A link with a known trick (a lookalike name, plain
+                    // http…) gets the main window's warning, as the
+                    // reader's does, unless its site is trusted there.
+                    if !super::links::link_dangers(&parsed).is_empty()
+                        && let Some(app) = this.app.upgrade()
+                    {
+                        app.update(cx, |app, cx| app.open_email_link(url, cx));
+                        let _ = this.main.update(cx, |_, w, _| w.activate_window());
+                    } else {
+                        cx.open_url(parsed.as_str());
+                    }
                 }
             }
+        });
+        // A `#` link's target, or what Tab focused.
+        let reveals = cx.subscribe(&html, |this, _, reveal: &HtmlReveal, cx| {
+            crate::display::html::scroll_to_reveal(&this.scroll, reveal);
+            cx.notify();
         });
         Self {
             mail,
@@ -67,7 +87,9 @@ impl MessageWindow {
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             hovered: None,
+            shown_html: None,
             _links: links,
+            _reveals: reveals,
         }
     }
 
@@ -117,6 +139,9 @@ impl MessageWindow {
 impl Render for MessageWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors;
+        if super::applock::covered(cx) {
+            return super::applock::cover(c, window);
+        }
         let m = &self.mail;
         // Sign-in codes found by Local AI are hidden here too.
         let codes = self
@@ -125,7 +150,7 @@ impl Render for MessageWindow {
             .map(|app| app.read(cx).hidden_codes(m))
             .unwrap_or_default();
         let subject = crate::manage::local_ai::otp::mask(&m.subject, &codes).into_owned();
-        window.set_window_title(&subject);
+        super::window::set_title(window, &subject);
         // A mailbox kept to its aliases shows the alias used in its place.
         let mask = self.app.upgrade().and_then(|app| app.read(cx).mask_for(m));
         let (sender, from) = match &mask {
@@ -158,20 +183,34 @@ impl Render for MessageWindow {
         } else if self.options.html
             && let Some(html) = &m.html
         {
-            let hidden = super::thread::hide_html_quotes(html);
-            has_quotes = hidden.is_some();
-            let shown = match &hidden {
-                Some(h) if !self.quotes_open => h.as_str(),
-                _ => html.as_str(),
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // The window's message is fixed (its HTML with it): what it
+                // is shown with is what can change. The length too, should it
+                // be filled in (downloaded) later.
+                (html.len(), &m.id, self.quotes_open, codes.as_slice(), mask.is_some()).hash(&mut h);
+                h.finish()
             };
-            let masked = mask.as_ref().map(|k| k.apply(shown));
-            let shown = masked.as_deref().unwrap_or(shown);
-            let shown = crate::manage::local_ai::otp::mask_html(shown, &codes);
-            let shown = shown.as_ref();
+            if self.shown_html.as_ref().is_none_or(|(k, ..)| *k != key) {
+                let hidden = super::thread::hide_html_quotes(html);
+                let quotes = hidden.is_some();
+                let shown = match &hidden {
+                    Some(h) if !self.quotes_open => h.as_str(),
+                    _ => html.as_str(),
+                };
+                let masked = mask.as_ref().map(|k| k.apply(shown));
+                let shown = masked.as_deref().unwrap_or(shown);
+                let shown = Rc::new(crate::manage::local_ai::otp::mask_html(shown, &codes).into_owned());
+                self.shown_html = Some((key, shown, quotes));
+            }
+            let (_, shown, quotes) = self.shown_html.as_ref().expect("made above");
+            has_quotes = *quotes;
+            let shown = shown.clone();
             let blocked = self.options.block_remote;
             let clean = self.clean_links(cx);
             self.html.update(cx, |view, cx| {
-                view.set_content(shown, &m.inline, blocked, dark, clean, cx)
+                view.set_content(&shown, &m.inline, blocked, dark, clean, cx)
             });
             body = body.child(self.html.clone());
         } else {
@@ -221,9 +260,9 @@ impl Render for MessageWindow {
                         .cursor_pointer()
                         .child("•••")
                         .child(if open {
-                            "Hide quoted text"
+                            t!("message-window-hide-quoted-text")
                         } else {
-                            "Show quoted text"
+                            t!("message-window-show-quoted-text")
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.quotes_open = !this.quotes_open;
@@ -246,7 +285,7 @@ impl Render for MessageWindow {
                 .border_color(rgb(c.border))
                 .text_size(px(12.))
                 .child(icon_el("paperclip", 14., c.muted))
-                .child(format!("{}  ·  {} KB", a.name, a.size / 1024))
+                .child(format!("{}  ·  {}", a.name, human_size(a.size as u64)))
         });
         let toolbar = super::window::detached_bar("message-titlebar", c)
             .child(icon_el("mail", 15., c.muted))
@@ -259,14 +298,14 @@ impl Render for MessageWindow {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(subject.clone()),
             )
-            .child(self.button("w-reply", "Reply", "reply", cx, |t, _, cx| t.reply(1, cx)))
+            .child(self.button("w-reply", t!("message-window-reply"), "reply", cx, |t, _, cx| t.reply(1, cx)))
             .child(
-                self.button("w-reply-all", "Reply all", "reply-all", cx, |t, _, cx| {
+                self.button("w-reply-all", t!("message-window-reply-all"), "reply-all", cx, |t, _, cx| {
                     t.reply(2, cx)
                 }),
             )
             .child(
-                self.button("w-forward", "Forward", "forward", cx, |t, _, cx| {
+                self.button("w-forward", t!("message-window-forward"), "forward", cx, |t, _, cx| {
                     t.reply(3, cx)
                 }),
             )
@@ -275,9 +314,9 @@ impl Render for MessageWindow {
                 d.child(self.button(
                     "w-remote",
                     if blocked {
-                        "Load images"
+                        t!("message-window-load-images")
                     } else {
-                        "Block images"
+                        t!("message-window-block-images")
                     },
                     if blocked { "image-off" } else { "image" },
                     cx,
@@ -328,7 +367,13 @@ impl Render for MessageWindow {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(avatar(&m.initials(), 40., 0, c))
+                            .child(sender_picture(
+                                &m.initials(),
+                                self.app.upgrade().and_then(|app| app.read(cx).brand_marks.get(&m.id).cloned()).as_ref(),
+                                40.,
+                                0,
+                                c,
+                            ))
                             .child(
                                 div()
                                     .flex_1()
@@ -356,15 +401,11 @@ impl Render for MessageWindow {
                                     )
                                     .child(
                                         div().text_size(px(11.)).text_color(rgb(c.muted)).child(
-                                            format!(
-                                                "to {}{}",
-                                                to.join(", "),
-                                                if cc.is_empty() {
-                                                    String::new()
-                                                } else {
-                                                    format!(" · cc {}", cc.join(", "))
-                                                }
-                                            ),
+                                            if cc.is_empty() {
+                                                t!("message-window-to", to = to.join(", "))
+                                            } else {
+                                                t!("message-window-to-cc", to = to.join(", "), cc = cc.join(", "))
+                                            },
                                         ),
                                     ),
                             )
@@ -384,6 +425,7 @@ impl Render for MessageWindow {
                     .as_deref()
                     .map(|url| super::links::link_status_pill(url, c)),
             ))
+            .into_any_element()
     }
 }
 
@@ -426,6 +468,41 @@ impl MailApp {
         } else {
             mail
         };
+        self.show_mail_window(mail, w, cx);
+    }
+
+    /// Opens an email file (.eml or Outlook .msg) in a message window of its
+    /// own, as when one is opened from the system's file manager.
+    pub(super) fn open_eml_file(&mut self, path: &std::path::Path, w: &mut Window, cx: &mut Context<Self>) {
+        // Read and parsed off the UI thread: an email file can be large, and
+        // an Outlook .msg is converted first.
+        let path = path.to_path_buf();
+        cx.spawn_in(w, async move |this, cx| {
+            let file = path.clone();
+            let parsed = cx
+                .background_executor()
+                .spawn(async move {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_email_file(&file)))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, w, cx| match parsed {
+                Ok(mut mail) => {
+                    mail.unread = false;
+                    this.show_mail_window(mail, w, cx);
+                }
+                Err(e) => this.notice(
+                    t!("message-window-couldnt-open", path = path.display(), e = format!("{:#}", e)),
+                    true,
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    fn show_mail_window(&mut self, mail: Mail, w: &mut Window, cx: &mut Context<Self>) {
+        let id = mail.id.clone();
         let options = self.reading_options(&mail);
         let (app, main, colors, dark) = (
             cx.weak_entity(),
@@ -484,5 +561,65 @@ impl MailApp {
                 },
             );
         }
+    }
+}
+
+/// The largest email file opened, and the largest a converted Outlook
+/// .msg may become: the largest message the cache reads back.
+const MAX_EMAIL_FILE: u64 = crate::manage::store::MAX_SOURCE;
+/// The largest Outlook .msg file opened: converting one reads its streams,
+/// perhaps several times over, before the message is written.
+const MAX_MSG_FILE: u64 = 64 * 1024 * 1024;
+
+/// An email file (.eml, or Outlook's .msg converted) read as a message.
+/// Its size is checked before it is read, on the file opened (not its
+/// name, which could be another file by then), and it is read no further
+/// than the limit, however it grows meanwhile.
+fn read_email_file(path: &std::path::Path) -> anyhow::Result<Mail> {
+    use std::io::Read as _;
+    let named_msg = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("msg"));
+    let file = std::fs::File::open(path)?;
+    let limit = if named_msg { MAX_MSG_FILE } else { MAX_EMAIL_FILE };
+    let size = file.metadata()?.len();
+    anyhow::ensure!(size <= limit, t!("message-window-the-file-is-too-large"));
+    let mut raw = Vec::with_capacity(size as usize);
+    file.take(limit + 1).read_to_end(&mut raw)?;
+    anyhow::ensure!(raw.len() as u64 <= limit, t!("message-window-the-file-is-too-large"));
+    let raw = if crate::sync::msg::is_msg(&raw) || named_msg {
+        anyhow::ensure!(raw.len() as u64 <= MAX_MSG_FILE, t!("message-window-the-file-is-too-large"));
+        crate::sync::msg::to_eml_within(&raw, MAX_EMAIL_FILE as usize)?
+    } else {
+        raw
+    };
+    let mut account = Account::new(Provider::Imap);
+    account.id = String::new();
+    let id = format!("file:{}", path.display());
+    crate::sync::mime::parse_message(&raw, &account, &id, Folder::Inbox, "", 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::prelude::v1::test;
+
+    /// An email file larger than may be opened is refused by its size,
+    /// before it is read (sparse files here, so nothing is written); one
+    /// within it opens.
+    #[test]
+    fn email_files_are_refused_by_size_before_being_read() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("picacho-eml-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let huge = dir.join("huge.eml");
+        std::fs::File::create(&huge)?.set_len(MAX_EMAIL_FILE + 1)?;
+        let err = read_email_file(&huge).unwrap_err();
+        assert_eq!(err.to_string(), t!("message-window-the-file-is-too-large"));
+        let msg = dir.join("large.msg");
+        std::fs::File::create(&msg)?.set_len(MAX_MSG_FILE + 1)?;
+        assert_eq!(read_email_file(&msg).unwrap_err().to_string(), t!("message-window-the-file-is-too-large"));
+        let small = dir.join("small.eml");
+        std::fs::write(&small, b"From: ana@example.com\r\nSubject: Hello\r\n\r\nHi\r\n")?;
+        assert_eq!(read_email_file(&small)?.subject, "Hello");
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

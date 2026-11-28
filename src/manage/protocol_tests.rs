@@ -205,6 +205,9 @@ fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
     });
     let (b, mut a, path) = backend(&cert)?;
     a.incoming_port = port;
+    // Every message downloads in the background, however old the fixed
+    // dates below are by the time this runs (the default is 30 days).
+    a.sync.offline_days = 0;
     let result = (|| -> Result<()> {
         let messages = b.sync(&a, Folder::Inbox, 300)?;
         assert_eq!(messages.len(), 1);
@@ -405,6 +408,191 @@ fn smtp_starttls_auth_delivery_and_attachment() -> Result<()> {
     Ok(())
 }
 
+/// An SMTP server over TLS that takes one message and hands it back.
+fn smtp_sink() -> Result<(Vec<u8>, u16, std::thread::JoinHandle<Vec<u8>>)> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"220 localhost ESMTP\r\n").unwrap();
+        let mut delivered = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let response = if line.starts_with("EHLO") {
+                "250-localhost\r\n250 AUTH PLAIN\r\n"
+            } else if line.starts_with("AUTH") {
+                "235 OK\r\n"
+            } else if line.starts_with("MAIL") || line.starts_with("RCPT") || line == "NOOP\r\n" {
+                "250 OK\r\n"
+            } else if line == "DATA\r\n" {
+                r.get_mut().write_all(b"354 Go\r\n").unwrap();
+                loop {
+                    let mut data = Vec::new();
+                    r.read_until(b'\n', &mut data).unwrap();
+                    if data == b".\r\n" {
+                        break;
+                    }
+                    if data.starts_with(b"..") {
+                        data.remove(0);
+                    }
+                    delivered.extend(data);
+                }
+                "250 Queued\r\n"
+            } else if line == "QUIT\r\n" {
+                r.get_mut().write_all(b"221 Bye\r\n").unwrap();
+                break;
+            } else {
+                panic!("Unexpected SMTP command: {line}")
+            };
+            r.get_mut().write_all(response.as_bytes()).unwrap();
+        }
+        delivered
+    });
+    Ok((cert, port, server))
+}
+
+/// OpenPGP end to end: a draft asking to be signed and encrypted goes out
+/// as PGP/MIME, and its copy in Sent opens again with the sender's key.
+#[test]
+fn openpgp_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
+    use crate::manage::openpgp::{Keyring, test_key};
+    use pgp::composed::SignedPublicKey;
+    let (cert, port, server) = smtp_sink()?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    a.smtp_tls = Some(true);
+    let me = test_key("QA <qa@example.com>", "");
+    let them = test_key("Rae <rae@example.com>", "");
+    let mut ring = Keyring::default();
+    ring.import(&me.to_armored_string(Default::default())?, "")?;
+    ring.import(&SignedPublicKey::from(them.clone()).to_armored_string(Default::default())?, "")?;
+    b.set_keyring(ring)?;
+    let d = Draft {
+        id: "pgp-test".into(),
+        account: a.id.clone(),
+        to: "Rae <rae@example.com>".into(),
+        subject: "Sealed".into(),
+        body: "Only Rae reads this.".into(),
+        sign: true,
+        encrypt: true,
+        encrypt_subject: true,
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let result = b.send(&a, &d);
+    let raw = server.join().unwrap();
+    result?;
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.contains("Subject: ...") && !text.contains("Sealed") && text.contains("multipart/encrypted"));
+    assert!(!text.contains("Only Rae reads this"));
+    // Rae's keys open it, and find it signed by QA.
+    let mut raes = Keyring::default();
+    raes.import(&them.to_armored_string(Default::default())?, "")?;
+    raes.import(&SignedPublicKey::from(me).to_armored_string(Default::default())?, "")?;
+    let (opened, verdict) = crate::manage::openpgp::open(&raw, &raes).unwrap();
+    assert!(verdict.decrypted);
+    assert_eq!(verdict.signature, crate::manage::openpgp::Signature::Good("QA <qa@example.com>".into()));
+    assert!(String::from_utf8_lossy(&opened).contains("Only Rae reads this."));
+    // The copy in Sent stays encrypted on disk and opens in the reader.
+    let sent = b.store.messages(&a.id, Folder::Sent, 10)?;
+    assert_eq!(sent.len(), 1);
+    assert!(!String::from_utf8_lossy(&b.store.raw(&sent[0].id)?.unwrap()).contains("Only Rae"));
+    let read = b.read(&a, &sent[0])?;
+    assert!(read.body.unwrap_or_default().contains("Only Rae reads this."));
+    assert!(b.store.message(&sent[0].id)?.unwrap().body.is_none(), "kept out of the cache");
+    // The hidden subject too: the cache keeps the envelope's, which is
+    // what snoozing would tell the server; lists get the real one back
+    // while the message is in memory.
+    assert_eq!(read.subject, "Sealed");
+    let kept = b.store.message(&sent[0].id)?.unwrap();
+    assert_eq!(kept.subject, "...");
+    assert_eq!(b.with_readable_previews(vec![kept])[0].subject, "Sealed");
+    assert!(b.verdict(&sent[0].id).unwrap().decrypted);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// An outgoing server taking TLS from the first byte on a port other than
+/// 465, chosen in its settings, and offering no sign-in (a relay that knows
+/// its senders by their network): the message goes without AUTH.
+#[test]
+fn smtp_tls_from_the_start_on_any_port_and_relays_without_auth() -> Result<()> {
+    let (cert, tls_acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r = BufReader::new(tls_acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"220 localhost ESMTP fixture\r\n").unwrap();
+        let mut commands = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            commands.push(line.trim_end().to_owned());
+            let response = if line.starts_with("EHLO") {
+                "250-localhost\r\n250 8BITMIME\r\n"
+            } else if line.starts_with("MAIL FROM:") || line.starts_with("RCPT TO:") {
+                "250 OK\r\n"
+            } else if line == "DATA\r\n" {
+                r.get_mut().write_all(b"354 Go ahead\r\n").unwrap();
+                loop {
+                    let mut data = Vec::new();
+                    r.read_until(b'\n', &mut data).unwrap();
+                    if data == b".\r\n" {
+                        break;
+                    }
+                }
+                "250 Queued\r\n"
+            } else if line == "QUIT\r\n" {
+                r.get_mut().write_all(b"221 Bye\r\n").unwrap();
+                break;
+            } else {
+                panic!("Unexpected SMTP command: {line}")
+            };
+            r.get_mut().write_all(response.as_bytes()).unwrap();
+        }
+        commands
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    a.smtp_tls = Some(true);
+    let d = Draft {
+        id: "smtp-tls".into(),
+        account: a.id.clone(),
+        to: "recipient@example.com".into(),
+        subject: "Implicit TLS".into(),
+        body: "Hello.".into(),
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let result = b.send(&a, &d);
+    let commands = server.join().unwrap();
+    result?;
+    assert!(commands[0].starts_with("EHLO"), "{commands:?}");
+    assert!(
+        !commands.iter().any(|c| c.starts_with("AUTH") || c == "STARTTLS"),
+        "{commands:?}"
+    );
+    assert!(commands.iter().any(|c| c == "DATA"));
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 #[test]
 fn pop3_tls_download_is_deduplicated_and_local_moves_survive_sync() -> Result<()> {
     let (cert, acceptor) = tls_fixture()?;
@@ -431,6 +619,8 @@ fn pop3_tls_download_is_deduplicated_and_local_moves_survive_sync() -> Result<()
                     b"+OK password\r\n".to_vec()
                 } else if line == "UIDL\r\n" {
                     b"+OK ids\r\n1 stable-uid\r\n.\r\n".to_vec()
+                } else if line == "LIST\r\n" {
+                    b"+OK sizes\r\n1 100\r\n.\r\n".to_vec()
                 } else if line == "RETR 1\r\n" {
                     downloads += 1;
                     [b"+OK message\r\n".as_slice(), MESSAGE, b".\r\n".as_slice()].concat()
@@ -787,7 +977,7 @@ fn imap_folder_delete_follows_the_servers_rights() -> Result<()> {
                 let (tag, command) = line.trim_end().split_once(' ').unwrap();
                 let upper = command.to_ascii_uppercase();
                 let mut out = String::new();
-                if upper.starts_with("LOGIN") {
+                if upper.starts_with("LOGIN") || upper.starts_with("UNSUBSCRIBE") {
                 } else if upper == "CAPABILITY" {
                     out.push_str("* CAPABILITY IMAP4rev1\r\n");
                 } else if upper.starts_with("LIST") {
@@ -877,7 +1067,7 @@ fn imap_folder_create_and_rename() -> Result<()> {
                 let upper = command.to_ascii_uppercase();
                 let mut out = String::new();
                 let unquote = |s: &str| s.trim_matches('"').to_owned();
-                if upper.starts_with("LOGIN") || upper.starts_with("SUBSCRIBE") {
+                if upper.starts_with("LOGIN") || upper.starts_with("SUBSCRIBE") || upper.starts_with("UNSUBSCRIBE") {
                 } else if upper == "CAPABILITY" {
                     out.push_str("* CAPABILITY IMAP4rev1\r\n");
                 } else if upper.starts_with("LIST") {
@@ -944,11 +1134,18 @@ fn imap_folder_create_and_rename() -> Result<()> {
         ..Mail::default()
     };
     b.store.save_messages(std::slice::from_ref(&cached))?;
+    b.store.save_raw(&cached.id, b"From: a@example.com\r\n\r\nKept.\r\n")?;
     let renamed = b.rename_remote_folder(&a, "Projects", "Work")?;
     assert_eq!(renamed.moved[0], ("Projects".into(), "Work".into()));
     assert!(renamed.moved.contains(&("Projects/2024".into(), "Work/2024".into())));
     assert!(renamed.folders.iter().any(|f| f.name == "Work/2025"));
-    assert!(b.store.message(&cached.id)?.is_none(), "its cached mail is forgotten");
+    // RFC 3501 §6.3.5: its UIDs survive, so its cache follows it, the
+    // folder inside it included, source and all.
+    assert!(b.store.message(&cached.id)?.is_none(), "not under the old name");
+    let kept = format!("{}:Work/2024:1:1", a.id);
+    let moved = b.store.message(&kept)?.expect("kept under the new name");
+    assert_eq!(moved.remote_folder, "Work/2024");
+    assert!(b.store.raw(&kept)?.is_some(), "nothing to download again");
     let standard = b.rename_remote_folder(&a, "Trash", "Bin").unwrap_err();
     assert!(format!("{standard:#}").contains("standard"), "{standard:#}");
     // Keeping the name changes nothing on the server.
@@ -1074,6 +1271,221 @@ fn imap_mail_moves_into_server_folders() -> Result<()> {
     Ok(())
 }
 
+/// RFC 8474 §4.1 with RFC 3501 §6.3.5: a folder another client renamed
+/// is recognized by its MAILBOXID when it is first checked under its new
+/// name. Its cache follows it, sources included, and nothing of it is
+/// downloaded again. A folder with another MAILBOXID is just new.
+#[test]
+fn folders_renamed_elsewhere_keep_their_cache_by_mailboxid() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut commands = Vec::new();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+        let mut selected = String::new();
+        loop {
+            let mut line = String::new();
+            if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                break;
+            }
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            let upper = command.to_ascii_uppercase();
+            commands.push(command.to_owned());
+            let mut out = String::new();
+            if upper.starts_with("LOGIN") {
+            } else if upper == "CAPABILITY" {
+                out.push_str("* CAPABILITY IMAP4rev1 OBJECTID\r\n");
+            } else if upper.starts_with("LIST") {
+                out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
+                out.push_str("* LIST () \"/\" \"New\"\r\n");
+                out.push_str("* LIST () \"/\" \"Fresh\"\r\n");
+            } else if upper.starts_with("SELECT") {
+                selected = command.split('"').nth(1).unwrap_or_default().to_owned();
+                let id = if selected == "New" { "F1" } else { "F9" };
+                out.push_str(&format!(
+                    "* 2 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 3] next\r\n* OK [MAILBOXID ({id})] id\r\n"
+                ));
+            } else if upper.starts_with("UID SEARCH") {
+                out.push_str("* SEARCH 1 2\r\n");
+            } else if upper.starts_with("UID FETCH") {
+                // Flags only, never a body: everything is cached already.
+                assert!(!upper.contains("BODY"), "{command}");
+                if selected == "New" {
+                    out.push_str("* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n* 2 FETCH (UID 2 FLAGS ())\r\n");
+                }
+            } else if upper.starts_with("LOGOUT") {
+                r.get_mut().write_all(format!("* BYE\r\n{tag} OK done\r\n").as_bytes()).unwrap();
+                break;
+            } else if upper.starts_with("NOOP") || upper.starts_with("ENABLE") || upper.starts_with("ID") {
+            } else {
+                // Other reads (headers of a new folder) are answered empty.
+            }
+            out.push_str(&format!("{tag} OK done\r\n"));
+            r.get_mut().write_all(out.as_bytes()).unwrap();
+        }
+        commands
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let mail = |uid: u32| Mail {
+        id: format!("{}:Old:42:{uid}", a.id),
+        account: a.id.clone(),
+        folder: Folder::Other,
+        remote_folder: "Old".into(),
+        uid,
+        date: 1_700_000_000 + i64::from(uid),
+        ..Mail::default()
+    };
+    b.store.save_messages(&[mail(1), mail(2)])?;
+    b.store.save_raw(&mail(1).id, b"From: a@example.com\r\n\r\nKept.\r\n")?;
+    b.store.save_mailbox_state(
+        &a.id,
+        "Old",
+        Some(&crate::manage::store::MailboxState {
+            validity: 42,
+            uid_next: 3,
+            exists: 2,
+            days: a.sync.days,
+            mailbox_id: "F1".into(),
+            ..Default::default()
+        }),
+    )?;
+    b.sync(&a, Mailbox::Remote("New".into()), 50)?;
+    let kept = format!("{}:New:42:1", a.id);
+    assert!(b.store.message(&kept)?.is_some(), "the cache follows the rename");
+    assert!(b.store.raw(&kept)?.is_some(), "its source too");
+    assert!(b.store.message(&mail(1).id)?.is_none());
+    assert_eq!(b.store.mailbox_state(&a.id, "New")?.unwrap().mailbox_id, "F1");
+    b.disconnect(&a.id);
+    let commands = server.join().unwrap();
+    assert!(
+        !commands.iter().any(|c| c.to_ascii_uppercase().contains("BODY")),
+        "nothing downloaded again: {commands:?}"
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// The commands an undo server heard, for a fixture that lists INBOX,
+/// Archive (or Gmail's All Mail) and Trash, and finds `<moved@example.com>`
+/// at UID 31 in whichever mailbox is selected.
+fn undo_server(
+    listener: std::net::TcpListener,
+    acceptor: native_tls::TlsAcceptor,
+    gmail: bool,
+) -> std::thread::JoinHandle<Vec<String>> {
+    std::thread::spawn(move || {
+        let mut heard = Vec::new();
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+        loop {
+            let mut line = String::new();
+            if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                break;
+            }
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            let upper = command.to_ascii_uppercase();
+            let mut out = String::new();
+            if upper.starts_with("LOGIN") {
+            } else if upper == "CAPABILITY" {
+                out.push_str(if gmail {
+                    "* CAPABILITY IMAP4rev1 MOVE X-GM-EXT-1\r\n"
+                } else {
+                    "* CAPABILITY IMAP4rev1 MOVE\r\n"
+                });
+            } else if upper.starts_with("LIST") {
+                out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
+                out.push_str(if gmail {
+                    "* LIST (\\All) \"/\" \"[Gmail]/All Mail\"\r\n"
+                } else {
+                    "* LIST (\\Archive) \"/\" \"Archive\"\r\n"
+                });
+                out.push_str("* LIST (\\Trash) \"/\" \"Trash\"\r\n");
+            } else if upper.starts_with("SELECT") {
+                heard.push(command.to_owned());
+                out.push_str("* 1 EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n");
+            } else if upper.starts_with("UID SEARCH") {
+                assert!(upper.contains("MOVED@EXAMPLE.COM"), "{command}");
+                out.push_str("* SEARCH 31\r\n");
+            } else if upper.starts_with("UID MOVE") || upper.starts_with("UID COPY") {
+                heard.push(command.to_owned());
+            } else if upper.starts_with("LOGOUT") {
+                r.get_mut()
+                    .write_all(format!("* BYE\r\n{tag} OK done\r\n").as_bytes())
+                    .unwrap();
+                break;
+            } else {
+                panic!("Unexpected IMAP command: {line}");
+            }
+            out.push_str(&format!("{tag} OK done\r\n"));
+            r.get_mut().write_all(out.as_bytes()).unwrap();
+        }
+        heard
+    })
+}
+
+/// Undo after an archive finds the message in Archive by its Message-ID
+/// (its UID there is new) and moves it back to the inbox; at Gmail it is
+/// copied back (the Inbox label again), never moved out of All Mail.
+#[test]
+fn undoing_a_move_puts_mail_back_where_it_was() -> Result<()> {
+    for gmail in [false, true] {
+        let (cert, acceptor) = tls_fixture()?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = undo_server(listener, acceptor, gmail);
+        let (b, mut a, path) = backend(&cert)?;
+        a.incoming_port = port;
+        let before = Mail {
+            id: format!("{}:INBOX:42:7", a.id),
+            account: a.id.clone(),
+            folder: Folder::Inbox,
+            remote_folder: "INBOX".into(),
+            uid: 7,
+            message_id: "<moved@example.com>".into(),
+            ..Mail::default()
+        };
+        // No Message-ID: nothing to find it by, so it is left alone.
+        let anonymous = Mail {
+            id: format!("{}:INBOX:42:8", a.id),
+            uid: 8,
+            message_id: String::new(),
+            ..before.clone()
+        };
+        let moved = [before, anonymous]
+            .map(|before| Moved { before, change: Change::Move(Folder::Archive) });
+        assert_eq!(b.undo_move(&a, &moved)?, 1);
+        b.disconnect(&a.id);
+        let heard = server.join().unwrap();
+        let archive = if gmail { "\"[Gmail]/All Mail\"" } else { "\"Archive\"" };
+        assert_eq!(
+            heard,
+            [
+                format!("SELECT {archive}"),
+                if gmail {
+                    "UID COPY 31 \"INBOX\"".to_string()
+                } else {
+                    "UID MOVE 31 \"INBOX\"".to_string()
+                },
+            ],
+            "gmail: {gmail}"
+        );
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
 /// Labels and Gmail ids come from the server's listing, not the message's
 /// source: opening a downloaded message keeps them, in what is shown and in
 /// the cache.
@@ -1159,6 +1571,38 @@ fn slow_smtp(
     Ok((port, server))
 }
 
+/// Sent with "Remind me if no reply", a message is waited on by the
+/// Message-ID it went with, from when it went.
+#[test]
+fn mail_sent_with_a_reminder_is_waited_on() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let (port, server) = slow_smtp(acceptor, Duration::from_millis(0))?;
+    let (b, mut a, _path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    b.store.save_account(&a)?;
+    let d = Draft {
+        id: "follow-up-test".into(),
+        account: a.id.clone(),
+        to: "Recipient <recipient@example.com>".into(),
+        subject: "Any news?".into(),
+        body: "Checking in.".into(),
+        follow_up: Some(3 * 86400),
+        ..Default::default()
+    };
+    let before = chrono::Utc::now().timestamp();
+    b.send(&a, &d)?;
+    let delivered = String::from_utf8_lossy(&server.join().unwrap().expect("delivered")).into_owned();
+    let waiting = b.follow_ups(&a.id);
+    assert_eq!(waiting.len(), 1);
+    let f = &waiting[0];
+    assert!(delivered.contains(&f.message_id), "{} not in what was sent", f.message_id);
+    assert_eq!((f.subject.as_str(), f.to.as_str()), ("Any news?", "Recipient <recipient@example.com>"));
+    assert!(f.due >= before + 3 * 86400 && f.due <= chrono::Utc::now().timestamp() + 3 * 86400);
+    assert!(!f.reminded);
+    Ok(())
+}
+
 /// With no window open, the background monitor sends a scheduled message
 /// once due, removes it from Drafts and says so; the window, opening while
 /// it is being sent, finds it taken and doesn't send it again.
@@ -1237,6 +1681,7 @@ fn the_background_monitor_waits_before_waking_snoozes_again() -> Result<()> {
         until: chrono::Utc::now().timestamp() - 5,
         folder: folder.into(),
         ids: vec![],
+        changed: 0,
     };
     for id in [&a.id, &pop.id] {
         b.store.set_preference(
@@ -1252,6 +1697,143 @@ fn the_background_monitor_waits_before_waking_snoozes_again() -> Result<()> {
     assert!(said.is_empty(), "{said:?}");
     // Still snoozed, for the next try.
     assert_eq!(b.snoozed(&a.id).len(), 1);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// S/MIME end to end: a signed, encrypted message goes out as
+/// application/pkcs7-mime, opens for its recipient, and its copy in Sent
+/// opens again here.
+#[test]
+fn smime_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
+    use crate::manage::smime::{Certificates, test_identity};
+    let (cert, port, server) = smtp_sink()?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    a.smtp_tls = Some(true);
+    let mut mine = Certificates::default();
+    mine.import_identity(&test_identity("qa@example.com", ""), "")?;
+    let mut theirs = Certificates::default();
+    theirs.import_identity(&test_identity("rae@example.com", ""), "")?;
+    // Rae's certificate, as one of Rae's signed messages would give it.
+    let signed = crate::manage::smime::protect_with(&theirs, b"From: rae@example.com\r\nSubject: hi\r\nContent-Type: text/plain\r\n\r\nhi\r\n", "rae@example.com", &[], true, false)?;
+    b.set_certificates(mine.clone())?;
+    let rae_signed = parse_message(&signed, &a, "rae-1", Folder::Inbox, "INBOX", 1)?;
+    b.store.save_download(&rae_signed, &signed)?;
+    b.read(&a, &rae_signed)?;
+    assert!(b.certificates().has_cert("rae@example.com"), "the signer's certificate is kept");
+    assert!(!b.smime_verdict("rae-1").unwrap().decrypted);
+    let d = Draft {
+        id: "smime-test".into(),
+        account: a.id.clone(),
+        to: "Rae <rae@example.com>".into(),
+        subject: "Sealed".into(),
+        body: "Only Rae reads this.".into(),
+        sign: true,
+        encrypt: true,
+        smime: true,
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let result = b.send(&a, &d);
+    let raw = server.join().unwrap();
+    result?;
+    let text = String::from_utf8_lossy(&raw);
+    // RFC 8551 §2.7.1: Rae's signed mail listed AES-256 GCM first, which
+    // reading it kept, so Rae's copy is AuthEnvelopedData (RFC 5083).
+    assert!(text.contains("smime-type=authEnveloped-data") && !text.contains("Only Rae"), "{text}");
+    let (opened, verdict, _) = crate::manage::smime::open(&raw, &theirs).unwrap();
+    assert!(verdict.decrypted && verdict.signature != crate::manage::smime::Signature::Bad);
+    assert!(String::from_utf8_lossy(&opened).contains("Only Rae reads this."));
+    let sent = b.store.messages(&a.id, Folder::Sent, 10)?;
+    let read = b.read(&a, &sent[0])?;
+    assert!(read.body.unwrap_or_default().contains("Only Rae reads this."));
+    assert!(b.store.message(&sent[0].id)?.unwrap().body.is_none(), "kept out of the cache");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A CalDAV task's reminders are shown as the calendar's, before it's due.
+#[test]
+fn caldav_task_reminders_are_shown() -> Result<()> {
+    let (cert, _acceptor) = tls_fixture()?;
+    let (b, _a, path) = backend(&cert)?;
+    let now = chrono::Utc::now().timestamp();
+    let due = chrono::DateTime::from_timestamp(now + 1800, 0).unwrap().format("%Y%m%dT%H%M%SZ");
+    let text = format!("BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nSUMMARY:Taxes\r\nDUE:{due}\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;RELATED=END:-PT1H\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALENDAR\r\n");
+    let task = crate::sync::caldav::Stored {
+        event: crate::sync::ical::parse_tasks(&text).pop().unwrap(),
+        href: "https://dav.example/cal/t.ics".into(),
+        ..Default::default()
+    };
+    b.store.set_preference("calendar_tasks", &serde_json::to_string(&[task])?)?;
+    let reminders = b.due_reminders(now);
+    assert_eq!(reminders.len(), 1, "{reminders:?}");
+    assert_eq!(reminders[0].0.summary, "Taxes");
+    // Once.
+    assert!(b.due_reminders(now + 60).is_empty());
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// Autocrypt-Gossip (Autocrypt 1.1 §2.4) is learned only from mail OpenPGP
+/// actually decrypted: the same header in plain mail, or inside mail that
+/// is only signed (here under a forged signature), teaches no key.
+#[test]
+fn gossip_keys_come_only_from_decrypted_mail() -> Result<()> {
+    use crate::manage::openpgp::{Keyring, Protect, protect, test_key};
+    use base64::Engine as _;
+    use pgp::composed::SignedPublicKey;
+    use pgp::ser::Serialize as _;
+    let ana = test_key("Ana <ana@example.org>", "");
+    let bo = test_key("Bo <bo@example.se>", "");
+    let cy = test_key("Cy <cy@example.net>", "");
+    let public = |k: &pgp::composed::SignedSecretKey| SignedPublicKey::from(k.clone()).to_armored_string(Default::default()).unwrap();
+    // Bo reads; Bo knows Ana, but not Cy.
+    let (b, mut a, path) = backend(b"")?;
+    a.email = "bo@example.se".into();
+    let mut bos = Keyring::default();
+    bos.import(&bo.to_armored_string(Default::default())?, "")?;
+    bos.import(&public(&ana), "")?;
+    b.set_keyring(bos)?;
+    let mail = |id: &str| {
+        let mut m = Mail { id: id.into(), account: a.id.clone(), to: "Bo <bo@example.se>".into(), ..Default::default() };
+        m.set_cc("cy@example.net".to_owned());
+        m
+    };
+    let cy_data = base64::engine::general_purpose::STANDARD.encode(SignedPublicKey::from(cy.clone()).to_bytes()?);
+    let gossip = format!("Autocrypt-Gossip: addr=cy@example.net; keydata={cy_data}\r\n");
+    let knows_cy = |b: &Backend| b.keyring().key_for("cy@example.net").is_some();
+
+    // Plain mail carrying the header.
+    let plain = format!(
+        "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nCc: cy@example.net\r\n{gossip}Subject: Plans\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nMeet at noon.\r\n"
+    );
+    b.parse_read(&a, &mail("plain"), plain.as_bytes())?;
+    assert!(!knows_cy(&b));
+
+    // Signed only: the header in the signed part, the signature forged.
+    let signed = format!(
+        "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nCc: cy@example.net\r\nSubject: Plans\r\nMIME-Version: 1.0\r\nContent-Type: multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain; protected-headers=\"v1\"\r\n{gossip}\r\nMeet at noon.\r\n--b\r\nContent-Type: application/pgp-signature\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\n\r\nAAAA\r\n-----END PGP SIGNATURE-----\r\n--b--\r\n"
+    );
+    b.parse_read(&a, &mail("signed"), signed.as_bytes())?;
+    assert!(!knows_cy(&b));
+    assert!(!b.verdict("signed").is_some_and(|v| v.decrypted));
+
+    // Encrypted by Ana to Bo and Cy: decrypted, so Cy's key is learned.
+    let mut anas = Keyring::default();
+    anas.import(&ana.to_armored_string(Default::default())?, "")?;
+    anas.import(&public(&bo), "")?;
+    anas.import(&public(&cy), "")?;
+    let source = b"From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nCc: cy@example.net\r\nSubject: Plans\r\nMessage-ID: <1@example.org>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nMeet at noon.\r\n";
+    let to = ["bo@example.se".to_owned(), "cy@example.net".to_owned()];
+    let sealed = protect(source, "ana@example.org", &to, Protect { sign: true, encrypt: true, ..Default::default() }, &anas)?;
+    b.parse_read(&a, &mail("sealed"), &sealed)?;
+    assert!(b.verdict("sealed").is_some_and(|v| v.decrypted));
+    assert!(knows_cy(&b));
     drop(b);
     std::fs::remove_dir_all(path)?;
     Ok(())

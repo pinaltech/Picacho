@@ -85,11 +85,49 @@ an older strip stays up until its replacement arrives, and strips far from the
 viewport are released. A spinner shows until the first layout and paint.
 Leaving a message, turning HTML off or blocking remote content ends the thread
 and cancels queued resource work. Clicks, hover (including author `:hover`
-styles and CSS cursors), drag selection/copy, Tab and Enter/Space are bridged
-to the document; a secondary click offers Copy, link and image actions, Copy
-Message Text and Show Original. On a touch screen a long press selects the
-word under the finger (`select_word_at`), moving the finger before lifting
-it extends the selection, and lifting it opens that menu. Scripts, forms and embedded frames are disabled.
+styles and CSS cursors), drag selection/copy, double-click (word) and
+triple-click (block) selection, shift-click to extend, Ctrl/⌘A, Tab and
+Enter/Space are bridged to the document, with modifier keys; a secondary click
+offers Copy, link and image actions, Copy Message Text and Show Raw. On a
+touch screen a long press selects the word under the finger
+(`select_word_at`; words of Chinese, Japanese, Thai and similar scripts come
+from ICU's dictionaries), moving the finger before lifting it extends the
+selection, and lifting it opens that menu. A `#` link, and Tab reaching an
+element out of view, scroll the reader to it (`HtmlReveal`); a wheel over one
+of the email's own scrollable boxes scrolls that box while it can. Scripts,
+form controls and embedded frames are disabled (a form's other content shows).
+Interactive email keeps working without its controls showing: a click on a
+`<label>` checks its hidden checkbox or radio button, and `:checked` rules
+then show the chosen tab, carousel slide or opened section.
+
+The document is laid out in CSS pixels at the reader's width, with the
+window's height and scale for `vh` units and media queries (resolution
+queries see the real scale). Content wider than the reader (a fixed 700-pixel
+table on a phone) is laid out at its width, up to three times the reader's,
+and shown scaled down to fit. The height counts absolutely positioned
+content. Fixed and sticky boxes are placed as absolute and relative ones, as
+the email is one long page. Animations and transitions are settled at their
+end rather than played. An email without a standards DOCTYPE gets browsers'
+quirk for lines holding only images (no gaps under sliced images in table
+cells), and legacy attributes (`align`, `background`, `bgcolor` names,
+`<font>`) apply through blitz-dom's patches. The email's `body` background
+fills the page and frames it. Remote resources are fetched six at a time, at
+most 400 and 64 MB per email, never from this computer or its local network
+(addresses and names that lead there are refused as the connection is made).
+A proxy looks names up itself, so Picacho can't tell where a request through
+one goes: with a proxy set for the system (`HTTPS_PROXY` and the like, or the
+macOS and Windows settings), remote resources aren't fetched, unless
+Settings → Reading → Proxy blocks local network (offered when a proxy is
+set), or `PICACHO_PROXY_BLOCKS_LOCAL_NETWORK=1` for a whole computer, says
+the proxy itself refuses requests to its computer and network. Then the proxy is used, even one on the local
+network, and a name that leads inside the network here is still refused
+before the proxy is asked. The same holds for other requests to addresses
+strangers chose (one-click unsubscribing, MTA-STS policies, key lookups,
+revocation checks). Images, inline ones too,
+are decoded only up to 40 million pixels each and 160 million per email, so a
+small, very compressible file can't stand for gigabytes of memory. While no
+resource is on its way, the document's thread sleeps until the view asks it
+for something.
 Development builds optimize the rendering crates (see `Cargo.toml`), since
 unoptimized they are roughly 50 times slower.
 
@@ -103,17 +141,49 @@ default color. Messages without an HTML part retain the selectable plain
 reader, on a page of the email's color when it differs from the app's.
 
 Blocked remote images keep their size as a dashed outline, so the sender's
-layout holds; images without a size get a small one, and tracking pixels stay
+layout holds; one with alt text shows the text in that box, images without a
+size get a small one, and tracking pixels (sized by attributes or CSS) stay
 invisible. Dark email colors use the email's own `prefers-color-scheme: dark`
-styles when it has them. Otherwise the painted scene is recolored before
-rasterizing (OKLab lightness, hue and chroma kept): grey and pale surfaces
-darken, dark text lightens, saturated brand surfaces and the light text on
-them are kept slightly dimmed, and images are untouched.
+styles when they set backgrounds, unless the email's first screens still come
+out mostly light (only a logo swapped): such an email, like one without dark
+styles, has its painted scene recolored before rasterizing (OKLab lightness,
+hue and chroma kept): grey and pale surfaces darken, dark text lightens,
+borders and rules lighten, saturated brand surfaces and the light text on
+them are kept slightly dimmed, text on a surface that stays light keeps its
+dark color, and images, SVG images included, are untouched.
+
+Screen readers see the email as a Document named "Message" (`html/view.rs`).
+It holds a group with one text node per paragraph of the email, with images
+given by their alt text and hidden content left out
+(`EmailDocument::accessible_text`). After that comes a list, "Links in this
+message", with up to 200 links. Each is named by its text, or by its address
+when it has none, and is described by its address. Activating one
+(AccessKit's Click) opens it the same way a click on the painted link does,
+including the link warnings. None of these nodes are drawn. They are zero-size
+boxes at the email's top left, so a screen reader's highlight shows there.
+
+Testing with a screen reader needs a real one. For every reader below, open
+an HTML newsletter with several paragraphs and links, then move focus into
+the reader. Tab until the email itself has focus.
+- VoiceOver (macOS, ⌘F5): press VO-Shift-↓ on "Message, document" to enter
+  it. VO-→ should read the email one paragraph at a time, then the "Links in
+  this message" list. VO-Space on a link should open it in the browser, or
+  show the link warning. The Rotor (VO-U) → Links should list the same links.
+- NVDA (Windows): in browse mode, ↓ should read the paragraphs in order and
+  K should jump between the links. Enter on a link should open it. NVDA+F7
+  should list the links.
+- Orca (GNOME, Super-Alt-S): Flat Review (KP-7/8/9) or Tab into the email
+  should read the paragraphs. In Orca's Find or Where Am I, each link should
+  be announced as a link with its address. Enter or KP-/ (activate) should
+  open it.
+
+Accessibility Inspector (macOS), Accessibility Insights (Windows) or Accerciser
+(Linux) should show the Document → Group (static texts) and List (links) tree.
 
 The "to …" line under the sender opens the message's details: addresses,
 mailed-by (the SPF envelope domain), signed-by (DKIM domains), transport
 security (TLS on the last hop, or end-to-end encryption) and SPF/DKIM/DMARC
-verdicts from the receiving server's Authentication-Results. Show Original
+verdicts from the receiving server's Authentication-Results. Show Raw
 opens the raw source with those facts, Copy and Download (.eml).
 
 ## Frame budget
@@ -146,10 +216,35 @@ Composing settings, and sending.
 
 Recipients have To, Cc and Bcc (Cc and Bcc appear on demand) and suggest
 people from loaded mail. With several accounts, From picks the sender.
-Formatted messages are Markdown underneath: the toolbar and shortcuts (⌘B,
-⌘I, ⌘⇧X, ⌘E, ⌘K, ⌘⇧8, ⌘⇧7, ⌘⇧9, ⌘⌥1) wrap or prefix the selection, ⌘⇧P
-previews, and sending adds an HTML version (`smtp::html_body`, raw HTML
-escaped). Files can be dropped on the editor. Drafts save on their own
+Formatted messages are edited as they look, in `RichEditor`
+(`rich_editor.rs`); plain ones in a text field. The editor's document is
+`manage::richtext`: blocks (paragraphs, headings, items, quoted lines,
+cells), each holding styled runs of text and pictures and the path of HTML
+elements it sits in, blocks of one element sharing its `Rc`. Elements and
+inline styles the editor doesn't know stay on the path and on the runs'
+`wrappers`, so another app's tables, classes and styles are written back
+as they came (`richtext::html::to_html`); reading (`html::parse`) drops
+scripts, frames, forms, handlers and script addresses. A formatted draft
+keeps that HTML in `Draft::html` (pictures as `file:<attachment name>`) and
+its text in `Draft::body`; Markdown drafts kept before open through
+`smtp::markdown_fragment`. The toolbar and shortcuts (⌘B, ⌘I, ⌘U, ⌘⇧X, ⌘E,
+⌘K, ⌘⇧8, ⌘⇧7, ⌘⇧9, ⌘⌥1) format the selection, ⌘⇧P previews the HTML, and
+sending sends it with the text beside it and its pictures by Content-ID
+(`smtp::rich_html_body`). The editor lays each block out itself: GPUI shapes
+and wraps a block's text; a block with pictures is flowed by the editor
+(words wrap at spaces, pictures sit on the baseline at their size, a
+selected one's grip resizes it); a table's blocks are grouped into rows
+and cells by their elements and laid out side by side, in equal columns.
+Keys are the text fields' ("Input" key context), and typing comes through
+GPUI's input handler, so input methods and phones' keyboards work; touch
+uses GPUI's long press and touch drags (claimed for the selection's
+handles), taps place the caret and pans scroll. Spelling
+(`manage/spelling.rs`) is the system's checker on macOS and Windows and
+Hunspell dictionaries (`spellbook`) on Linux; misspelled words are cut into
+runs of their own with a wavy underline, and right click opens the edit
+menu with spellings. Copying puts HTML on the system clipboard (arboard),
+the draft's pictures in it as `data:`. Files can be dropped on the editor;
+pictures dropped on formatted text go in it. Drafts save on their own
 after a pause, off the main thread, and at once on ⌘S, close and quit.
 
 Sending checks recipients, then optionally asks about a missing subject or

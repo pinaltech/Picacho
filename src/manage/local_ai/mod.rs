@@ -5,10 +5,16 @@
 //!
 //! The features: hiding sign-in and verification codes (see `otp`), and
 //! understanding dates and times typed where Picacho asks when ("tmrw at 6",
-//! see `when`).
+//! see `when`), confirming tracking numbers found in mail (see `parcel`),
+//! suggesting replies to received mail in its own language (see
+//! `replies`), and sorting the inbox into its categories (see
+//! `categories`).
+pub mod categories;
 #[cfg(target_os = "macos")]
 mod coreml;
 pub mod otp;
+pub mod parcel;
+pub mod replies;
 pub mod runtime;
 pub mod when;
 
@@ -24,6 +30,18 @@ pub const ENABLED_PREFERENCE: &str = "local_ai";
 pub const OTP_PREFERENCE: &str = "local_ai_otp";
 /// Preference: typed dates and times are understood.
 pub const WHEN_PREFERENCE: &str = "local_ai_when";
+/// Preference: tracking numbers found in mail are confirmed by the model.
+pub const PARCEL_PREFERENCE: &str = "local_ai_parcel";
+/// Preference: replies are suggested under received mail.
+pub const REPLIES_PREFERENCE: &str = "local_ai_replies";
+/// Preference: the suggested replies chosen and turned away (JSON,
+/// `replies::History`).
+pub const REPLY_HISTORY_PREFERENCE: &str = "local_ai_reply_history";
+/// Preference: the inbox category model sorts the inbox.
+pub const CATEGORIES_PREFERENCE: &str = "local_ai_categories";
+/// Preference: what was learned from the mail the person moved to another
+/// category (JSON, `categories::Learned`).
+pub const CATEGORIES_LEARNED_PREFERENCE: &str = "local_ai_categories_learned";
 
 /// Where the models are published: Picacho's model repositories on Hugging
 /// Face (in the pinaltech "Picacho Models" collection), one per model. Each
@@ -55,6 +73,10 @@ pub struct Model {
     pub kind: Kind,
     /// The published file.
     file: &'static str,
+    /// Not published yet: installed from `local_dir` (the training
+    /// directory in Picacho's source, where `train.py` writes it) rather
+    /// than downloaded.
+    local: bool,
     /// What is kept in the models directory once installed: the file
     /// itself, or (Core ML) the model compiled from it.
     installed: &'static str,
@@ -82,6 +104,7 @@ const OTP_COREML: Model = Model {
     repo: "veil-otp",
     kind: Kind::Scorer,
     file: "otp-v1.mlmodel",
+    local: false,
     installed: "otp-v1.mlmodelc",
     sha256: "309484159aa766e287f9a0bffcc0f2d990ba524eaaed374ab63b25b3b0194c8a",
     size: 1_049_025,
@@ -96,6 +119,7 @@ const OTP_NATIVE: Model = Model {
     repo: "veil-otp",
     kind: Kind::Scorer,
     file: "otp-v1.bin",
+    local: false,
     installed: "otp-v1.bin",
     sha256: "7667b357195ca20d04e3505700ca5db72d335befbafc7e1dbe803eb765347bc6",
     size: 1_048_728,
@@ -112,6 +136,7 @@ pub const WHEN: Model = Model {
     repo: "epoch-tbs",
     kind: Kind::Tagger,
     file: "tbs-v1.bin",
+    local: false,
     installed: "tbs-v1.bin",
     sha256: "5035ed09e644033d7b53a7ea3dee558ba2099da874b0a5fc68baf2c032de0de5",
     size: 603_700,
@@ -119,8 +144,84 @@ pub const WHEN: Model = Model {
     threshold: 0.,
 };
 
+/// Vast Parcel, the tracking number model (see `models/parcel/train.py`):
+/// a Core ML model on macOS, Picacho's own format elsewhere, the same
+/// network either way. Until it is on Hugging Face, it is installed from
+/// the files `train.py` writes in `models/parcel` (see `local_dir`).
+#[cfg(target_os = "macos")]
+pub const PARCEL: Model = PARCEL_COREML;
+#[cfg(not(target_os = "macos"))]
+pub const PARCEL: Model = PARCEL_NATIVE;
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const PARCEL_COREML: Model = Model {
+    id: "parcel",
+    label: "Tracking number model",
+    features: &["Find tracking numbers"],
+    repo: "vast-parcel",
+    kind: Kind::Scorer,
+    file: "parcel-v1.mlmodel",
+    local: false,
+    installed: "parcel-v1.mlmodelc",
+    sha256: "f48915c0952f34c7a844fb95acca333f243b858bd43ab1fb64f6b6c46efa7f2b",
+    size: 524_674,
+    dim: parcel::DIM,
+    threshold: 0.5,
+};
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const PARCEL_NATIVE: Model = Model {
+    id: "parcel",
+    label: "Tracking number model",
+    features: &["Find tracking numbers"],
+    repo: "vast-parcel",
+    kind: Kind::Scorer,
+    file: "parcel-v1.bin",
+    local: false,
+    installed: "parcel-v1.bin",
+    sha256: "3afb6727202b9c5399adc18da800f9fb7d9f26ec1052aa9e757d3f4a54aa1585",
+    size: 524_376,
+    dim: parcel::DIM,
+    threshold: 0.5,
+};
+
+/// Echo Replies, the reply suggestion model (see `models/replies/train.py`):
+/// the same file on every platform, run by Picacho's own runtime, published
+/// as `pinaltech/echo-replies`.
+pub const REPLIES: Model = Model {
+    id: "replies",
+    label: "Reply suggestion model",
+    features: &["Suggest replies"],
+    repo: "echo-replies",
+    kind: Kind::Tagger,
+    file: "replies-v1.bin",
+    local: false,
+    installed: "replies-v1.bin",
+    sha256: "2e70213172b99b6537baf5a4b1c4594a5db1c6a2642c3e215ab0ffc144b27d2b",
+    size: 1_187_716,
+    dim: replies::DIM,
+    threshold: 0.,
+};
+
+/// Sift Categories, the inbox category model (see
+/// `models/categories/train.py`): the same file on every platform, run by
+/// Picacho's own runtime, published as `pinaltech/sift-categories`.
+pub const CATEGORIES: Model = Model {
+    id: "categories",
+    label: "Inbox category model",
+    features: &["Sort the inbox"],
+    repo: "sift-categories",
+    kind: Kind::Tagger,
+    file: "categories-v1.bin",
+    local: false,
+    installed: "categories-v1.bin",
+    sha256: "29b1da62cddc59c0a02bfc8c669ac76ef5e16464bea0dc4db7c9372ef96dd6ea",
+    size: 1_180_984,
+    dim: categories::DIM,
+    threshold: 0.,
+};
+
 /// Every model Local AI can download.
-pub const MODELS: [&Model; 2] = [&OTP, &WHEN];
+pub const MODELS: [&Model; 5] = [&OTP, &WHEN, &PARCEL, &REPLIES, &CATEGORIES];
 
 /// The model with this id.
 pub fn model(id: &str) -> Option<&'static Model> {
@@ -135,9 +236,50 @@ pub fn enabled(store: &Store) -> bool {
 pub fn otp_enabled(store: &Store) -> bool {
     enabled(store) && store.preference(OTP_PREFERENCE).as_deref() == Some("true")
 }
+/// Whether tracking numbers are confirmed by the model (Local AI on, and the
+/// feature on).
+pub fn parcel_enabled(store: &Store) -> bool {
+    enabled(store) && store.preference(PARCEL_PREFERENCE).as_deref() == Some("true")
+}
+/// Whether replies are suggested (Local AI on, and the feature on).
+pub fn replies_enabled(store: &Store) -> bool {
+    enabled(store) && store.preference(REPLIES_PREFERENCE).as_deref() == Some("true")
+}
+/// The suggested replies chosen and turned away so far.
+pub fn reply_history(store: &Store) -> replies::History {
+    store
+        .preference(REPLY_HISTORY_PREFERENCE)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+/// Whether the inbox category model sorts the inbox (Local AI on, and the
+/// feature on).
+pub fn categories_enabled(store: &Store) -> bool {
+    enabled(store) && store.preference(CATEGORIES_PREFERENCE).as_deref() == Some("true")
+}
+/// What was learned from the mail the person moved to another category.
+pub fn categories_learned(store: &Store) -> categories::Learned {
+    store
+        .preference(CATEGORIES_LEARNED_PREFERENCE)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
 /// Whether typed dates are understood (Local AI on, and the feature on).
 pub fn when_enabled(store: &Store) -> bool {
     enabled(store) && store.preference(WHEN_PREFERENCE).as_deref() == Some("true")
+}
+
+/// Where an unpublished model is installed from: `PICACHO_LOCAL_MODELS`
+/// (a directory holding its files), or else its training directory in the
+/// source Picacho was built from (`models/<id>`, where `train.py` writes
+/// them).
+pub fn local_dir(model: &Model) -> PathBuf {
+    match std::env::var_os("PICACHO_LOCAL_MODELS") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models")
+            .join(model.id),
+    }
 }
 
 /// The directory the models are kept in.
@@ -159,18 +301,21 @@ impl Model {
     /// keeps it (compiled for Core ML on macOS). `received` counts the bytes
     /// downloaded so far. Blocks; run off the main thread.
     pub fn install(&self, store: &Store, received: &AtomicU64) -> Result<()> {
-        let url = match std::env::var("PICACHO_MODELS_URL") {
-            Ok(base) => format!("{}/{}", base.trim_end_matches('/'), self.file),
-            Err(_) => self.url(),
+        let bytes = match std::env::var("PICACHO_MODELS_URL") {
+            Ok(base) => {
+                let url = format!("{}/{}", base.trim_end_matches('/'), self.file);
+                crate::sync::models::download(&url, self.size, received)?
+            }
+            Err(_) if self.local => self.read_local(received)?,
+            Err(_) => crate::sync::models::download(&self.url(), self.size, received)?,
         };
-        let bytes = crate::sync::models::download(&url, self.size, received)?;
         let digest: String = Sha256::digest(&bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
         ensure!(
             bytes.len() as u64 == self.size && digest == self.sha256,
-            "The downloaded model isn't the published one, so it wasn't installed."
+            t!("manage-local-ai-the-downloaded-model-isnt-the-published")
         );
         let dir = models_dir(store);
         std::fs::create_dir_all(&dir)?;
@@ -179,11 +324,28 @@ impl Model {
         let result = self.place(&partial, &self.path(store));
         let _ = std::fs::remove_file(&partial);
         result?;
-        // What was installed has to load.
-        match self.kind {
+        // What was installed has to load. One that doesn't is removed:
+        // left, it counted as installed (`installed` checks the file is
+        // there), and failed again each time it was used.
+        let loaded = match self.kind {
             Kind::Scorer => self.load(store).map(drop),
             Kind::Tagger => self.load_tagger(store).map(drop),
+        };
+        if loaded.is_err() {
+            let path = self.path(store);
+            let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
         }
+        loaded
+    }
+
+    /// The unpublished model's file from `local_dir`.
+    fn read_local(&self, received: &AtomicU64) -> Result<Vec<u8>> {
+        let path = local_dir(self).join(self.file);
+        let bytes = std::fs::read(&path).with_context(|| {
+            t!("manage-local-ai-the-isnt-published-yet-and-isnt", model = self.label.to_lowercase(), path = path.display(), id = self.id)
+        })?;
+        received.store(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(bytes)
     }
 
     /// Where the model is published.
@@ -193,12 +355,14 @@ impl Model {
 
     #[cfg(target_os = "macos")]
     fn place(&self, downloaded: &std::path::Path, target: &std::path::Path) -> Result<()> {
-        if self.kind == Kind::Tagger {
-            runtime::NativeTagger::load(downloaded)?;
-            std::fs::rename(downloaded, target)?;
-            return Ok(());
+        match self.kind {
+            Kind::Scorer => coreml::compile(downloaded, target),
+            Kind::Tagger => {
+                runtime::NativeTagger::load(downloaded)?;
+                std::fs::rename(downloaded, target)?;
+                Ok(())
+            }
         }
-        coreml::compile(downloaded, target)
     }
     #[cfg(not(target_os = "macos"))]
     fn place(&self, downloaded: &std::path::Path, target: &std::path::Path) -> Result<()> {
@@ -213,16 +377,16 @@ impl Model {
     /// The installed model, ready to score.
     pub fn load(&self, store: &Store) -> Result<Box<dyn runtime::Scorer>> {
         let path = self.path(store);
-        ensure!(path.exists(), "{} isn't installed.", self.label);
+        ensure!(path.exists(), t!("manage-local-ai-isnt-installed", label = self.label));
         #[cfg(target_os = "macos")]
         let scorer: Box<dyn runtime::Scorer> = Box::new(
             coreml::CoreMlModel::load(&path, self.dim)
-                .context("Core ML couldn't load the model")?,
+                .with_context(|| t!("manage-local-ai-core-ml-couldnt-load-the-model"))?,
         );
         #[cfg(not(target_os = "macos"))]
         let scorer: Box<dyn runtime::Scorer> = {
             let model = runtime::NativeModel::load(&path)?;
-            ensure!(model.threshold.is_finite(), "The model has no threshold");
+            ensure!(model.threshold.is_finite(), t!("manage-local-ai-the-model-has-no-threshold"));
             Box::new(model)
         };
         Ok(scorer)
@@ -231,7 +395,7 @@ impl Model {
     /// The installed labeller (a `Kind::Tagger` model).
     pub fn load_tagger(&self, store: &Store) -> Result<runtime::NativeTagger> {
         let path = self.path(store);
-        ensure!(path.exists(), "{} isn't installed.", self.label);
+        ensure!(path.exists(), t!("manage-local-ai-isnt-installed", label = self.label));
         runtime::NativeTagger::load(&path)
     }
 
@@ -250,13 +414,32 @@ impl Model {
         } else {
             Ok(())
         }
-        .with_context(|| format!("Couldn't delete {}", path.display()))
+        .with_context(|| t!("manage-local-ai-couldnt-delete", path = path.display()))
     }
 }
 
 /// The sign-in code detector, with the installed model.
 pub fn otp_detector(store: &Store) -> Result<otp::Detector> {
     Ok(otp::Detector::new(OTP.load(store)?, OTP.threshold))
+}
+
+/// The tracking number confirmer, with the installed model.
+pub fn parcel_confirmer(store: &Store) -> Result<parcel::Confirmer> {
+    Ok(parcel::Confirmer::new(
+        PARCEL.load(store)?,
+        PARCEL.threshold,
+    ))
+}
+
+/// The reply suggester, with the installed model.
+pub fn reply_suggester(store: &Store) -> Result<replies::Suggester> {
+    replies::Suggester::new(REPLIES.load_tagger(store)?)
+}
+
+/// The inbox category model, with what was learned here.
+pub fn category_ai(store: &Store) -> Result<categories::Ai> {
+    let model = categories::Model::new(CATEGORIES.load_tagger(store)?)?;
+    Ok(categories::Ai::new(model, categories_learned(store)))
 }
 
 /// The date and time reader, with the installed model.
@@ -283,7 +466,7 @@ pub fn remove_stale(store: &Store) -> Result<()> {
         } else {
             std::fs::remove_file(&path)
         }
-        .with_context(|| format!("Couldn't delete {}", path.display()))?;
+        .with_context(|| t!("manage-local-ai-couldnt-delete", path = path.display()))?;
     }
     Ok(())
 }
@@ -293,7 +476,7 @@ pub fn remove_all(store: &Store) -> Result<()> {
     let dir = models_dir(store);
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("Couldn't delete {}", dir.display()))?;
+            .with_context(|| t!("manage-local-ai-couldnt-delete-2", dir = dir.display()))?;
     }
     Ok(())
 }
@@ -325,10 +508,18 @@ fn size_of(path: &std::path::Path) -> u64 {
 pub(crate) fn test_model(file: &str) -> PathBuf {
     use std::sync::Mutex;
     static FETCHING: Mutex<()> = Mutex::new(());
-    let model = [&OTP_NATIVE, &OTP_COREML, &WHEN]
-        .into_iter()
-        .find(|m| m.file == file)
-        .unwrap_or_else(|| panic!("no published model is named {file}"));
+    let model = [
+        &OTP_NATIVE,
+        &OTP_COREML,
+        &WHEN,
+        &PARCEL_NATIVE,
+        &PARCEL_COREML,
+        &REPLIES,
+        &CATEGORIES,
+    ]
+    .into_iter()
+    .find(|m| m.file == file)
+    .unwrap_or_else(|| panic!("no published model is named {file}"));
     let published = |path: &std::path::Path| {
         std::fs::read(path).is_ok_and(|bytes| {
             bytes.len() as u64 == model.size && hex(&Sha256::digest(&bytes)) == model.sha256
@@ -339,6 +530,13 @@ pub(crate) fn test_model(file: &str) -> PathBuf {
     if published(&trained) {
         return trained;
     }
+    assert!(
+        !model.local,
+        "{} isn't published yet and the trained file isn't the one the app expects: \
+         run models/{}/train.py --coreml and update its size and digest",
+        trained.display(),
+        model.id
+    );
     let cached = root.join("target/test-models").join(file);
     let _fetching = FETCHING.lock().unwrap_or_else(|e| e.into_inner());
     if published(&cached) {
@@ -372,7 +570,7 @@ mod tests {
     fn the_published_models_are_the_ones_the_app_expects() {
         // The files on Hugging Face (or just trained) match the sizes and
         // digests here; `test_model` checks both, downloading if needed.
-        for model in [OTP_NATIVE, OTP_COREML, WHEN] {
+        for model in [OTP_NATIVE, OTP_COREML, WHEN, PARCEL_NATIVE, PARCEL_COREML, CATEGORIES] {
             let bytes = std::fs::read(test_model(model.file)).unwrap();
             assert_eq!(hex(&Sha256::digest(&bytes)), model.sha256, "{}", model.file);
             assert_eq!(bytes.len() as u64, model.size, "{}", model.file);

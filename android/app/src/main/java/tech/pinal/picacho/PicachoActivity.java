@@ -272,7 +272,10 @@ public final class PicachoActivity extends GpuiInputActivity {
         opened(this, intent);
     }
 
-    /** Hands a tapped notification's target to Rust, once. */
+    /**
+     * Hands a tapped notification's target to Rust, once; and what another
+     * app handed Picacho (a mailto: link, an email file, a share), once.
+     */
     private static void opened(android.content.Context context, Intent intent) {
         String target = Notifier.targetOf(context, intent);
         if (target != null) {
@@ -280,7 +283,35 @@ public final class PicachoActivity extends GpuiInputActivity {
             intent.removeExtra(Notifier.EXTRA_KEY);
             Native.open(target);
         }
+        String widgetUri = WidgetStore.widgetUriOf(context, intent);
+        if (widgetUri != null) {
+            intent.removeExtra(WidgetStore.EXTRA_WIDGET);
+            intent.removeExtra(WidgetStore.EXTRA_KEY);
+            Native.launch(widgetUri);
+        }
+        if (intent != null && !intent.getBooleanExtra(HANDLED, false)) {
+            intent.putExtra(HANDLED, true);
+            // Copying shared files may take long (large files, another
+            // app's slow provider): off the UI thread, one share at a time,
+            // each handed to Rust once copied.
+            android.content.Context app = context.getApplicationContext();
+            Intent shared = new Intent(intent);
+            SHARES.execute(() -> {
+                for (String request : Shared.requests(app, shared)) {
+                    Native.launch(request);
+                }
+            });
+        }
     }
+    /** The thread shares are copied on, one after another. */
+    private static final java.util.concurrent.ExecutorService SHARES =
+            java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "picacho-shared");
+                thread.setDaemon(true);
+                return thread;
+            });
+    /** Marks an intent whose share or link was handed to Rust already. */
+    private static final String HANDLED = "tech.pinal.picacho.HANDLED";
 
     @Override
     protected void onDestroy() {
@@ -372,8 +403,9 @@ public final class PicachoActivity extends GpuiInputActivity {
         Native.shutdown();
         Intent restart = new Intent(this, RestartActivity.class)
                 .putExtra(RestartActivity.EXTRA_PID, Process.myPid())
-                // A tapped notification's target goes to the new process.
+                // A tapped notification's or widget's target goes to the new process.
                 .putExtra(Notifier.EXTRA_OPEN, Notifier.targetOf(this, getIntent()))
+                .putExtra(WidgetStore.EXTRA_WIDGET, WidgetStore.widgetUriOf(this, getIntent()))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
         startActivity(restart);
         finish();

@@ -62,24 +62,23 @@ fn android_main(app: android_activity::AndroidApp) {
         log::error!("no internal data directory");
         return;
     };
-    let backend = {
+    {
         let mut process = process();
         process.ui = true;
         // The window checks mail from here on; the monitor's watches end
         // before the window's begin.
         process.monitor = None;
-        match process.backend(&path) {
-            Ok(backend) => backend,
-            Err(e) => {
-                log::error!("could not open the mail store at {}: {e:#}", path.display());
-                process.ui = false;
-                return;
-            }
-        }
-    };
+    }
+    let opened = open_backend(&path);
     // Starts (or stops) the service that keeps checking once the activity
     // is gone.
-    set_background(background::enabled(&backend.store));
+    let started = |backend: &Arc<Backend>| {
+        set_background(background::enabled(&backend.store));
+        crate::manage::widgets::publish_soon(backend.store.clone());
+    };
+    if let Ok(backend) = &opened {
+        started(backend);
+    }
 
     platform::init_platform(&app);
     let Some(gpui_platform) = platform::shared_platform() else {
@@ -87,14 +86,24 @@ fn android_main(app: android_activity::AndroidApp) {
         process().ui = false;
         return;
     };
+    let gpui_app = gpui::Application::with_platform(gpui_platform.into_rc());
     // Blocks on the activity's event loop; the app's window opens once the
     // system has given the activity its surface. Returns once the activity
     // is destroyed.
-    display::run_on(
-        gpui::Application::with_platform(gpui_platform.into_rc()),
-        backend.clone(),
-    );
-    drop(backend);
+    match opened {
+        Ok(backend) => display::run_on(gpui_app, backend),
+        // A window says why (an encrypted database whose key is gone, say)
+        // and offers to try again or start over.
+        Err(e) => {
+            log::error!("could not open the mail store at {}: {e:#}", path.display());
+            let dir = path.clone();
+            display::run_recovery_on(gpui_app, path, e, move || {
+                let backend = open_backend(&dir)?;
+                started(&backend);
+                Ok(backend)
+            });
+        }
+    }
 
     let mut process = process();
     process.ui = false;
@@ -119,10 +128,16 @@ fn init_logging() {
 
 /// The activity's window has run in this process (it can't again).
 static UI_STARTED: AtomicBool = AtomicBool::new(false);
-/// This side set up ndk-context (for the keychain) in a process the service
-/// started; android-activity sets it up itself, once, when an activity is
-/// created, so it is released first (`beforeActivity`).
-static CONTEXT_OURS: AtomicBool = AtomicBool::new(false);
+/// Serializes `Native.attach` (the activity's main thread and a widget's or
+/// the service's thread may each be first) and its use of ndk-context.
+static ATTACH: Mutex<()> = Mutex::new(());
+/// Serializes opening the store, without holding `PROCESS` (which the UI
+/// thread takes in `beforeActivity`) while it opens.
+static OPENING: Mutex<()> = Mutex::new(());
+/// Moves on with each `serviceStarted` and `serviceStopped`: a service start
+/// whose thread runs after the service stopped finds it moved on, and
+/// starts no monitor for a service that's gone.
+static SERVICE_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the activity and the service share in the process.
 struct Process {
@@ -148,14 +163,31 @@ fn process() -> MutexGuard<'static, Process> {
     PROCESS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The process's backend, opened now if no one has yet. The store opens
+/// (which may take a while: an encrypted one's key from the keychain, a
+/// migration) without `PROCESS` held, so the activity's `beforeActivity`,
+/// on the UI thread, never waits for it.
+fn open_backend(path: &Path) -> anyhow::Result<Arc<Backend>> {
+    let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(backend) = process().backend.clone() {
+        return Ok(backend);
+    }
+    let backend = display::new_backend(Arc::new(Store::open(path)?));
+    process().install(backend.clone());
+    Ok(backend)
+}
+
 impl Process {
-    fn backend(&mut self, path: &Path) -> anyhow::Result<Arc<Backend>> {
-        if let Some(backend) = &self.backend {
-            return Ok(backend.clone());
-        }
-        let backend = display::new_backend(Arc::new(Store::open(path)?));
+    fn install(&mut self, backend: Arc<Backend>) {
         self.backend = Some(backend.clone());
-        Ok(backend)
+        // Notifications and widgets in the language Picacho shows.
+        set_language("", false);
+        // Notification buttons pressed while the activity's window isn't up
+        // act here; taps and Reply open the activity themselves (Notifier).
+        display::notify::set_background(display::notify::Background {
+            backend,
+            open: None,
+        });
     }
 
     /// Starts the monitor when the service runs without a window and
@@ -195,21 +227,71 @@ pub fn set_background(on: bool) {
     });
 }
 
+/// Tells Android's home-screen widgets (`WidgetStore.refreshAll`) that
+/// `widget-snapshot.json` was updated.
+pub fn publish_widgets(_json: &str) {
+    with_java("WidgetStore.refreshAll", |env, java| {
+        env.call_static_method(
+            &java.widgets,
+            jni_str!("refreshAll"),
+            jni_sig!("(Landroid/content/Context;)V"),
+            &[JValue::Object(java.context.as_obj())],
+        )
+        .map(drop)
+    });
+}
+
+/// `Native.refreshWidgets(String dataDir)`: rebuilds `widget-snapshot.json`
+/// from the local store and refreshes all home-screen widgets. Called on a
+/// background thread when a widget's Refresh button is tapped or when no
+/// snapshot exists yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_refreshWidgets<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    data_dir: JString<'caller>,
+) {
+    native(env, |_| {
+        if data_dir.is_null() {
+            return Ok(());
+        }
+        let path = std::path::PathBuf::from(data_dir.to_string());
+        let existing = process().backend.as_ref().map(|b| b.store.clone());
+        match existing {
+            Some(store) => {
+                crate::manage::widgets::publish_force(&store);
+            }
+            None => match Store::open(&path) {
+                Ok(store) => {
+                    crate::manage::widgets::publish_force(&store);
+                }
+                Err(e) => {
+                    log::warn!("refreshWidgets: could not open store at {}: {e:#}", path.display());
+                }
+            },
+        }
+        Ok(())
+    });
+}
+
 /// Shows a notification (`Notifier.show`). `key` picks the notification:
 /// one with the same key replaces it. Tapping it opens Picacho and hands
 /// `target` (`notify::Target`'s JSON; empty for none) back through
-/// `Native.open`.
-pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str) {
+/// `Native.open`. `actions` are its buttons, a line each: the action's
+/// key, its label and its own target, tab-separated. Reply opens Picacho
+/// with its target; the others reach `Native.quick` through the service.
+pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str, actions: &str) {
     with_java("Notifier.show", |env, java| {
         let title = env.new_string(title)?;
         let text = env.new_string(text)?;
         let sub_text = env.new_string(sub_text)?;
         let target = env.new_string(target)?;
+        let actions = env.new_string(actions)?;
         env.call_static_method(
             &java.notifier,
             jni_str!("show"),
             jni_sig!(
-                "(Landroid/content/Context;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
+                "(Landroid/content/Context;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
             ),
             &[
                 JValue::Object(java.context.as_obj()),
@@ -218,6 +300,7 @@ pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str) 
                 JValue::Object(&text),
                 JValue::Object(&sub_text),
                 JValue::Object(&target),
+                JValue::Object(&actions),
             ],
         )
         .map(drop)
@@ -274,6 +357,20 @@ pub fn clipboard_from_system(cx: &mut gpui::App) {
     }
 }
 
+/// Whether the system asks apps to reduce motion (Remove animations).
+pub fn reduce_motion() -> bool {
+    call_java("Clipboard.reduceMotion", |env, java| {
+        env.call_static_method(
+            &java.clipboard,
+            jni_str!("reduceMotion"),
+            jni_sig!("(Landroid/content/Context;)Z"),
+            &[JValue::Object(java.context.as_obj())],
+        )?
+        .z()
+    })
+    .unwrap_or(false)
+}
+
 /// The system clipboard's HTML, for pasting with formatting.
 pub fn clipboard_html() -> Option<String> {
     let mut html = None;
@@ -312,16 +409,121 @@ pub fn clipboard_to_system(cx: &mut gpui::App) {
     }
     *synced = Some(text.clone());
     drop(synced);
-    with_java("Clipboard.write", |env, java| {
-        let text = env.new_string(&text)?;
+    write_system_clipboard(&text);
+}
+
+/// Copies `text` to Android's clipboard now, for a Copy button: GPUI's
+/// clipboard is only the app's own, and otherwise reaches Android only as
+/// Picacho goes to the background. False when Android refused it (too
+/// large to hand between apps).
+pub fn copy_to_system(text: &str) -> bool {
+    let copied = write_system_clipboard(text);
+    if copied {
+        *CLIPBOARD_SYNCED.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_owned());
+    }
+    copied
+}
+
+/// Copies a secret (a sign-in code) to Android's clipboard, marked
+/// sensitive so the system's preview and keyboards' histories leave it out.
+pub fn copy_sensitive_to_system(text: &str) -> bool {
+    let copied = call_java("Clipboard.writeSensitive", |env, java| {
+        let text = env.new_string(text)?;
+        env.call_static_method(
+            &java.clipboard,
+            jni_str!("writeSensitive"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)Z"),
+            &[JValue::Object(java.context.as_obj()), JValue::Object(&text)],
+        )?
+        .z()
+    }) == Some(true);
+    if copied {
+        // Not copied again, unmarked, when the app's clipboard is synced.
+        *CLIPBOARD_SYNCED.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_owned());
+    }
+    copied
+}
+
+fn write_system_clipboard(text: &str) -> bool {
+    call_java("Clipboard.write", |env, java| {
+        let text = env.new_string(text)?;
         env.call_static_method(
             &java.clipboard,
             jni_str!("write"),
-            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)V"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)Z"),
             &[JValue::Object(java.context.as_obj()), JValue::Object(&text)],
-        )
-        .map(drop)
+        )?
+        .z()
+    }) == Some(true)
+}
+
+/// Asks where to save `bytes` as `name` with the system's document picker
+/// (`SaveFile`) and saves them there: GPUI has no save dialog on Android.
+/// `Ok(false)` when the person cancelled. Blocks until they answer: call it
+/// off the UI thread.
+pub fn save_as(bytes: &[u8], name: &str, mime: &str) -> anyhow::Result<bool> {
+    if JAVA.get().is_none() {
+        anyhow::bail!(t!("android-saving-isnt-available-yet"));
+    }
+    // Written whole to the cache first; Java copies it where it was asked.
+    let dir = std::env::temp_dir().join("picacho-save");
+    std::fs::create_dir_all(&dir)?;
+    // Copies left by a save the app was closed during (it never came back
+    // to remove them). A day old: no picker stays open that long.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(86_400));
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let source = dir.join(format!("{:016x}", rand_suffix()));
+    if let Err(e) = std::fs::write(&source, bytes) {
+        // A partly written copy (the disk filled) isn't left behind.
+        let _ = std::fs::remove_file(&source);
+        return Err(e.into());
+    }
+    let source_path = source.to_string_lossy().into_owned();
+    let outcome = call_java("SaveFile.save", |env, java| {
+        let source = env.new_string(&source_path)?;
+        let name = env.new_string(name)?;
+        let mime = env.new_string(mime)?;
+        env.call_static_method(
+            &java.save_file,
+            jni_str!("save"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I"),
+            &[
+                JValue::Object(java.context.as_obj()),
+                JValue::Object(&source),
+                JValue::Object(&name),
+                JValue::Object(&mime),
+            ],
+        )?
+        .i()
     });
+    let _ = std::fs::remove_file(&source);
+    match outcome {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(t!("android-couldnt-save-the-file")),
+    }
+}
+
+fn rand_suffix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
 }
 
 /// A step of Android's Back (`PicachoActivity`'s back callback).
@@ -443,6 +645,51 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_open<'caller>(
     native(env, |_| {
         if !target.is_null() {
             display::notify::clicked(&target.to_string());
+        }
+        Ok(())
+    });
+}
+
+/// `Native.quick(String target)`: a button on a new-mail notification was
+/// pressed (Mark as Read, Archive, Delete; `target` carries which, as its
+/// `action`), reaching `MailService`. The window acts on it when it's up,
+/// otherwise the service's backend does (`notify::quick`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_quick<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    target: JString<'caller>,
+) {
+    native(env, |_| {
+        if !target.is_null() {
+            let target = target.to_string();
+            if let Ok(t) = serde_json::from_str::<display::notify::Target>(&target)
+                && let Some(action) = t.action.clone()
+            {
+                let plain = display::notify::Target { action: None, ..t };
+                if let Ok(json) = serde_json::to_string(&plain) {
+                    display::notify::quick(&json, &action);
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
+/// `Native.launch(String request)`: another app handed Picacho a `mailto:`
+/// link, an email file or a share (`Shared.java`); the window takes it
+/// (`display::launch`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_launch<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    request: JString<'caller>,
+) {
+    native(env, |_| {
+        if !request.is_null()
+            && let Some(request) = display::launch::request(&request.to_string())
+        {
+            display::launch::push(request);
         }
         Ok(())
     });
@@ -589,6 +836,14 @@ struct Java {
     passkeys: Global<JClass<'static>>,
     /// Opens links in the browser (or mail app).
     browser: Global<JClass<'static>>,
+    /// "Save as", with the system's document picker.
+    save_file: Global<JClass<'static>>,
+    /// Home-screen widgets (`WidgetStore`).
+    widgets: Global<JClass<'static>>,
+    /// The app lock's fingerprint or face prompt (`AppLock`).
+    app_lock: Global<JClass<'static>>,
+    /// Picacho's language, for the text Android shows (`Lang`).
+    lang: Global<JClass<'static>>,
     /// The app's package name (`tech.pinal.picacho`, or the beta's).
     package: String,
 }
@@ -666,6 +921,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
 ) {
     init_logging();
     native(env, |env| {
+        let _attaching = ATTACH.lock().unwrap_or_else(|e| e.into_inner());
         if JAVA.get().is_some() {
             return Ok(());
         }
@@ -679,6 +935,10 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
         let keys = env.find_class(jni_str!("tech/pinal/picacho/SecurityKeys"))?;
         let passkeys = env.find_class(jni_str!("tech/pinal/picacho/Passkeys"))?;
         let browser = env.find_class(jni_str!("tech/pinal/picacho/Browser"))?;
+        let save_file = env.find_class(jni_str!("tech/pinal/picacho/SaveFile"))?;
+        let widgets = env.find_class(jni_str!("tech/pinal/picacho/WidgetStore"))?;
+        let app_lock = env.find_class(jni_str!("tech/pinal/picacho/AppLock"))?;
+        let lang = env.find_class(jni_str!("tech/pinal/picacho/Lang"))?;
         let package = env
             .call_method(
                 &context,
@@ -700,11 +960,58 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
             keys: env.new_global_ref(&keys)?,
             passkeys: env.new_global_ref(&passkeys)?,
             browser: env.new_global_ref(&browser)?,
+            save_file: env.new_global_ref(&save_file)?,
+            widgets: env.new_global_ref(&widgets)?,
+            app_lock: env.new_global_ref(&app_lock)?,
+            lang: env.new_global_ref(&lang)?,
             package,
         };
         let _ = JAVA.set(java);
+        if let Some(java) = JAVA.get() {
+            prime_context_users(java);
+        }
         Ok(())
     });
+}
+
+/// Opens what needs the app's context through ndk-context (the keychain's
+/// store, which keeps its own reference to the context once made, and the
+/// system's DNS settings, read once), with the context set for just that,
+/// then released: before anything else of Picacho's runs in the process
+/// (the first `Native.attach`, under `ATTACH`), and before an activity,
+/// whose android-activity sets ndk-context up itself and must find it
+/// unset. Nothing reads ndk-context afterwards (but the activity's own
+/// code, from its context), so no thread races with its setting or
+/// release, and a refresh started without the activity (a widget's, in a
+/// process started cold) can't find it unset and panic in the keychain,
+/// poisoning its locks for the process's life.
+fn prime_context_users(java: &Java) {
+    if UI_STARTED.load(Ordering::SeqCst) {
+        // android-activity's context is set: nothing of ours to set.
+        let _ = crate::manage::store::secret_entry("picacho-prime");
+        let _ = crate::sync::auth::system_conf();
+        return;
+    }
+    // Safety: the first attach of the process, under `ATTACH`; no activity
+    // has started (android-activity hasn't set it), and no other thread
+    // of Picacho's runs yet to read it. The context is a global reference
+    // kept for the process's life (`JAVA`). Released below, before any
+    // activity's onCreate goes on (it waits for `ATTACH`).
+    unsafe {
+        ndk_context::initialize_android_context(java.vm.get_raw().cast(), java.context.as_obj().as_raw().cast());
+    }
+    let primed = std::panic::catch_unwind(|| {
+        if let Err(e) = crate::manage::store::secret_entry("picacho-prime") {
+            log::warn!("the keychain couldn't be opened: {e:#}");
+        }
+        let _ = crate::sync::auth::system_conf();
+    });
+    if primed.is_err() {
+        log::error!("opening the keychain panicked");
+    }
+    // Safety: set just above by this thread, under `ATTACH`; nothing else
+    // read it meanwhile.
+    unsafe { ndk_context::release_android_context() };
 }
 
 /// `Native.beforeActivity()`: the first activity of this process is about to
@@ -716,13 +1023,24 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_beforeActivity<'caller>(
     _class: JClass<'caller>,
 ) {
     native(env, |_| {
-        let mut process = process();
-        process.ui = true;
-        process.monitor = None;
-        if CONTEXT_OURS.swap(false, Ordering::SeqCst) {
-            // Safety: set by `start_service_monitor`, and nothing else
-            // released it.
-            unsafe { ndk_context::release_android_context() };
+        // Briefly: the store opens without `PROCESS` (`open_backend`).
+        let monitor = {
+            let mut process = process();
+            process.ui = true;
+            process.monitor.take()
+        };
+        // Stopped off the UI thread: waiting for a scheduled message being
+        // sent (up to minutes) here would freeze the activity's start. The
+        // window shares this process's backend, which sends each scheduled
+        // message once (`Backend::scheduled_sending`), so it needn't wait.
+        // ndk-context isn't the monitor's (`prime_context_users`).
+        if let Some(monitor) = monitor {
+            let stopped = std::thread::Builder::new()
+                .name("picacho-monitor-stop".into())
+                .spawn(move || monitor.stop_and_wait(std::time::Duration::from_secs(1)));
+            if let Err(e) = stopped {
+                log::warn!("the background check couldn't be stopped apart: {e}");
+            }
         }
         Ok(())
     });
@@ -739,9 +1057,10 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_serviceStarted<'caller>(
 ) {
     native(env, |_| {
         let path = std::path::PathBuf::from(data_dir.to_string());
+        let run = SERVICE_RUNS.fetch_add(1, Ordering::SeqCst) + 1;
         let spawned = std::thread::Builder::new()
             .name("picacho-service".into())
-            .spawn(move || start_service_monitor(&path));
+            .spawn(move || start_service_monitor(&path, run));
         if let Err(e) = spawned {
             log::error!("could not start checking mail in the background: {e}");
         }
@@ -749,35 +1068,29 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_serviceStarted<'caller>(
     });
 }
 
-fn start_service_monitor(path: &Path) {
-    let mut process = process();
-    process.service = true;
-    if process.ui {
-        // The window checks while it runs; the monitor starts once it's gone.
-        return;
-    }
-    // The keychain finds the app through ndk-context, which only an
-    // activity sets up.
-    if !UI_STARTED.load(Ordering::SeqCst)
-        && !CONTEXT_OURS.load(Ordering::SeqCst)
-        && let Some(java) = JAVA.get()
+fn start_service_monitor(path: &Path, run: u64) {
     {
-        // Safety: no activity has run in this process, so android-activity
-        // hasn't set it; it's released before one does (`beforeActivity`).
-        // The context is a global reference kept for the process's life.
-        unsafe {
-            ndk_context::initialize_android_context(
-                java.vm.get_raw().cast(),
-                java.context.as_obj().as_raw().cast(),
-            );
+        let mut process = process();
+        if SERVICE_RUNS.load(Ordering::SeqCst) != run {
+            // Stopped (or started again) since: that one decides.
+            return;
         }
-        CONTEXT_OURS.store(true, Ordering::SeqCst);
+        process.service = true;
+        if process.ui {
+            // The window checks while it runs; the monitor starts once it's gone.
+            return;
+        }
     }
-    if let Err(e) = process.backend(path) {
+    // Opened without `PROCESS` held (`open_backend`); the keychain it may
+    // need was opened at attach (`prime_context_users`).
+    if let Err(e) = open_backend(path) {
         log::error!("could not open the mail store at {}: {e:#}", path.display());
         return;
     }
-    process.reconcile();
+    let mut process = process();
+    if SERVICE_RUNS.load(Ordering::SeqCst) == run && !process.ui {
+        process.reconcile();
+    }
 }
 
 /// `Native.serviceStopped()`: `MailService` ended (turned off, or stopped
@@ -788,6 +1101,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_serviceStopped<'caller>(
     _class: JClass<'caller>,
 ) {
     native(env, |_| {
+        SERVICE_RUNS.fetch_add(1, Ordering::SeqCst);
         let mut process = process();
         process.service = false;
         process.reconcile();
@@ -839,7 +1153,10 @@ pub fn open_sign_in(url: &str) -> anyhow::Result<()> {
         )?
         .z()
     });
-    anyhow::ensure!(opened == Some(true), "Could not open the browser");
+    anyhow::ensure!(
+        opened == Some(true),
+        t!("android-could-not-open-the-browser")
+    );
     Ok(())
 }
 
@@ -889,7 +1206,7 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
     });
     anyhow::ensure!(
         started == Some(true),
-        "Proton wants to check that it's you, but its check couldn't be shown."
+        t!("android-proton-wants-to-check-that-its")
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30 * 60);
     let outcome = loop {
@@ -902,7 +1219,7 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
                 }
             }
             Waited::Answer(None) | Waited::TimedOut => break Ok(None),
-            Waited::Cancelled => break Err(anyhow::anyhow!("Sign-in cancelled.")),
+            Waited::Cancelled => break Err(anyhow::anyhow!(t!("android-sign-in-cancelled"))),
         }
     };
     with_java("VerifyActivity.close", |env, java| {
@@ -915,4 +1232,100 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
         .map(drop)
     });
     outcome
+}
+
+/// Whether the phone can unlock the app lock with a fingerprint or the face
+/// (`AppLock.available`): Android 10 or later, with one enrolled.
+pub fn biometrics_available() -> bool {
+    call_java("AppLock.available", |env, java| {
+        env.call_static_method(
+            &java.app_lock,
+            jni_str!("available"),
+            jni_sig!("(Landroid/content/Context;)Z"),
+            &[JValue::Object(java.context.as_obj())],
+        )?
+        .z()
+    }) == Some(true)
+}
+
+/// Shows Android's fingerprint or face prompt for the app lock
+/// (`AppLock.authenticate`) and waits for how it ended.
+pub fn authenticate_biometrics(reason: &str) -> crate::display::biometric::Answer {
+    use crate::display::biometric::Failure;
+    use requests::{Request, Waited};
+    let request = Request::new();
+    let id = request.id();
+    let asked = call_java("AppLock.authenticate", |env, java| {
+        let title = env.new_string(t!("android-unlock-picacho"))?;
+        let reason = env.new_string(reason)?;
+        let cancel = env.new_string(t!("android-use-passcode"))?;
+        env.call_static_method(
+            &java.app_lock,
+            jni_str!("authenticate"),
+            jni_sig!("(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
+            &[
+                JValue::Int(id),
+                JValue::Object(&title),
+                JValue::Object(&reason),
+                JValue::Object(&cancel),
+            ],
+        )
+        .map(drop)
+    });
+    if asked.is_none() {
+        return Err(Failure::Failed(
+            t!("android-the-fingerprint-or-face-prompt-couldnt").into(),
+        ));
+    }
+    let never = AtomicBool::new(false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
+    match request.next(&never, deadline) {
+        Waited::Answer(Some(answer)) if answer == "ok" => Ok(()),
+        Waited::Answer(Some(answer)) if answer == "unsupported" => Err(Failure::Failed(
+            t!("android-this-phones-android-is-too-old").into(),
+        )),
+        Waited::Answer(Some(answer)) => match answer.strip_prefix("error:") {
+            Some(why) => Err(Failure::Failed(why.to_owned())),
+            None => Err(Failure::Cancelled),
+        },
+        Waited::Answer(None) | Waited::TimedOut | Waited::Cancelled => Err(Failure::Cancelled),
+    }
+}
+
+/// Tells the Java side the language Picacho shows (`Lang.set`), for the
+/// text Android shows for it: notifications, widgets, the widget settings.
+/// With `apply`, `chosen` (empty: the phone's) was just chosen in Settings,
+/// and Android 13 and later learn it too (its app info, the widget picker).
+pub fn set_language(chosen: &str, apply: bool) {
+    let code = crate::i18n::language();
+    with_java("Lang.set", |env, java| {
+        let code = env.new_string(code)?;
+        let chosen = env.new_string(chosen)?;
+        env.call_static_method(
+            &java.lang,
+            jni_str!("set"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Z)V"),
+            &[
+                JValue::Object(java.context.as_obj()),
+                JValue::Object(&code),
+                JValue::Object(&chosen),
+                JValue::Bool(apply),
+            ],
+        )
+        .map(drop)
+    });
+}
+
+/// Keeps Picacho's picture out of Recents (Android 13 and later), while
+/// the app lock is on (`AppLock.setRecentsPrivate`). Screenshots still work.
+pub fn set_recents_private(on: bool) {
+    with_java("AppLock.setRecentsPrivate", |env, java| {
+        env.call_static_method(
+            &java.app_lock,
+            jni_str!("setRecentsPrivate"),
+            jni_sig!("(Z)V"),
+            &[JValue::Bool(on)],
+        )
+        .map(drop)
+    });
 }

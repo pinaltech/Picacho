@@ -65,18 +65,31 @@ impl MailApp {
 
     fn page_title(&self, page: &Page) -> String {
         match page {
-            Page::General => "General".into(),
-            Page::Reading => "Reading".into(),
-            Page::Composing => "Composing".into(),
-            Page::Forwarding => "Forwarding".into(),
-            Page::LocalAi => "Local AI".into(),
-            Page::About => "About Picacho".into(),
+            Page::General => t!("mobile-settings-general").into(),
+            Page::Reading => t!("mobile-settings-reading").into(),
+            Page::Composing => t!("mobile-settings-composing").into(),
+            Page::Forwarding => t!("mobile-settings-forwarding").into(),
+            Page::Contacts => t!("mobile-settings-contacts").into(),
+            Page::Calendar => t!("mobile-settings-calendar").into(),
+            Page::Encryption => t!("mobile-settings-encryption").into(),
+            Page::Privacy => t!("mobile-settings-privacy").into(),
+            Page::LocalAi => t!("mobile-settings-local-ai").into(),
+            Page::Organizing => t!("mobile-settings-rules-layout").into(),
+            Page::InboxControl => t!("mobile-settings-inbox-control").into(),
+            Page::Workspaces => t!("mobile-settings-workspaces").into(),
+            Page::Workspace(id) => self
+                .workspaces
+                .get(id)
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| t!("mobile-settings-workspaces").into()),
+            Page::Shortcuts => t!("mobile-settings-keyboard-shortcuts").into(),
+            Page::About => t!("mobile-settings-about-picacho").into(),
             Page::Account(id) => self
                 .accounts
                 .iter()
                 .find(|a| &a.id == id)
                 .map(|a| a.label().to_owned())
-                .unwrap_or_else(|| "Mailbox".into()),
+                .unwrap_or_else(|| t!("mobile-settings-mailbox").into()),
         }
     }
 
@@ -98,7 +111,9 @@ impl MailApp {
     ) -> AnyElement {
         let c = self.colors();
         let row = |id: &'static str, icon: &'static str, page: Page| {
-            let active = beside && self.page == page;
+            // A workspace's page is within Workspaces.
+            let within = page == Page::Workspaces && matches!(self.page, Page::Workspace(_));
+            let active = beside && (self.page == page || within);
             self.cell(
                 id,
                 icon_el(icon, 22., c.accent).into_any_element(),
@@ -124,7 +139,7 @@ impl MailApp {
                     SharedString::from(format!("mobile-settings-account-{}", a.id)),
                     self.account_avatar(a, i, 28.),
                     a.label().to_owned(),
-                    issue.then(|| "Needs attention".to_owned()),
+                    issue.then(|| t!("mobile-settings-needs-attention").to_owned()),
                     !beside,
                     active,
                     Self::open_page(page),
@@ -137,7 +152,7 @@ impl MailApp {
             self.cell(
                 "mobile-settings-add-account",
                 icon_el("plus", 22., c.accent).into_any_element(),
-                "Add Account",
+                t!("mobile-settings-add-account"),
                 None,
                 false,
                 false,
@@ -164,9 +179,16 @@ impl MailApp {
                 row("mobile-settings-reading", "mail", Page::Reading),
                 row("mobile-settings-composing", "compose", Page::Composing),
                 row("mobile-settings-forwarding", "alias", Page::Forwarding),
+                row("mobile-settings-contacts", "contact", Page::Contacts),
+                row("mobile-settings-calendar", "clock", Page::Calendar),
+                row("mobile-settings-encryption", "lock", Page::Encryption),
+                row("mobile-settings-privacy", "shield", Page::Privacy),
                 row("mobile-settings-local-ai", "sparkle", Page::LocalAi),
+                row("mobile-settings-organizing", "filter", Page::Organizing),
+                row("mobile-settings-inbox-control", "vip", Page::InboxControl),
+                row("mobile-settings-workspaces", "workspace", Page::Workspaces),
             ]))
-            .child(self.group_label("Mailboxes"))
+            .child(self.group_label(t!("mobile-settings-mailboxes")))
             .child(self.group(mailboxes))
             .child(div().h_6())
             .child(self.group(vec![row("mobile-settings-about", "info", Page::About)]));
@@ -179,7 +201,7 @@ impl MailApp {
                 "mobile-settings-bar",
                 insets,
                 Some(self.back_icon("mobile-settings-done", cx)),
-                "Settings",
+                t!("mobile-settings-settings"),
                 None,
                 vec![],
             ))
@@ -212,8 +234,10 @@ impl MailApp {
             ),
         };
         // Back to the list of pages, or from reverse aliases to Forwarding.
-        let leading = (stacked || (self.fwd_reverse.is_some() && sub_open(self)))
-            .then(|| self.back_icon("mobile-settings-back", cx));
+        let leading = (stacked
+            || (self.fwd_reverse.is_some() && sub_open(self))
+            || matches!(self.page, Page::Workspace(_)))
+        .then(|| self.back_icon("mobile-settings-back", cx));
         div()
             .id("mobile-settings-page")
             .relative()
@@ -353,7 +377,7 @@ impl MailApp {
             ),
             None => (
                 self.back_icon("mobile-subs-back", cx),
-                "Subscriptions".to_owned(),
+                t!("mobile-settings-subscriptions").to_owned(),
                 self.subscription_list(true, Corners::default(), cx)
                     .border_r_0()
                     .into_any_element(),
@@ -378,6 +402,121 @@ impl MailApp {
                     .flex_col()
                     .text_size(px(15.))
                     .child(content),
+            )
+            .into_any_element()
+    }
+}
+
+impl MailApp {
+    /// Calendar, Tasks or Contacts opened as its own full-screen view on phones.
+    pub(super) fn mobile_app_view(
+        &mut self,
+        view: calendar_views::AppView,
+        insets: Insets,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = self.colors();
+        let back = self.back_icon("mobile-app-view-back", cx);
+        if view == calendar_views::AppView::Attachments {
+            // Its list scrolls itself, under the bar.
+            return div()
+                .id("mobile-attachments")
+                .debug_selector(|| "mobile-attachments".into())
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(c.surface))
+                .child(self.nav_bar(
+                    "mobile-app-view-bar",
+                    insets,
+                    Some(back),
+                    t!("attachments-attachments").to_owned(),
+                    None,
+                    vec![],
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .pl(px(insets.left))
+                        .pr(px(insets.right))
+                        .pb(px(insets.below()))
+                        .child(self.attachments_page(Corners::default(), true, cx)),
+                )
+                .into_any_element();
+        }
+        let (id, title, content) = match view {
+            calendar_views::AppView::Calendar => {
+                ("mobile-calendar", t!("mobile-settings-calendar"), self.calendar_page(cx))
+            }
+            calendar_views::AppView::Contacts => {
+                ("mobile-contacts", t!("mobile-settings-contacts"), self.contacts_page(cx))
+            }
+            calendar_views::AppView::Tasks => ("mobile-tasks", t!("calendar-views-tasks"), self.tasks_page(cx)),
+            calendar_views::AppView::Attachments => unreachable!("drawn above"),
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(c.surface))
+            .child(self.nav_bar(
+                "mobile-app-view-bar",
+                insets,
+                Some(back),
+                title.to_owned(),
+                None,
+                vec![],
+            ))
+            .child(
+                div()
+                    .id("mobile-app-view-scroll")
+                    .track_scroll(&self.cal.scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .pl(px(insets.left + GUTTER))
+                    .pr(px(insets.right + GUTTER))
+                    .pt_4()
+                    .pb(px(insets.below() + 24.))
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    /// An account's Summary, full screen.
+    pub(super) fn mobile_summary(&mut self, insets: Insets, cx: &mut Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let back = self.back_icon("mobile-summary-back", cx);
+        div()
+            .id("mobile-summary")
+            .debug_selector(|| "mobile-summary".into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(c.surface))
+            .child(self.nav_bar(
+                "mobile-summary-bar",
+                insets,
+                Some(back),
+                t!("mobile-settings-summary").to_owned(),
+                None,
+                vec![],
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .pl(px(insets.left))
+                    .pr(px(insets.right))
+                    .pb(px(insets.below()))
+                    .flex()
+                    .flex_col()
+                    .child(self.summary_page(true, Corners::default(), cx)),
             )
             .into_any_element()
     }
@@ -417,13 +556,13 @@ impl MailApp {
                     link(
                         "mobile-about-source",
                         "github",
-                        "Source Code",
+                        t!("mobile-settings-source-code"),
                         super::super::REPO_URL,
                     ),
                     link(
                         "mobile-about-website",
                         "globe",
-                        "Website",
+                        t!("mobile-settings-website"),
                         super::super::WEBSITE_URL,
                     ),
                 ])),

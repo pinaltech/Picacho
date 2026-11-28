@@ -33,13 +33,39 @@ pub(super) struct Watcher {
     mailbox: Mailbox,
     /// Its server agreed to NOTIFY: it hears about every mailbox.
     notifying: Arc<AtomicBool>,
+    /// Its thread, woken from `pause` when stopped.
+    thread: Option<std::thread::Thread>,
 }
 impl Watcher {
+    fn on(mut self, thread: &std::thread::Thread) -> Self {
+        self.thread = Some(thread.clone());
+        self
+    }
     fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(thread) = &self.thread {
+            thread.unpark();
+        }
         if let Some(socket) = self.socket.lock().unwrap().take() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
+    }
+}
+/// Waits `wait` on a watcher's own thread, or less once `stop` is set
+/// (`Watcher::stop` wakes it). Asleep meanwhile, rather than waking every
+/// moment to look. Returns whether it was stopped.
+fn pause(stop: &AtomicBool, wait: Duration) -> bool {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= until {
+            return false;
+        }
+        // Wakes early on `unpark` (or spuriously): the loop looks again.
+        std::thread::park_timeout(until - now);
     }
 }
 /// Why a watch ended.
@@ -76,25 +102,42 @@ impl Backend {
                 return;
             }
             if let Some(w) = self.spawn_proton_watch(a, Arc::new(changed)) {
-                self.watchers.lock().unwrap().insert(a.id.clone(), w);
+                self.keep_watcher(&self.watchers, &a.id, w);
             }
             return;
         }
         if a.provider == Provider::Jmap {
             self.stop_watching(&a.id);
             if let Some(w) = self.spawn_jmap_watch(a, Arc::new(changed)) {
-                self.watchers.lock().unwrap().insert(a.id.clone(), w);
+                self.keep_watcher(&self.watchers, &a.id, w);
+            }
+            return;
+        }
+        // Exchange Server: a streaming subscription, Exchange's own push.
+        if a.ews() {
+            self.stop_watching(&a.id);
+            if let Some(w) = self.spawn_ews_watch(a, Arc::new(changed)) {
+                self.keep_watcher(&self.watchers, &a.id, w);
+            }
+            return;
+        }
+        // The Gmail API and Microsoft Graph: their pushes can't reach a
+        // desktop app, so a small question every half minute stands in.
+        if a.native_api() {
+            self.stop_watching(&a.id);
+            if let Some(w) = self.spawn_api_watch(a, Arc::new(changed)) {
+                self.keep_watcher(&self.watchers, &a.id, w);
             }
             return;
         }
         // POP3 has no IDLE: its mail is checked on a timer.
-        if !a.provider.imap() {
+        if !a.imap() {
             return;
         }
         self.stop_watching(&a.id);
         let watcher = self.spawn_watch(a, Mailbox::Standard(Folder::Inbox), Arc::new(changed));
         if let Some(w) = watcher {
-            self.watchers.lock().unwrap().insert(a.id.clone(), w);
+            self.keep_watcher(&self.watchers, &a.id, w);
         }
     }
     /// Also watches `mailbox` (the one open in the window) with IDLE, when
@@ -110,7 +153,7 @@ impl Backend {
         let wanted = mailbox.filter(|m| {
             !m.folder().is_virtual()
                 && !matches!(m, Mailbox::Standard(Folder::Inbox | Folder::Drafts))
-                && a.provider.imap()
+                && a.imap()
         });
         let notifying = self
             .watchers
@@ -133,7 +176,7 @@ impl Backend {
             return;
         };
         if let Some(w) = self.spawn_watch(a, mailbox, Arc::new(changed)) {
-            self.folder_watchers.lock().unwrap().insert(a.id.clone(), w);
+            self.keep_watcher(&self.folder_watchers, &a.id, w);
         }
     }
     /// Proton: its event stream stands in for IDLE, as it does inside
@@ -145,6 +188,7 @@ impl Backend {
             socket: Arc::new(Mutex::new(None)),
             mailbox: Mailbox::Standard(Folder::Inbox),
             notifying: Arc::new(AtomicBool::new(true)),
+            thread: None,
         };
         let stop = watcher.stop.clone();
         let backend = self.clone();
@@ -158,7 +202,7 @@ impl Backend {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         backend.proton_events(&a, &stop, &*changed, &mut watched)
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Proton's events failed")));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-watch-protons-events-failed"))));
                     let Err(error) = outcome else {
                         break;
                     };
@@ -174,17 +218,14 @@ impl Backend {
                         retry
                     };
                     retry = (retry * 2).min(LONGEST_RETRY);
-                    let until = std::time::Instant::now() + wait;
-                    while std::time::Instant::now() < until && !stop.load(Ordering::Acquire) {
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
+                    pause(&stop, wait);
                     // Mail may have arrived while the watch was down.
                     if !stop.load(Ordering::Acquire) {
                         changed(Mailbox::Standard(Folder::Inbox));
                     }
                 }
             });
-        spawned.ok().map(|_| watcher)
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
     }
     /// Follows Proton's events until `stop`, saying which mailboxes
     /// changed. Like IDLE, it only notices: the regular check syncs.
@@ -204,12 +245,8 @@ impl Backend {
             // the requests don't settle into lockstep with anything else.
             let every = Duration::from_secs(u64::from(a.sync.proton_events_seconds.max(1)));
             let wait = every + every.mul_f64(rand::random::<f64>() / 4.0);
-            let until = std::time::Instant::now() + wait;
-            while std::time::Instant::now() < until {
-                if stop.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(250));
+            if pause(stop, wait) {
+                return Ok(());
             }
             let (news, folders) =
                 self.with_proton(a, |s| Ok((s.events_since(&since)?, s.folders())))?;
@@ -279,12 +316,140 @@ impl Backend {
     /// JMAP: the server's event source stands in for IDLE (or, where it has
     /// none, asking for changes every minute). One watcher per account
     /// hears about every mailbox, so no folder needs one of its own.
+    /// Watches a Gmail API or Microsoft Graph account by asking every
+    /// `API_WATCH` whether its mailbox changed (Gmail's history id; the
+    /// inbox's counts and newest message at Microsoft): one small request,
+    /// and the inbox is said to have changed when the answer does.
+    fn spawn_api_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
+        #[cfg(not(test))]
+        const API_WATCH: Duration = Duration::from_secs(30);
+        #[cfg(test)]
+        const API_WATCH: Duration = Duration::from_millis(50);
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            socket: Arc::new(Mutex::new(None)),
+            mailbox: Mailbox::Standard(Folder::Inbox),
+            notifying: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
+        let stop = watcher.stop.clone();
+        let backend = self.clone();
+        let a = a.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("api-watch-{}", a.id))
+            .spawn(move || backend.poll_signature(&a, &stop, &changed, API_WATCH));
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
+    }
+    /// Asks every `every` whether the account's mailbox changed (see
+    /// `mailbox_signature`), saying the inbox did when the answer changes,
+    /// until `stop`.
+    fn poll_signature(&self, a: &Account, stop: &AtomicBool, changed: &Changed, every: Duration) {
+        let mut last: Option<String> = None;
+        let mut wait = every;
+        while !pause(stop, wait) {
+            let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.mailbox_signature(a)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the mailbox couldn't be asked")));
+            match asked {
+                Ok(now) => {
+                    wait = every;
+                    if last.as_ref().is_some_and(|l| *l != now) && !stop.load(Ordering::Acquire) {
+                        changed(Mailbox::Standard(Folder::Inbox));
+                    }
+                    last = Some(now);
+                }
+                // Signed out or offline: ask less often until it works.
+                Err(e) if e.downcast_ref::<AccessFailure>().is_some() => wait = LONGEST_RETRY,
+                Err(_) => wait = (wait * 2).min(LONGEST_RETRY),
+            }
+        }
+    }
+    /// Watches an Exchange account's inbox with a streaming subscription
+    /// (EWS's push, Exchange 2010 SP1 and later), each request held for a
+    /// few minutes and asked again. Where streaming keeps failing at once
+    /// (an older Exchange, or a proxy that won't hold a request open), the
+    /// inbox is asked about every half minute instead. After a broken
+    /// stream the inbox is said to have changed, as changes meanwhile
+    /// weren't heard. Stopping takes effect at the next answer, at most
+    /// `STREAM_MINUTES` later, when the thread ends without telling.
+    fn spawn_ews_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
+        const STREAM_MINUTES: u32 = 5;
+        #[cfg(not(test))]
+        const POLL: Duration = Duration::from_secs(30);
+        #[cfg(test)]
+        const POLL: Duration = Duration::from_millis(50);
+        #[cfg(not(test))]
+        const FIRST_RETRY: Duration = Duration::from_secs(5);
+        #[cfg(test)]
+        const FIRST_RETRY: Duration = Duration::from_millis(20);
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            socket: Arc::new(Mutex::new(None)),
+            mailbox: Mailbox::Standard(Folder::Inbox),
+            notifying: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
+        let stop = watcher.stop.clone();
+        let backend = self.clone();
+        let a = a.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("ews-watch-{}", a.id))
+            .spawn(move || {
+                let mut quick_failures = 0;
+                let mut retry = FIRST_RETRY;
+                let mut broken = false;
+                while !stop.load(Ordering::Acquire) {
+                    let started = std::time::Instant::now();
+                    let heard = || {
+                        if !stop.load(Ordering::Acquire) {
+                            changed(Mailbox::Standard(Folder::Inbox));
+                        }
+                    };
+                    let streamed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        backend.with_ews(&a, |s| s.stream_inbox(&stop, STREAM_MINUTES, broken, heard))
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the stream couldn't be read")));
+                    match streamed {
+                        Ok(()) => return,
+                        Err(e) => {
+                            broken = true;
+                            let signed_out = e.downcast_ref::<AccessFailure>().is_some();
+                            if !signed_out && started.elapsed() < Duration::from_secs(10) {
+                                quick_failures += 1;
+                            } else {
+                                quick_failures = 0;
+                            }
+                            if quick_failures >= 3 {
+                                backend.poll_signature(&a, &stop, &changed, POLL);
+                                return;
+                            }
+                            let wait = if signed_out { LONGEST_RETRY } else { retry };
+                            retry = if started.elapsed() > Duration::from_secs(60) { FIRST_RETRY } else { (retry * 2).min(LONGEST_RETRY) };
+                            if pause(&stop, wait) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
+    }
+    /// Something that changes whenever an API account's mail does.
+    fn mailbox_signature(&self, a: &Account) -> Result<String> {
+        if a.gmail_api() {
+            self.with_gmail(a, |s| Ok(s.profile()?.history_id))
+        } else if a.ews() {
+            self.with_ews(a, |s| s.inbox_signature())
+        } else {
+            self.with_graph(a, |s| s.inbox_signature())
+        }
+    }
     fn spawn_jmap_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
         let watcher = Watcher {
             stop: Arc::new(AtomicBool::new(false)),
             socket: Arc::new(Mutex::new(None)),
             mailbox: Mailbox::Standard(Folder::Inbox),
             notifying: Arc::new(AtomicBool::new(true)),
+            thread: None,
         };
         let stop = watcher.stop.clone();
         let backend = self.clone();
@@ -298,7 +463,7 @@ impl Backend {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         backend.jmap_events(&a, &stop, &*changed, &mut watched)
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("JMAP's events failed")));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-watch-jmaps-events-failed"))));
                     let Err(error) = outcome else {
                         break;
                     };
@@ -314,17 +479,14 @@ impl Backend {
                         retry
                     };
                     retry = (retry * 2).min(LONGEST_RETRY);
-                    let until = std::time::Instant::now() + wait;
-                    while std::time::Instant::now() < until && !stop.load(Ordering::Acquire) {
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
+                    pause(&stop, wait);
                     // Mail may have arrived while the watch was down.
                     if !stop.load(Ordering::Acquire) {
                         changed(Mailbox::Standard(Folder::Inbox));
                     }
                 }
             });
-        spawned.ok().map(|_| watcher)
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
     }
     /// Follows a JMAP account's changes until `stop`, saying which
     /// mailboxes changed. Like IDLE, it only notices: the regular check
@@ -368,14 +530,8 @@ impl Backend {
             } else {
                 Duration::from_secs(60)
             };
-            {
-                let until = std::time::Instant::now() + wait;
-                while std::time::Instant::now() < until {
-                    if stop.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
+            if pause(stop, wait) {
+                return Ok(());
             }
             if stop.load(Ordering::Acquire) {
                 return Ok(());
@@ -396,6 +552,7 @@ impl Backend {
             socket: Arc::new(Mutex::new(None)),
             mailbox: mailbox.clone(),
             notifying: Arc::new(AtomicBool::new(false)),
+            thread: None,
         };
         let (stop, socket, notifying) = (
             watcher.stop.clone(),
@@ -423,7 +580,7 @@ impl Backend {
                             &mut watched,
                         )
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("IDLE failed")));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-watch-idle-failed"))));
                     match outcome {
                         Ok(Ended::Unsupported) => break,
                         Ok(Ended::Stopped) => break,
@@ -447,11 +604,7 @@ impl Backend {
                                 retry
                             };
                             retry = (retry * 2).min(LONGEST_RETRY);
-                            let until = std::time::Instant::now() + wait;
-                            while std::time::Instant::now() < until && !stop.load(Ordering::Acquire)
-                            {
-                                std::thread::sleep(Duration::from_millis(250));
-                            }
+                            pause(&stop, wait);
                             // Mail may have arrived while the watch was down.
                             if !stop.load(Ordering::Acquire) {
                                 changed(mailbox.clone());
@@ -461,9 +614,18 @@ impl Backend {
                 }
             });
         // Without a thread, polling checks this mailbox.
-        spawned.ok().map(|_| watcher)
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
     }
     /// Ends the account's watches, if any; their connections close.
+    /// Keeps `w` as `id`'s watcher in `watchers`, stopping the one it
+    /// replaces: two watches started at once each stopped the old one and
+    /// then put theirs in, the first one's thread and connection left
+    /// running with nothing to stop them.
+    fn keep_watcher(&self, watchers: &Mutex<HashMap<String, Watcher>>, id: &str, w: Watcher) {
+        if let Some(old) = watchers.lock().unwrap().insert(id.to_owned(), w) {
+            old.stop();
+        }
+    }
     pub fn stop_watching(&self, id: &str) {
         if let Some(w) = self.watchers.lock().unwrap().remove(id) {
             w.stop();
@@ -537,7 +699,7 @@ impl Backend {
         c.session.examine(&wire)?;
         // The inbox's watcher hears about every mailbox where it can.
         let inbox = *mailbox == Mailbox::Standard(Folder::Inbox);
-        if inbox && ext.notify && notify_personal(&mut c.session)? {
+        if inbox && ext.notify && notify_personal(&mut c.session, ext.condstore)? {
             notifying.store(true, Ordering::Release);
         }
         let utf8 = c.enabled.utf8;
@@ -559,11 +721,31 @@ impl Backend {
                 continue;
             }
             // NOTIFY's STATUS lines name other mailboxes that changed.
+            // After an overflow the server has stopped notifying: every
+            // mailbox may have changed, and NOTIFY is set again.
+            if let Some(heard) = &heard
+                && notification_overflow(heard)
+            {
+                for n in &names {
+                    if !n.has("Noselect") && !n.has("NonExistent") {
+                        changed(mailbox_of(&names, a.provider, &n.name));
+                    }
+                }
+                let _ = notify_personal(&mut c.session, ext.condstore);
+            }
             if let Some(heard) = &heard {
                 for name in status_mailboxes(heard, utf8) {
                     if name != remote {
                         changed(mailbox_of(&names, a.provider, &name));
                     }
+                }
+                // Folders made, renamed, deleted or (un)subscribed elsewhere
+                // (NOTIFY's MailboxName and SubscriptionChange, RFC 5465
+                // §5.4–5.5): the Inbox's check is asked for because every
+                // check lists the folders again and saves them. However
+                // many LIST lines came, once.
+                if mailbox_list_changed(heard) {
+                    changed(Mailbox::Standard(Folder::Inbox));
                 }
             }
             // Any line ends the wait, keepalives too ("* OK still here"
@@ -600,8 +782,11 @@ fn mailbox_of(names: &[Name], provider: Provider, remote: &str) -> Mailbox {
 /// Whether what a server sent during IDLE reports a change in the watched
 /// mailbox: untagged mailbox data (`* 3 EXISTS`, `* 2 EXPUNGE`, `* 5
 /// FETCH`…), not status lines (`* OK`, `* NO`, `* BYE`), NOTIFY's STATUS
-/// about other mailboxes, the `+ idling` go-ahead, or the tagged reply that
-/// ends the IDLE. A copy cut off at its limit is taken to.
+/// about other mailboxes, an annotation changed elsewhere (unsolicited
+/// METADATA, RFC 5464 §4.4.2: no message changed), NOTIFY's LIST about
+/// folders (handled as such: `mailbox_list_changed`), the `+ idling`
+/// go-ahead, or the tagged reply that ends the IDLE. A copy cut off at its
+/// limit is taken to.
 fn reports_change(heard: &[u8]) -> bool {
     if heard.len() >= crate::sync::stream::Tap::LIMIT {
         return true;
@@ -610,7 +795,7 @@ fn reports_change(heard: &[u8]) -> bool {
         let mut words = line.split_ascii_whitespace();
         words.next() == Some("*")
             && words.next().is_some_and(|w| {
-                !["OK", "NO", "BAD", "BYE", "PREAUTH", "STATUS"]
+                !["OK", "NO", "BAD", "BYE", "PREAUTH", "STATUS", "METADATA", "LIST"]
                     .iter()
                     .any(|s| s.eq_ignore_ascii_case(w))
             })
@@ -627,6 +812,8 @@ mod tests {
         assert!(!reports_change(quiet));
         assert!(!reports_change(b"+ idling\r\n* BYE going down\r\n"));
         assert!(!reports_change(b"* STATUS Work (MESSAGES 4)\r\n"));
+        assert!(!reports_change(b"* METADATA INBOX /private/vendor/tech.pinal.picacho/snoozed\r\n"));
+        assert!(!reports_change(b"* LIST () \"/\" Work\r\n"));
         assert!(reports_change(b"+ idling\r\n* 4 EXISTS\r\na7 OK done\r\n"));
         assert!(reports_change(b"* 2 EXPUNGE\r\n"));
         assert!(reports_change(b"* VANISHED 4\r\n"));

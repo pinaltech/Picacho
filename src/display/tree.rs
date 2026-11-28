@@ -344,11 +344,11 @@ impl MailApp {
             self.save_tree();
         }
     }
-    /// The first account the sidebar lists.
+    /// The first account the sidebar lists (in the workspace on).
     pub(super) fn first_account(&self) -> Option<String> {
         account_order(&self.tree)
             .into_iter()
-            .find(|id| !fwd::is_view(id))
+            .find(|id| !fwd::is_view(id) && self.in_workspace(id))
     }
     pub(super) fn open(&self, key: &str) -> bool {
         !self.collapsed.contains(key)
@@ -375,43 +375,43 @@ impl MailApp {
     /// Adding: an account, a folder or a separator, inside `parent` or at the end.
     pub(super) fn create_entries(&self, parent: Option<String>) -> Vec<Entry> {
         vec![
-            entry("Add Account…", "user", Action::Connect),
+            entry(t!("tree-add-account"), "user", Action::Connect),
             Entry::Separator,
             entry(
-                "New Folder",
+                t!("tree-new-folder"),
                 "folder-closed",
                 Action::NewFolder(parent.clone()),
             ),
-            entry("New Separator", "minus", Action::NewSeparator(parent)),
+            entry(t!("tree-new-separator"), "minus", Action::NewSeparator(parent)),
         ]
     }
     pub(super) fn folder_entries(&self, id: &str) -> Vec<Entry> {
         let id = id.to_owned();
         vec![
-            entry("Rename…", "compose", Action::RenameFolder(id.clone())),
+            entry(t!("tree-rename"), "compose", Action::RenameFolder(id.clone())),
             entry(
-                if self.open(&id) { "Collapse" } else { "Expand" },
+                if self.open(&id) { t!("tree-collapse") } else { t!("tree-expand") },
                 "chevron-down",
                 Action::ToggleGroup(id.clone()),
             ),
             Entry::Separator,
             entry(
-                "New Folder Inside",
+                t!("tree-new-folder-inside"),
                 "folder-closed",
                 Action::NewFolder(Some(id.clone())),
             ),
             entry(
-                "New Separator Inside",
+                t!("tree-new-separator-inside"),
                 "minus",
                 Action::NewSeparator(Some(id.clone())),
             ),
             Entry::Separator,
-            danger("Delete Folder", "trash", Action::DeleteFolder(id)),
+            danger(t!("tree-delete-folder"), "trash", Action::DeleteFolder(id)),
         ]
     }
     fn separator_entries(&self, id: &str) -> Vec<Entry> {
         vec![danger(
-            "Remove Separator",
+            t!("tree-remove-separator"),
             "trash",
             Action::RemoveSeparator(id.to_owned()),
         )]
@@ -455,7 +455,7 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.add_node(Node::new_folder("New Folder"), parent, w, cx);
+        self.add_node(Node::new_folder(t!("tree-new-folder")), parent, w, cx);
     }
     pub(super) fn new_separator(
         &mut self,
@@ -481,7 +481,7 @@ impl MailApp {
     /// Edits a folder's name, or an account's nickname, in place.
     pub(super) fn start_rename(&mut self, id: String, w: &mut Window, cx: &mut Context<Self>) {
         let (name, placeholder) = match find(&self.tree, &id) {
-            Some(Node::Folder { name, .. }) => (name.clone(), "Folder name".to_owned()),
+            Some(Node::Folder { name, .. }) => (name.clone(), t!("tree-folder-name").to_owned()),
             Some(Node::Account { id }) => match self.accounts.iter().find(|a| &a.id == id) {
                 Some(a) => (a.nickname.clone(), a.name.clone()),
                 None => return,
@@ -743,7 +743,7 @@ impl MailApp {
                 )
             }
             Node::Folder { name, .. } => (name.clone().into(), PreviewIcon::Icon("folder-closed")),
-            Node::Separator { .. } => ("Separator".into(), PreviewIcon::Icon("minus")),
+            Node::Separator { .. } => (t!("tree-separator").into(), PreviewIcon::Icon("minus")),
         };
         let c = self.colors();
         let this = cx.weak_entity();
@@ -1136,8 +1136,14 @@ impl MailApp {
                     block = add(block, el);
                 }
             }
+            if folder == Folder::Inbox {
+                block = add(block, self.summary_nav(id, cx));
+            }
         }
         block = add(block, self.subscriptions_nav(id, cx));
+        if let Some(nav) = self.waiting_nav(id, cx) {
+            block = add(block, nav);
+        }
         Some(block.into_any_element())
     }
     fn folder_block(
@@ -1255,7 +1261,7 @@ impl MailApp {
                             .items_center()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child("Drag accounts here")
+                            .child(t!("tree-drag-accounts-here"))
                             .on_drag_move(cx.listener({
                                 let id = id.to_owned();
                                 move |this, e: &DragMoveEvent<Dragged>, _, cx| {
@@ -1469,14 +1475,18 @@ impl MailApp {
                     if open {
                         for (index, folder) in Folder::ALL.into_iter().enumerate() {
                             let mailbox: Mailbox = folder.into();
-                            let active = current && self.mailbox() == mailbox;
+                            let active = current
+                                && self.mailbox() == mailbox
+                                && !self.subs_open
+                                && !self.summary_open
+                                && !self.waiting_open;
                             let count = self.unread_for(id, &mailbox);
                             let entries = self.mailbox_entries(id, mailbox.clone());
                             let button = self
                                 .rail_button(
                                     format!("rail-{id}-{}", folder.key()),
                                     if count > 0 {
-                                        format!("{} · {} unread", folder.label(), fmt_count(count))
+                                        t!("tree-unread", label = folder.label(), shown = fmt_count(count), count = count)
                                     } else {
                                         folder.label().into()
                                     },
@@ -1513,18 +1523,35 @@ impl MailApp {
                                         this.open_menu(e.position, entries.clone(), cx)
                                     }),
                                 );
+                            // The Summary comes right after the Inbox.
+                            let place = index + usize::from(index > 0);
                             block = block.child(self.reveal(
                                 id,
                                 div().child(self.stagger(button, Self::next_row(row))),
-                                index,
+                                place,
                             ));
+                            if folder == Folder::Inbox {
+                                let button = self.summary_rail(id, cx);
+                                block = block.child(self.reveal(
+                                    id,
+                                    div().child(self.stagger(button, Self::next_row(row))),
+                                    1,
+                                ));
+                            }
                         }
                         let button = self.subscriptions_rail(id, cx);
                         block = block.child(self.reveal(
                             id,
                             div().child(self.stagger(button, Self::next_row(row))),
-                            Folder::ALL.len(),
+                            Folder::ALL.len() + 1,
                         ));
+                        if let Some(button) = self.waiting_rail(id, cx) {
+                            block = block.child(self.reveal(
+                                id,
+                                div().child(self.stagger(button, Self::next_row(row))),
+                                Folder::ALL.len() + 2,
+                            ));
+                        }
                     }
                     out.push(block.into_any_element());
                 }

@@ -16,7 +16,10 @@ use super::{
     requests::{Request, Waited},
     with_java,
 };
-use crate::sync::fido::Assertion;
+use crate::sync::{
+    ctap_nfc::{self, ctap_answer, lost},
+    fido::Assertion,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{
@@ -65,7 +68,7 @@ impl KeySearch {
             )?
             .i()
         })
-        .ok_or_else(|| anyhow!("Security keys can't be used on this phone."))?;
+        .ok_or_else(|| anyhow!(t!("android-keys-security-keys-cant-be-used-on")))?;
         Ok(Self {
             nfc: match state {
                 2 => Nfc::On,
@@ -81,7 +84,7 @@ impl KeySearch {
         let deadline = Instant::now() + wait;
         loop {
             if cancel.load(Ordering::Relaxed) {
-                bail!("Sign-in cancelled.");
+                bail!(t!("android-keys-sign-in-cancelled"));
             }
             if Instant::now() >= deadline {
                 bail!(if self.nfc == Nfc::On {
@@ -97,9 +100,7 @@ impl KeySearch {
             match found {
                 Some(1) => return Ok(KeyToken::new(Link::Usb, cancel)),
                 Some(2) => return Ok(KeyToken::new(Link::Nfc, cancel)),
-                Some(3) => bail!(
-                    "Picacho wasn't allowed to use the security key. Plug it in again, and allow Picacho to use it."
-                ),
+                Some(3) => bail!(t!("android-keys-picacho-wasnt-allowed-to-use-the")),
                 _ => std::thread::sleep(Duration::from_millis(150)),
             }
         }
@@ -144,15 +145,6 @@ const FIRST: usize = REPORT - 7;
 const NEXT: usize = REPORT - 5;
 /// How long a key may take to answer, touch included.
 const ANSWER: Duration = Duration::from_secs(60);
-
-/// The FIDO applet (CTAP 2.1 §11.3.3), and what selecting it answers.
-const APPLET: [u8; 8] = [0xa0, 0x00, 0x00, 0x06, 0x47, 0x2f, 0x00, 0x01];
-const FIDO_2_0: &[u8] = b"FIDO_2_0";
-const U2F_V2: &[u8] = b"U2F_V2";
-
-fn lost() -> WebauthnCError {
-    WebauthnCError::ApduTransmission
-}
 
 impl<'c> KeyToken<'c> {
     fn new(link: Link, cancel: &'c AtomicBool) -> Self {
@@ -271,6 +263,12 @@ impl<'c> KeyToken<'c> {
         };
         let command = first[4];
         let length = usize::from(u16::from_be_bytes([first[5], first[6]]));
+        // CTAPHID carries at most one first packet and 128 continuations
+        // (sequence 0 to 127): a longer length is a broken (or hostile)
+        // device's, whose sequence count would otherwise overflow.
+        if length > FIRST + 128 * NEXT {
+            return Err(lost());
+        }
         let mut data = first[7..7 + length.min(FIRST)].to_vec();
         let mut sequence = 0u8;
         while data.len() < length {
@@ -280,7 +278,7 @@ impl<'c> KeyToken<'c> {
             }
             let take = (length - data.len()).min(NEXT);
             data.extend_from_slice(&report[5..5 + take]);
-            sequence += 1;
+            sequence = sequence.checked_add(1).ok_or_else(lost)?;
         }
         Ok((command, data))
     }
@@ -342,76 +340,22 @@ impl<'c> KeyToken<'c> {
     }
 
     fn nfc_init(&self) -> Result<(), WebauthnCError> {
-        let mut select = vec![0x00, 0xa4, 0x04, 0x00, APPLET.len() as u8];
-        select.extend_from_slice(&APPLET);
-        select.push(0x00);
-        let answer = self.nfc_exchange(&select)?;
-        if !answer.is_ok() || (answer.data != FIDO_2_0 && answer.data != U2F_V2) {
-            return Err(WebauthnCError::NotSupported);
-        }
-        Ok(())
+        ctap_nfc::select(self)
     }
 
     fn nfc_transmit<U: UiCallback>(&self, cbor: &[u8], ui: &U) -> Result<Vec<u8>, WebauthnCError> {
-        // Chained short APDUs: every part but the last says more follows.
-        let parts: Vec<&[u8]> = cbor.chunks(255).collect();
-        let mut answer = None;
-        for (i, part) in parts.iter().enumerate() {
-            let last = i + 1 == parts.len();
-            let mut apdu = vec![if last { 0x80 } else { 0x90 }, 0x10, 0x00, 0x00];
-            apdu.push(part.len() as u8);
-            apdu.extend_from_slice(part);
-            if last {
-                apdu.push(0x00);
-            }
-            let a = self.nfc_exchange(&apdu)?;
-            if !last && !a.is_ok() {
-                return Err(lost());
-            }
-            answer = Some(a);
-        }
-        let mut answer = answer.ok_or(WebauthnCError::MessageTooShort)?;
-        let mut data = Vec::new();
-        let deadline = Instant::now() + ANSWER;
-        loop {
-            if self.cancelled() {
-                return Err(WebauthnCError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(WebauthnCError::Ctap(CtapError::Ctap2UserActionTimeout));
-            }
-            match (answer.sw1, answer.sw2) {
-                (0x90, 0x00) => {
-                    data.extend_from_slice(&answer.data);
-                    return ctap_answer(data);
-                }
-                // More of the answer waits: GET RESPONSE.
-                (0x61, more) => {
-                    data.extend_from_slice(&answer.data);
-                    answer = self.nfc_exchange(&[0x00, 0xc0, 0x00, 0x00, more])?;
-                }
-                // Still working: ask again (NFCCTAP_GETRESPONSE).
-                (0x91, 0x00) => {
-                    ui.processing();
-                    std::thread::sleep(Duration::from_millis(100));
-                    answer = self.nfc_exchange(&[0x80, 0x11, 0x00, 0x00, 0x00])?;
-                }
-                _ => return Err(lost()),
-            }
-        }
+        ctap_nfc::transmit(self, cbor, ui)
     }
 }
 
-/// A CTAP2 answer: its status byte, then the CBOR.
-fn ctap_answer(mut data: Vec<u8>) -> Result<Vec<u8>, WebauthnCError> {
-    if data.is_empty() {
-        return Err(WebauthnCError::MessageTooShort);
+/// The NFC half of the key, for the shared framing.
+impl ctap_nfc::Link for KeyToken<'_> {
+    fn exchange(&self, apdu: &[u8]) -> Result<ISO7816ResponseAPDU, WebauthnCError> {
+        self.nfc_exchange(apdu)
     }
-    let status = CtapError::from(data.remove(0));
-    if !status.is_ok() {
-        return Err(WebauthnCError::Ctap(status));
+    fn cancelled(&self) -> bool {
+        KeyToken::cancelled(self)
     }
-    Ok(data)
 }
 
 #[async_trait]
@@ -509,7 +453,7 @@ pub fn passkey(
         .map(drop)
     });
     if started.is_none() {
-        bail!("Passkeys can't be used on this phone.");
+        bail!(t!("android-keys-passkeys-cant-be-used-on-this"));
     }
     let answer = match pending.next(cancel, Instant::now() + Duration::from_secs(5 * 60)) {
         Waited::Answer(answer) => answer.unwrap_or_default(),
@@ -523,31 +467,26 @@ pub fn passkey(
                 )
                 .map(drop)
             });
-            bail!("Sign-in cancelled.");
+            bail!(t!("android-keys-sign-in-cancelled"));
         }
     };
     let (kind, detail) = answer.split_once(':').unwrap_or((answer.as_str(), ""));
     match kind {
         "ok" => assertion(detail, client_data_json, challenge),
-        "cancelled" => bail!("Using a passkey was cancelled."),
-        "none" => bail!(
-            "No passkey for this Proton account was found. Use another way, or the code from your authenticator app."
-        ),
-        "unsupported" => bail!(
-            "Passkeys need Android 14 or later here. Use a security key, or the code from your authenticator app."
-        ),
-        "refused" => bail!(
-            "Your password manager didn't let Picacho use your Proton passkey: it only lets browsers it knows ask for another site's passkeys. Use a security key, or the code from your authenticator app."
-        ),
-        _ if detail.is_empty() => bail!("The passkey didn't work."),
-        _ => bail!("The passkey didn't work ({detail})."),
+        "cancelled" => bail!(t!("android-keys-using-a-passkey-was-cancelled")),
+        "closed" => bail!(t!("android-keys-open-picacho-to-use-a-passkey")),
+        "none" => bail!(t!("android-keys-no-passkey-for-this-proton-account")),
+        "unsupported" => bail!(t!("android-keys-passkeys-need-android-14-or-later")),
+        "refused" => bail!(t!("android-keys-your-password-manager-didnt-let-picacho")),
+        _ if detail.is_empty() => bail!(t!("android-keys-the-passkey-didnt-work")),
+        _ => bail!(t!("android-keys-the-passkey-didnt-work-2", detail = detail)),
     }
 }
 
 /// What the passkey signed, from Credential Manager's WebAuthn JSON.
 fn assertion(response: &str, client_data_json: &[u8], challenge: &[u8]) -> Result<Assertion> {
-    let response: Value =
-        serde_json::from_str(response).map_err(|_| anyhow!("The passkey's answer couldn't be read."))?;
+    let response: Value = serde_json::from_str(response)
+        .map_err(|_| anyhow!(t!("android-keys-the-passkeys-answer-couldnt-be-read")))?;
     let bytes = |v: &Value| {
         let text = v.as_str()?;
         URL_SAFE_NO_PAD
@@ -561,7 +500,7 @@ fn assertion(response: &str, client_data_json: &[u8], challenge: &[u8]) -> Resul
         bytes(&signed["authenticatorData"]),
         bytes(&signed["signature"]),
     ) else {
-        bail!("The passkey's answer was incomplete.");
+        bail!(t!("android-keys-the-passkeys-answer-was-incomplete"));
     };
     // Given Proton's hash, the password manager signs it and may answer
     // with placeholder client data; one that made its own (for this
@@ -578,6 +517,7 @@ fn assertion(response: &str, client_data_json: &[u8], challenge: &[u8]) -> Resul
         authenticator_data,
         signature,
         credential_id,
+        user_handle: bytes(&signed["userHandle"]).filter(|h| !h.is_empty() && h.len() <= 64),
     })
 }
 

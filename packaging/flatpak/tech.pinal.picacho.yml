@@ -18,7 +18,13 @@ finish-args:
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
-  # GPU rendering, and USB security keys for passkey sign-in (all includes dri).
+  # GPU rendering, and USB security keys for passkey sign-in (all includes
+  # dri). Security keys are hidraw devices, which only --device=all exposes;
+  # a narrower --device=dri would leave them out, and so would
+  # --device=usb (/dev/bus/usb only) and --device=input (/dev/input), as of
+  # Flatpak 1.18. It also exposes cameras and every other device to an app
+  # that renders untrusted mail: revisit when Flatpak can grant hidraw
+  # alone, or a portal offers security keys.
   - --device=all
   # Credentials live in the Secret Service (GNOME Keyring, KWallet).
   - --talk-name=org.freedesktop.secrets
@@ -44,12 +50,31 @@ modules:
       no-debuginfo: true
       append-path: /usr/lib/sdk/llvm23/bin
     build-commands:
-      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.100.0 --no-modify-path
+      # rustup-init 1.28.2, checked against its published SHA-256 before it
+      # runs (a script piped from the network was run unchecked).
+      - |
+        case "$(uname -m)" in
+          x86_64) sum=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;;
+          aarch64) sum=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;;
+          *) echo "no checked rustup-init for $(uname -m)" >&2; exit 1 ;;
+        esac
+        curl --proto '=https' --tlsv1.2 -sSf -o rustup-init \
+          "https://static.rust-lang.org/rustup/archive/1.28.2/$(uname -m)-unknown-linux-gnu/rustup-init"
+        echo "$sum  rustup-init" | sha256sum -c -
+        chmod +x rustup-init
+        ./rustup-init -y --profile minimal --default-toolchain 1.100.0 --no-modify-path
       - $CARGO_HOME/bin/cargo build --release --locked
       - install -Dm755 target/release/picacho /app/bin/picacho
       - install -Dm644 packaging/linux/tech.pinal.picacho.svg /app/share/icons/hicolor/scalable/apps/tech.pinal.picacho.svg
-      - install -Dm644 packaging/flatpak/tech.pinal.picacho.desktop /app/share/applications/tech.pinal.picacho.desktop
-      - python3 scripts/release/changelog.py metainfo packaging/flatpak/tech.pinal.picacho.metainfo.xml /app/share/metainfo/tech.pinal.picacho.metainfo.xml
+      # Mail in GNOME's and KDE's searches (Settings → Privacy), which ask
+      # Picacho over D-Bus on tech.pinal.picacho.SearchProvider, a name of
+      # the app ID's that a Flatpak may own.
+      - install -Dm644 packaging/linux/tech.pinal.picacho.search-provider.ini /app/share/gnome-shell/search-providers/tech.pinal.picacho.search-provider.ini
+      - install -Dm644 packaging/linux/tech.pinal.picacho.krunner.desktop /app/share/krunner/dbusplugins/tech.pinal.picacho.desktop
+      # The desktop entry and listing with their translations (locales/).
+      - python3 scripts/release/l10n.py desktop packaging/flatpak/tech.pinal.picacho.desktop /app/share/applications/tech.pinal.picacho.desktop
+      - python3 scripts/release/l10n.py metainfo packaging/flatpak/tech.pinal.picacho.metainfo.xml metainfo.xml
+      - python3 scripts/release/changelog.py metainfo metainfo.xml /app/share/metainfo/tech.pinal.picacho.metainfo.xml
     sources:
       - type: dir
         path: ../..

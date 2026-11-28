@@ -24,19 +24,46 @@ argon2 = "0.6"
 base64 = "0.23"
 # Embed Blitz without its standalone window/event loop or unrestricted network client.
 # `floats`: gpui-pre turns on taffy's float layout, which stylo_taffy must fill in.
-blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff", "floats"] }
+# `complex-scripts`: word and line breaks for Chinese, Japanese, Thai, Khmer,
+# Lao and Burmese (ICU4X's dictionaries and models), without which a long
+# press selected whole lines of Japanese and Thai text didn't wrap.
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff", "floats", "complex-scripts"] }
 blitz-html = { version = "=0.3.0-beta.4", default-features = false }
 blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = "=0.3.0-beta.4"
+# Computed styles of the email's elements (positions, overflow, backgrounds).
+style = { package = "stylo", version = "=0.22.0" }
+percent-encoding = "2"
+encoding_rs = "0.8"
+idna = "1"
+rustls-native-certs = "0.8"
+# Words of Chinese, Japanese, Thai and other scripts written without spaces,
+# for the reader's word selection (the same dictionaries Blitz's text uses).
+icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
 anyrender = "0.14"
+# Print and Save as PDF (display/html/print.rs): the email, laid out and
+# painted by Blitz as the reader shows it, written as vector PDF pages with
+# its fonts (subset) and images.
+krilla = { version = "0.8", default-features = false, features = ["raster-images"] }
+# Fonts' character maps, so text in those PDFs can be copied and searched;
+# the version krilla uses.
+skrifa = "0.42"
 anyrender_vello_cpu = { version = "0.18", default-features = false }
 peniko = "0.6"
 # The font collection the HTML reader shares across emails (see
 # display/html/document.rs); blitz's `system-fonts` already builds its backends.
 fontique = { version = "0.12", default-features = false }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tga", "pnm", "qoi", "hdr"] }
+# Previewing SVG attachments in the reader (display/tools.rs).
+resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
 bytemuck = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# Time zones named in calendar invitations (sync/ical.rs).
+chrono-tz = "0.10"
+# This computer's time zone by name, on every system (new events keep it).
+iana-time-zone = "0.1"
+# Repeating events, the whole of RFC 5545's RRULE (sync/ical.rs).
+rrule = "0.14"
 cursor-icon = "1"
 directories = "6"
 # IMAP COMPRESS=DEFLATE (RFC 4978): raw deflate over the TLS stream.
@@ -68,22 +95,54 @@ keyring = "4"
 # Builds messages (MIME); Picacho speaks SMTP itself (sync/smtp.rs).
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname"] }
 # Checks DKIM, SPF and DMARC. Pure-Rust crypto, without aws-lc's C build.
-mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory"] }
+mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory", "arc"] }
+# mail-auth's resolver, with DNSSEC validation (ring, already linked) for the
+# separate resolver that checks TLSA, OPENPGPKEY and SMIMEA (sync/auth.rs).
+hickory-resolver = { version = "=0.26.3", features = ["dnssec-ring"] }
 # 0.17 and later limit MIME nesting; deeply nested parts used to overflow the stack.
 mailparse = "0.18"
 markdown = "1.0.0"
 # Pasting with formatting: copied HTML becomes the composer's Markdown.
 htmd = "0.5"
+# The formatted composer's document read from HTML (manage/richtext): drafts
+# written in other apps, pasted formatting, signatures. The versions htmd
+# already links.
+html5ever = "0.38"
+markup5ever_rcdom = "0.38"
+# Moving by characters and words in the formatted composer.
+unicode-segmentation = "1"
 md-5 = "0.11"
+# Finding a forwarded original in an outgoing message (already a
+# dependency of several crates here).
+memchr = "2"
 # Attachment content types from their file names.
 mime_guess = "2"
 # The public suffix list: a trusted link site is never a shared suffix such
 # as blogspot.com, whose subdomains belong to different people.
 psl = "2"
 native-tls = "0.2"
-notify-rust = "4"
+notify-rust = "4.19"
 open = "5"
 pgp = "0.21"
+# S/MIME (manage/smime.rs): PKCS#7 and PKCS#12, from the OpenSSL already
+# linked for native-tls and Proton's push encryption.
+openssl = "0.10"
+# Security keys (manage/hardware.rs) whose private keys never leave them:
+# OpenPGP cards (YubiKey, Nitrokey, Gnuk…) over PC/SC, which sync/pcsc.rs
+# loads from the system when first used (no PC/SC headers needed to
+# build), signing and decrypting with rPGP through openpgp-card-rpgp; and
+# PKCS#11 tokens for S/MIME, whose module (OpenSC, YubiKey's ykcs11, a
+# vendor's) cryptoki loads at run time.
+openpgp-card = "0.7"
+openpgp-card-rpgp = "0.9"
+card-backend = "0.2"
+cryptoki = "0.12"
+secrecy = "0.10"
+libloading = "0.8"
+# Reading a CRL's extensions (its scope: issuing distribution point, delta
+# indicator) and a certificate's distribution points, which the openssl
+# crate doesn't expose (manage/smime/revocation.rs).
+x509-parser = "0.18"
 # Proton Mail without Bridge: Proton's API (SRP sign-in, keys, sync, send),
 # used directly by sync/proton.rs. Its IMAP/SMTP listeners are not started.
 protected_email_bridge = { git = "https://github.com/pinaltech/Protected-Email-Bridge" }
@@ -91,26 +150,51 @@ webauthn-rs-proto = "=0.6.2"
 # The QR code a phone scans to sign in with its passkey.
 qrcode = { version = "0.14", default-features = false }
 rand = "0.10"
+# The rand pgp takes, for signing and encrypting outgoing mail (manage/openpgp.rs).
+rand08 = { package = "rand", version = "0.8" }
+# CardDAV answers (WebDAV XML), for the address book.
+roxmltree = "0.21"
 # Finds candidate sign-in codes for the local model (Local AI).
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls", "system-proxy"] }
+# The proxy settings reqwest follows (`system-proxy`), read the same way, so
+# email images can tell a corporate proxy from a local address
+# (display/html/resources.rs).
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+http = "1"
 # fallible_uint: sizes and counts bind as integers, failing rather than wrapping when too large.
-rusqlite = { version = "0.42", features = ["bundled", "fallible_uint", "functions"] }
+# SQLCipher rather than plain SQLite, for the optional encrypted database
+# (Settings → Privacy, manage/vault.rs). Without a key it reads and writes
+# ordinary SQLite files, so unencrypted databases are unchanged. Its crypto is
+# the system's: OpenSSL's libcrypto on Linux, CommonCrypto on macOS and iOS;
+# Android and Windows build OpenSSL in (below).
+rusqlite = { version = "0.42", features = ["bundled-sqlcipher", "fallible_uint", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
+# The system's language: the interface's (i18n), and typed dates' and print
+# page sizes'.
 sys-locale = "0.3.2"
+# The interface's text in each language (src/i18n, locales/): Fluent
+# messages, with each language's plural rules.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+fluent-langneg = "0.13"
 sha2 = "0.11"
 unicode-normalization = "0.1"
 url = "2"
 # Removes tracking from links in mail; its rule catalog is in assets/url-sanitize.
 url-sanitize-core = "2.4"
+# Tracking numbers: each carrier's formats and check digits, from the
+# tracking_number_data catalog (see manage/parcels.rs).
+tracking-numbers = "0.1.2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
 [dev-dependencies]
-rand08 = { package = "rand", version = "0.8" }
 gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
+# The i18n tests read the message files' syntax (src/i18n/tests.rs).
+fluent-syntax = "0.12"
 
 [features]
 # Offers a fictional sample inbox from onboarding, for development and screenshots.
@@ -221,6 +305,12 @@ opt-level = 3
 [profile.dev.package.app_units]
 opt-level = 3
 
+# build.rs: Windows' icon and version resource (windres or RC.EXE). The
+# version GPUI uses for its manifest. Build dependencies follow the host,
+# so this is built for every target and used only for Windows.
+[build-dependencies]
+embed-resource = "3.0.12"
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Unlike gpui 0.2, the platforms leave text and Linux windowing to features:
 # without `font-kit` macOS draws no text, and without `wayland` or `x11`
@@ -237,6 +327,17 @@ webauthn-authenticator-rs = { version = "0.6.2", features = ["usb", "cable"] }
 # Wayland's data-control protocol where the compositor has it, else X11.
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
+# Kerberos sign-in (sync/gss.rs) loads the system's GSS-API library with
+# libloading (above) when first used, so builds need no Kerberos headers and
+# computers without Kerberos run as before. Windows uses SSPI (windows-sys,
+# below).
+
+# Spelling in the formatted composer on Linux and the BSDs (manage/spelling.rs):
+# the Hunspell dictionaries desktop apps install. macOS and Windows use the
+# system's spellchecker.
+[target.'cfg(all(unix, not(any(target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies]
+spellbook = "0.4"
+
 [target.'cfg(target_os = "android")'.dependencies]
 # GPUI's Android platform: the window, input, text and wgpu renderer.
 # `vibration`: haptic feedback for the phone presentation's gestures.
@@ -244,8 +345,12 @@ gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 log = "0.4"
+# Long background work runs at a lower priority (`manage::memory`).
+libc = "0.2"
 # Android has no system OpenSSL; build it into the app.
 native-tls = { version = "0.2", features = ["vendored"] }
+# SQLCipher's crypto from that same built-in OpenSSL.
+rusqlite = { version = "0.42", features = ["bundled-sqlcipher-vendored-openssl"] }
 # keyring's own Entry has no Android store; credentials go to the app's
 # SharedPreferences, encrypted with an Android Keystore key, through
 # keyring-core directly (manage/store.rs).
@@ -275,6 +380,21 @@ apple-native-keyring-store = { version = "1", features = ["protected"] }
 # UIPasteboard's HTML and RTF, for pasting with formatting (display/paste_ios.rs);
 # the version gpui-mobile uses.
 objc2 = "0.6"
+# The app lock's Face ID or Touch ID prompt (display/biometric.rs).
+# Spotlight's items (manage/system_search/spotlight.rs) take arrays.
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
+# Proton's security keys over NFC (Core NFC, packaging/ios/SecurityKeys.swift)
+# and a passkey on another phone by QR code and Bluetooth (caBLE): CTAP2
+# here, the NFC I/O through the Swift side (ios/keys.rs).
+webauthn-authenticator-rs = { version = "0.6.2", features = ["ctap2", "cable"] }
+# Its `Token` trait, implemented for those keys.
+async-trait = "0.1"
+
+# The app lock's Touch ID, Face ID or Optic ID (display/biometric.rs): the
+# LocalAuthentication framework, which answers on a queue of its own.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext", "LABiometryType", "LAError"] }
+block2 = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Debug builds only: the development driver captures the app's own window.
@@ -283,12 +403,70 @@ core-graphics = "0.24"
 objc = "0.2"
 # Local AI runs its models with Core ML.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSObject"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSPrintInfo", "NSPrintOperation", "NSView", "NSResponder", "NSGraphicsContext", "NSSpellChecker"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSRange", "NSBundle", "NSData", "NSDictionary", "NSError", "NSFileManager", "NSString", "NSURL", "NSValue", "NSObject"] }
 objc2-core-ml = { version = "0.3", default-features = false, features = ["std", "MLModel", "MLModel_MLModelCompilation", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLMultiArray", "MLFeatureValue", "MLModelConfiguration"] }
 
 [target.'cfg(windows)'.dependencies]
 # Windows Hello: the system's own passkeys and security keys.
 webauthn-authenticator-rs = { version = "0.6.2", features = ["win10"] }
+# Windows has no system OpenSSL (S/MIME and Proton's push encryption use
+# it): build it into the app, as on Android.
+openssl = { version = "0.10", features = ["vendored"] }
+# SQLCipher's crypto from that same built-in OpenSSL.
+rusqlite = { version = "0.42", features = ["bundled-sqlcipher-vendored-openssl"] }
+# display/windows.rs: the AppUserModelID, the delay-loaded DLLs' checks,
+# the animations setting and the data directory's access list. The
+# versions GPUI and keyring already use.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    # Kerberos sign-in through SSPI (sync/gss.rs).
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Authorization",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    # High contrast's state (display/motion.rs, prefers-contrast in emails).
+    "Win32_UI_Accessibility",
+] }
+windows-registry = "0.6"
+# Spelling in the formatted composer (manage/spelling.rs): Windows' spell
+# checking API. The version GPUI already uses.
+# Printing (display/html/print_windows.rs): the print dialog, Windows.Data.Pdf,
+# Direct2D's XPS print control and GDI. Windows Search's crawl scope
+# (manage/system_search/windows_search.rs).
+windows = { version = "0.62", features = [
+    "Win32_Globalization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Memory",
+    "Win32_System_Search",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Pdf",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Printing",
+    "Win32_Graphics_Printing_PrintTicket",
+    "Win32_Storage_Xps",
+    "Win32_Storage_Xps_Printing",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Data_Pdf",
+    "Foundation",
+    "Storage",
+    "Storage_Streams",
+    "UI",
+] }
+# The window's handle, to own the print dialog; the version GPUI uses.
+raw-window-handle = "0.6"
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The tray (menu bar) icon while Picacho runs in the background (display/tray.rs).
@@ -303,16 +481,38 @@ ksni = { version = "0.3", features = ["blocking"] }
 # glibc's allocator settings and malloc_trim, to keep the background's
 # memory small (manage/memory.rs).
 libc = "0.2"
+# The desktop portal's print dialog (Print) and Open With dialog (OpenURI
+# with `ask`), also inside Flatpak, and its Background request, which starts
+# Picacho at sign-in from inside Flatpak; the version GPUI already uses.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "background", "open_uri", "print"] }
+# GNOME's and KDE's searches ask Picacho for mail over D-Bus
+# (manage/system_search/desktop_search.rs); the version ashpd and ksni use.
+zbus = { version = "5", default-features = false, features = ["blocking-api"] }
 
 [patch.crates-io]
 # Patched crates, one folder each with its patches and README:
 # https://github.com/pinaltech/Picacho-Patches
 # After changing that repository, run `cargo update -p gpui` to use it here.
 # An email's unresolvable image or link address no longer panics; text in
-# padded inline blocks and centered cells is hit (selected, clicked) where shown.
-blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
-# Inline boxes paint gradient backgrounds (emails' dark styles).
+# padded inline blocks and centered cells is hit (selected, clicked) where shown;
+# blocks directly in a table (columns restacked for phones) are laid out.
+# TEMPORARY: the fix/blitz-table-block-children branch (with its email
+# legacy attributes and media device pixel ratio patches), pinned to a
+# published commit, until it is merged; then back to the vendor-split-dev
+# git dependency and `cargo update -p blitz-dom -p blitz-paint`. Never a
+# `path` outside this repository: CI couldn't build it, and releases would
+# come from an unpublished local tree (`scripts/check-patches.sh`).
+# The HTML reader needs blitz-dom's `set_media_device_pixel_ratio` (0007).
+blitz-dom =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# Inline boxes paint gradient backgrounds (emails' dark styles); SVG images
+# are drawn in layers the dark recoloring recognizes (`is_image_layer`).
 blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# prefers-reduced-motion and prefers-contrast media queries (Media Queries 5
+# §11.3, §11.4), which blitz-dom's `set_media_preferences` sets.
+# TEMPORARY, as blitz-dom above: the fix/blitz-table-block-children
+# branch, pinned, until it is merged; then the git dependency like stylo_derive's.
+stylo = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+stylo_atoms =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # ToCss error inference with GPUI's log/serde feature.
 stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,
@@ -320,10 +520,16 @@ stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = 
 imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Maximized windows' content is no longer a resize edge.
 gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# Backdrop blur (`Window::paint_backdrop_blur`), drawn by the wgpu renderer
+# (Linux), for the closing cover. TEMPORARY, as blitz-dom above: the
+# fix/blitz-table-block-children branch, pinned, until it is merged.
+gpui-pre =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+gpui-pre-wgpu =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 
 # Proton push notifications: Android messaging tokens registered against
 # their Firebase installation (see the folder's README). A [patch] only
 # applies from the top-level workspace, so it must be here rather than in
 # protected_email_bridge.
+
 [patch."https://github.com/agusibrahim/fcm_receiver.rs"]
 fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }

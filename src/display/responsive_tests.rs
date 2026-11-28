@@ -383,3 +383,103 @@ fn closing_the_window_frees_the_app(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(weak.upgrade().is_none(), "MailApp outlives its window");
 }
+
+#[gpui::test]
+fn setup_offers_an_organizations_single_sign_on(cx: &mut TestAppContext) {
+    let (view, cx) = open(store(), cx);
+    act(&view, Action::Start, cx);
+    act(&view, Action::ChooseService(Service::Other), cx);
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.form[EMAIL], "ana@example.edu", w, cx);
+        this.step = Step::Credentials;
+    });
+    act(&view, Action::Manual, cx);
+    frame(cx);
+    // form-1: the password; form-10: the sign-in service (SSO_ISSUER).
+    assert_eq!((PASSWORD, SSO_ISSUER), (1, 10));
+    assert!(cx.debug_bounds("form-1").is_some());
+    act(&view, Action::ToggleSetupSso, cx);
+    frame(cx);
+    // The password gives way to the sign-in service's fields.
+    assert!(cx.debug_bounds("form-1").is_none());
+    assert!(cx.debug_bounds("form-10").is_some());
+    view.update_in(cx, |this, w, cx| {
+        for (i, text) in [
+            (IMAP_HOST, "imap.example.edu"),
+            (IMAP_PORT, "993"),
+            (SMTP_HOST, "smtp.example.edu"),
+            (SMTP_PORT, "587"),
+            (SSO_ISSUER, "https://login.example.edu/realms/mail/"),
+        ] {
+            MailApp::set(&this.form[i], text, w, cx);
+        }
+    });
+    let a = view.read_with(cx, |this, cx| this.setup_account(cx));
+    assert!(a.oauth && !a.kerberos);
+    assert_eq!(a.sso.as_ref().unwrap().issuer, "https://login.example.edu/realms/mail");
+    assert!(a.validate().is_ok(), "{:?}", a.validate());
+    // Kerberos and single sign-on exclude each other.
+    act(&view, Action::ToggleSetupKerberos, cx);
+    view.read_with(cx, |this, _| assert!(this.setup_kerberos && !this.setup_sso));
+}
+
+/// Exchange Server with hybrid modern authentication: Microsoft Entra signs
+/// in for the server, with Picacho's own registration unless one is given.
+#[gpui::test]
+fn exchange_setup_offers_the_organizations_sign_in(cx: &mut TestAppContext) {
+    let (view, cx) = open(store(), cx);
+    act(&view, Action::Start, cx);
+    act(&view, Action::ChooseService(Service::Exchange), cx);
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.form[EMAIL], "ana@corp.example", w, cx);
+        this.step = Step::Credentials;
+    });
+    frame(cx);
+    assert!(cx.debug_bounds("form-1").is_some());
+    act(&view, Action::ToggleSetupSso, cx);
+    frame(cx);
+    assert!(cx.debug_bounds("form-1").is_none());
+    assert!(cx.debug_bounds("form-10").is_some());
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.form[IMAP_HOST], "mail.corp.example", w, cx);
+        MailApp::set(&this.form[SSO_ISSUER], "https://login.microsoftonline.com/tenant/v2.0", w, cx);
+        MailApp::set(&this.form[SSO_CLIENT], "admin-app", w, cx);
+    });
+    let a = view.read_with(cx, |this, cx| this.setup_account(cx));
+    assert!(a.ews() && a.oauth && !a.kerberos);
+    assert_eq!(a.client_id, "admin-app");
+    assert_eq!(a.sso_scope(), "https://mail.corp.example/EWS.AccessAsUser.All");
+    assert!(a.validate().is_ok(), "{:?}", a.validate());
+}
+
+/// An API token or app password chosen instead of the browser: the
+/// account is set up to sign in with it (no OAuth), to the service's own
+/// servers, and the form asks for it by the service's name for it.
+#[gpui::test]
+fn tokens_chosen_instead_of_the_browser_sign_in_with_them(cx: &mut TestAppContext) {
+    let (view, cx) = open(store(), cx);
+    act(&view, Action::Start, cx);
+    for (service, label) in [(Service::Fastmail, "API token"), (Service::Gmail, "App password")] {
+        act(&view, Action::ChooseService(service), cx);
+        view.update_in(cx, |this, w, cx| {
+            // As in a build that signs in to it with the browser.
+            this.setup_token = true;
+            this.oauth = false;
+            MailApp::set(&this.form[EMAIL], "ana@example.org", w, cx);
+            assert!(this.sign_in().typed(), "{service:?} is typed now");
+            let a = this.setup_account(cx);
+            assert!(!a.oauth && a.client_id.is_empty(), "{service:?}: {a:?}");
+            assert_eq!(a.service, service);
+            match service {
+                // JMAP, sending the token as Bearer (sync/jmap.rs).
+                Service::Fastmail => assert_eq!(a.incoming_host, crate::sync::oauth::FASTMAIL_JMAP),
+                _ => assert_eq!(a.incoming_host, "imap.gmail.com"),
+            }
+            assert_eq!(service.password_label(), label);
+            // Back to the browser.
+            this.setup_token = false;
+            assert_eq!(this.sign_in(), service.sign_in());
+        });
+        act(&view, Action::SetupBack, cx);
+    }
+}

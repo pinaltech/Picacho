@@ -110,6 +110,32 @@ fn a_phone_goes_from_mailboxes_to_a_message_and_back(cx: &mut TestAppContext) {
     assert_eq!(screen(&view, cx), Screen::List);
 }
 
+/// A message opened from search results goes back to them: Back used to
+/// close the search under the message and leave the message open.
+#[gpui::test]
+fn back_from_a_searched_message_returns_to_the_results(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    act(&view, Action::OpenSearch, cx);
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert!(view.read_with(cx, |this, _| this.search_open), "the results are still there");
+    // The back chevron too, sliding over the results.
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    view.update_in(cx, |this, w, cx| this.mobile_animate_back(w, cx));
+    cx.executor().advance_clock(PUSH * 2);
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert!(view.read_with(cx, |this, _| this.search_open));
+    // Back again closes the search.
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert!(view.read_with(cx, |this, _| !this.search_open));
+}
+
 #[gpui::test]
 fn bars_stay_out_of_the_notch_and_home_indicator(cx: &mut TestAppContext) {
     let (view, cx) = phone(PHONE, cx);
@@ -245,6 +271,13 @@ fn swiping_a_row_archives_it(cx: &mut TestAppContext) {
             .expect("the row follows the finger");
         assert_eq!(swiping, id);
         assert!(dx <= -100.);
+        // Not yet far enough to act: a good part of the row's width.
+        assert!(dx.abs() < this.mobile.swipe_reach, "{dx} of {}", this.mobile.swipe_reach);
+    });
+    pan(-60., TouchPhase::Moved, cx);
+    view.read_with(cx, |this, _| {
+        let (_, dx) = this.mobile.swipe.clone().expect("still swiping");
+        assert!(dx.abs() >= this.mobile.swipe_reach, "{dx} of {}", this.mobile.swipe_reach);
     });
     // Toward the leading edge archives; the other way marks read.
     view.read_with(cx, |this, _| {
@@ -275,6 +308,44 @@ fn swiping_a_row_archives_it(cx: &mut TestAppContext) {
                 .is_some_and(|issues| issues.contains_key(&IssueSource::Change)),
             "letting go past the threshold did not archive"
         );
+    });
+}
+
+/// A sideways brush on the way to scrolling, or a swipe let go of short of
+/// the row's middle, archives nothing.
+#[gpui::test]
+fn a_half_swipe_or_a_slanted_pan_archives_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let id = first_message(&view, cx);
+    let row: &'static str = Box::leak(format!("mobile-row-{id}").into_boxed_str());
+    let at = bounds(cx, row).center();
+    let pan = |dx: f32, dy: f32, phase: TouchPhase, cx: &mut VisualTestContext| {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            source: ScrollSource::Touch,
+        });
+    };
+    // Mostly sideways, but not enough so: the list's.
+    pan(0., 0., TouchPhase::Started, cx);
+    pan(-30., -24., TouchPhase::Moved, cx);
+    assert!(view.read_with(cx, |this, _| this.mobile.swipe.is_none()));
+    pan(0., 0., TouchPhase::Ended, cx);
+    // A swipe past the old 88-point mark, short of the row's middle.
+    cx.run_until_parked();
+    view.update(cx, |this, _| this.mobile.swipe_ended = None);
+    pan(0., 0., TouchPhase::Started, cx);
+    pan(-60., 0., TouchPhase::Moved, cx);
+    pan(-50., 0., TouchPhase::Moved, cx);
+    assert!(view.read_with(cx, |this, _| this.mobile.swipe.is_some()));
+    pan(0., 0., TouchPhase::Ended, cx);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(this.mobile.swipe.is_none());
+        assert!(this.visible.iter().any(|&i| this.messages[i].id == id), "still listed");
+        assert!(this.undo.is_none(), "nothing was moved: {}", this.status);
     });
 }
 
@@ -387,6 +458,20 @@ fn fields_ask_for_the_keyboard_they_need(cx: &mut TestAppContext) {
         assert_eq!(keys(&this.form[TOTP]), Some(Keys::Number));
         assert_eq!(keys(&this.form[SMTP_HOST]), Some(Keys::Url));
         assert_eq!(keys(&this.search), Some(Keys::Search));
+        // Passwords, PINs, keys and passphrases: the password keyboard.
+        for state in [
+            &this.form[PASSWORD],
+            &this.form[MAILBOX_PASSWORD],
+            &this.form[KEY_PIN],
+            &this.unlock_input,
+            &this.fwd_key,
+            &this.calendar_password,
+            &this.contacts_password,
+            &this.key_passphrase,
+            &this.identity_inputs[6],
+        ] {
+            assert_eq!(keys(state), Some(Keys::Password));
+        }
     });
     // Focusing a field is followed; scrolling away lets go of it.
     act(&view, Action::OpenSearch, cx);
@@ -451,7 +536,9 @@ fn screens_title_themselves_beside_a_back_chevron(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn account_folders_fold_from_the_header(cx: &mut TestAppContext) {
-    let (view, cx) = phone(PHONE, cx);
+    // A tall phone: the account's header above the tab bar, below All
+    // Accounts' rows.
+    let (view, cx) = phone((PHONE.0, 1000.), cx);
     view.update_in(cx, |this, w, cx| this.close(w, cx));
     let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
     let fold: &'static str = Box::leak(format!("mobile-fold-{id}").into_boxed_str());
@@ -505,6 +592,59 @@ fn snoozing_fits_a_phone(cx: &mut TestAppContext) {
     );
     let confirm = bounds(cx, "snooze-confirm");
     assert!(confirm.right() <= px(PHONE.0) && confirm.size.height >= px(TOUCH - 0.5));
+}
+
+/// A notice for something that can be put back has Undo, well apart from
+/// the close button, and Undo puts it back.
+#[gpui::test]
+fn notices_offer_undo_away_from_dismiss(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let id = first_message(&view, cx);
+    let before = view.read_with(cx, |this, _| {
+        this.messages.iter().find(|m| m.id == id).unwrap().clone()
+    });
+    // A local POP3 account: the move and its undo need no server.
+    let account = view.update(cx, |this, _| {
+        let a = this.accounts.iter_mut().find(|a| a.id == before.account).unwrap();
+        a.provider = Provider::Pop3;
+        a.id.clone()
+    });
+    act(&view, Action::Apply(vec![id.clone()], Change::Move(Folder::Trash)), cx);
+    settle(cx);
+    view.read_with(cx, |this, _| {
+        assert!(!this.messages.iter().any(|m| m.id == id), "moved out of the inbox");
+        assert!(this.undo.is_some(), "the notice offers undo: {}", this.status);
+    });
+    // Read at once: `bounds` lets time pass, and the notice goes after a while.
+    let undo = cx.debug_bounds("toast-undo").expect("the notice has Undo");
+    let dismiss = cx.debug_bounds("toast-dismiss").expect("the notice has a close button");
+    for b in [undo, dismiss] {
+        assert!(b.size.height >= px(TOUCH - 0.5) && b.size.width >= px(TOUCH - 0.5), "{b:?}");
+    }
+    assert!(
+        dismiss.left() - undo.right() >= px(16.),
+        "Undo ends at {:?}, the close button starts at {:?}",
+        undo.right(),
+        dismiss.left()
+    );
+    // Notices without anything to put back have no Undo.
+    let pending = view.update(cx, |this, cx| {
+        let pending = this.undo.clone();
+        this.notice("Link copied", false, cx);
+        pending
+    });
+    assert!(!shown(cx, "toast-undo"));
+    // Undo brings it back to the inbox.
+    view.update(cx, |this, _| this.undo = pending);
+    act(&view, Action::Undo, cx);
+    settle(cx);
+    view.read_with(cx, |this, _| {
+        let back = this.messages.iter().find(|m| m.id == id).expect("back in the list");
+        assert_eq!(back.folder, Folder::Inbox);
+        assert!(this.undo.is_none());
+    });
+    let cached = view.read_with(cx, |this, _| this.backend.store.message(&id).unwrap());
+    assert_eq!(cached.map(|m| m.folder), Some(Folder::Inbox), "{account}");
 }
 
 /// A message with long headers and lines, opened with its original
@@ -563,7 +703,7 @@ fn the_original_message_fits_a_phone(cx: &mut TestAppContext) {
             "original-source",
             "source-tab-headers",
             "source-tab-html",
-            "source-tab-original",
+            "source-tab-raw",
             "copy-original",
             "save-original",
         ] {
@@ -903,6 +1043,29 @@ fn all_accounts_lists_every_accounts_subscriptions(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn an_accounts_summary_opens_from_under_its_inbox_and_back_returns(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let first = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    let row: &'static str = Box::leak(format!("mobile-summary-{first}").into_boxed_str());
+    // Listed under the Inbox (below the fold here), and tapping it pushes
+    // the Summary.
+    bounds(cx, row);
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::OpenSummary(first.clone()), w, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::Summary);
+    assert!(shown(cx, "mobile-summary"));
+    assert!(shown(cx, "summary-page"));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    view.read_with(cx, |this, _| assert!(!this.summary_open));
+}
+
+#[gpui::test]
 fn accounts_sort_by_dragging_their_handles(cx: &mut TestAppContext) {
     let (view, cx) = phone(PHONE, cx);
     view.update_in(cx, |this, w, cx| this.close(w, cx));
@@ -1187,6 +1350,8 @@ fn a_notification_opens_its_message_once_it_arrives(cx: &mut TestAppContext) {
             account: account.clone(),
             mailbox: Folder::Inbox.into(),
             message: Some(new.clone()),
+            messages: Vec::new(),
+            action: None,
         };
         this.open_notified(target, w, cx)
     });
@@ -1208,4 +1373,243 @@ fn a_notification_opens_its_message_once_it_arrives(cx: &mut TestAppContext) {
     frame(cx);
     assert_eq!(view.read_with(cx, |this, _| this.selected.clone()), Some(new));
     assert_eq!(screen(&view, cx), Screen::Reader);
+}
+
+#[gpui::test]
+fn calendar_and_contacts_open_as_views_on_phones(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    // Start at Mailboxes, where Calendar and Contacts live.
+    view.update(cx, |this, cx| {
+        this.mobile.mailboxes = true;
+        cx.notify();
+    });
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    assert!(cx.debug_bounds("mobile-open-calendar").is_some());
+    assert!(cx.debug_bounds("mobile-open-contacts").is_some());
+
+    // Open Calendar as its own full-screen view.
+    act(
+        &view,
+        Action::Calendar(calendar_views::CalAction::Open(
+            calendar_views::AppView::Calendar,
+        )),
+        cx,
+    );
+    frame(cx);
+    assert_eq!(
+        screen(&view, cx),
+        Screen::AppView(calendar_views::AppView::Calendar)
+    );
+    assert!(cx.debug_bounds("mobile-calendar").is_some());
+
+    // Back returns to Mailboxes.
+    act(&view, Action::Close, cx);
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+
+    // Open Contacts as its own full-screen view.
+    act(
+        &view,
+        Action::Calendar(calendar_views::CalAction::Open(
+            calendar_views::AppView::Contacts,
+        )),
+        cx,
+    );
+    frame(cx);
+    assert_eq!(
+        screen(&view, cx),
+        Screen::AppView(calendar_views::AppView::Contacts)
+    );
+    assert!(cx.debug_bounds("mobile-contacts").is_some());
+
+    // Back returns to Mailboxes.
+    act(&view, Action::Close, cx);
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+}
+
+#[gpui::test]
+fn home_screen_widget_links_open_inbox_message_compose_and_calendar(cx: &mut TestAppContext) {
+    let (view, cx, _store) = two_accounts(cx);
+    view.update(cx, |this, cx| {
+        this.mobile.on = true;
+        this.mobile.fake_insets = Some(NOTCH);
+        this.mobile.mailboxes = true;
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(PHONE.0), px(PHONE.1)));
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+
+    let accounts: Vec<String> =
+        view.read_with(cx, |this, _| this.accounts.iter().map(|a| a.id.clone()).collect());
+    assert_eq!(accounts.len(), 2);
+
+    // 1. Open a specific account's Inbox from a widget.
+    let inbox_uri = crate::manage::widgets::WidgetAction::Inbox {
+        account: Some(accounts[1].clone()),
+    }
+    .to_uri();
+    crate::display::launch::push(inbox_uri);
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert_eq!(
+        view.read_with(cx, |this, _| this.account.clone()),
+        Some(accounts[1].clone())
+    );
+
+    // 2. Open a specific message directly from the Inbox widget.
+    let msg_id = first_message(&view, cx);
+    let msg_uri = crate::manage::widgets::WidgetAction::Message {
+        account: accounts[1].clone(),
+        id: msg_id.clone(),
+    }
+    .to_uri();
+    crate::display::launch::push(msg_uri);
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    assert_eq!(
+        view.read_with(cx, |this, _| this.selected.clone()),
+        Some(msg_id)
+    );
+
+    // 3. Open the Calendar view from the Calendar widget.
+    crate::display::launch::push(crate::manage::widgets::WidgetAction::Calendar.to_uri());
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(
+        screen(&view, cx),
+        Screen::AppView(calendar_views::AppView::Calendar)
+    );
+
+    // 4. Open Summary → Packages and Summary → Receipts from their widgets.
+    crate::display::launch::push(
+        crate::manage::widgets::WidgetAction::Packages { account: None }.to_uri(),
+    );
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Summary);
+    assert!(view.read_with(cx, |this, _| this.summary_packages && !this.summary_receipts));
+
+    crate::display::launch::push(
+        crate::manage::widgets::WidgetAction::Receipts { account: None }.to_uri(),
+    );
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Summary);
+    assert!(view.read_with(cx, |this, _| this.summary_receipts && !this.summary_packages));
+
+    // 5. Start composing a new message from a widget's Compose button.
+    let compose_uri = crate::manage::widgets::WidgetAction::Compose {
+        account: Some(accounts[0].clone()),
+    }
+    .to_uri();
+    crate::display::launch::push(compose_uri);
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert!(
+        view.read_with(cx, |this, _| !this.composers.is_empty()),
+        "widget compose action should open a composer"
+    );
+}
+
+#[gpui::test]
+fn workspaces_switch_from_mailboxes_and_open_their_page_on_a_phone(cx: &mut TestAppContext) {
+    use super::super::workspaces::{Template, WsAction};
+    let (view, cx) = phone(PHONE, cx);
+    let (work, home) = view.read_with(cx, |this, _| {
+        (this.accounts[0].id.clone(), this.accounts[1].id.clone())
+    });
+    // No workspaces: no switcher on the Mailboxes screen.
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    assert!(!shown(cx, "mobile-workspace"));
+
+    // A new one opens its page full screen, with a way back.
+    act(&view, Action::Workspaces(WsAction::New(Template::Blank)), cx);
+    assert_eq!(screen(&view, cx), Screen::Settings);
+    let id = view.read_with(cx, |this, _| match &this.page {
+        Page::Workspace(id) => id.clone(),
+        other => panic!("{other:?}"),
+    });
+    assert!(shown(cx, "settings-page"));
+    assert!(shown(cx, "mobile-settings-back"));
+    touchable(cx, "workspace-color-0");
+    act(
+        &view,
+        Action::Workspaces(WsAction::EveryAccount(id.clone(), false)),
+        cx,
+    );
+    act(
+        &view,
+        Action::Workspaces(WsAction::ToggleAccount(id.clone(), home.clone())),
+        cx,
+    );
+    let row: &'static str = Box::leak(format!("workspace-account-{work}").into_boxed_str());
+    let b = bounds(cx, row);
+    assert!(b.size.height >= px(TOUCH - 0.5), "a fingertip's row");
+    assert!(b.right() <= px(PHONE.0));
+    // Back goes to Workspaces, then to the list of pages.
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    view.read_with(cx, |this, _| assert_eq!(this.page, Page::Workspaces));
+    assert!(shown(cx, "workspace-row-0"));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert!(shown(cx, "mobile-settings-list"));
+    assert!(shown(cx, "mobile-settings-workspaces"));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_ne!(screen(&view, cx), Screen::Settings);
+
+    // Mailboxes: the switcher, and only the workspace's account.
+    view.update_in(cx, |this, w, cx| {
+        while this.mobile_screen() != Screen::Mailboxes {
+            this.close(w, cx);
+        }
+    });
+    assert!(shown(cx, "mobile-workspace"));
+    let home_section: &'static str = Box::leak(format!("mobile-account-{home}").into_boxed_str());
+    let work_section: &'static str = Box::leak(format!("mobile-account-{work}").into_boxed_str());
+    assert!(shown(cx, work_section));
+    assert!(!shown(cx, home_section), "Home is hidden");
+    touchable(cx, "mobile-workspace");
+    // Everything again from the switcher's menu.
+    act(&view, Action::Workspaces(WsAction::Switch(None)), cx);
+    assert!(shown(cx, home_section));
+}
+
+/// A tablet's keyboard opens the command palette on a phone too: it fits
+/// the screen, and Back closes it without leaving the screen under it,
+/// which a back swipe can't drag away meanwhile.
+#[gpui::test]
+fn back_closes_the_command_palette_first(cx: &mut TestAppContext) {
+    use crate::display::ui::palette::PaletteAction;
+    let (view, cx) = phone(PHONE, cx);
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+
+    act(&view, Action::Palette(PaletteAction::Toggle), cx);
+    let panel = bounds(cx, "palette");
+    assert!(panel.left() >= px(0.) && panel.right() <= px(PHONE.0), "{panel:?}");
+    assert!(panel.top() >= px(0.) && panel.bottom() <= px(PHONE.1), "{panel:?}");
+    let row = bounds(cx, "palette-row-0");
+    assert!(row.right() <= panel.right() && row.size.height > px(0.), "{row:?}");
+    view.update_in(cx, |this, w, cx| {
+        assert!(this.mobile_has_back(w, cx));
+        assert!(!this.mobile_can_go_back(cx));
+        this.close(w, cx);
+    });
+    settle(cx);
+    view.read_with(cx, |this, _| assert!(!this.palette.open));
+    assert_eq!(screen(&view, cx), Screen::Reader, "Back closed only the palette");
+    assert!(!shown(cx, "palette"));
 }

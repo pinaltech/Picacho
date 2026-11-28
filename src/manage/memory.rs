@@ -12,22 +12,44 @@
 /// Arenas glibc may make: enough for the few threads busy at once.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const ARENAS: i32 = 4;
+/// The window's process: more, so that its thread doesn't wait on the
+/// allocator's locks while background work (sorting mail into tabs, on
+/// several threads, at launch) allocates at full speed. With four, the
+/// window's own allocations took several times as long meanwhile.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const WINDOW_ARENAS: i32 = 8;
 
-/// Called first thing in `main`, before other threads start.
-pub fn configure() {
+/// Called first thing in `main`, before other threads start. `window`:
+/// this process shows the window (not the background one).
+pub fn configure(window: bool) {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // Set by the person (or a packager): theirs wins.
         if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+            let arenas = if window { WINDOW_ARENAS } else { ARENAS };
             // Safety: mallopt only changes the allocator's settings.
-            unsafe { libc::mallopt(libc::M_ARENA_MAX, ARENAS) };
+            unsafe { libc::mallopt(libc::M_ARENA_MAX, arenas) };
         }
     }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = window;
     // Tokio runtimes made without a size (zbus's, for D-Bus) start a worker
     // per core; D-Bus needs a couple. Picacho's own runtimes set theirs.
     if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
         // Safety: no other threads are running yet to read the environment.
         unsafe { std::env::set_var("TOKIO_WORKER_THREADS", "2") };
+    }
+}
+
+/// Lowers the calling thread's priority, for long background work (the
+/// whole look at listed mail, the widgets' scans): the window's thread,
+/// and a check's, go first when the cores are busy.
+pub fn lower_priority() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // Safety: setpriority with a thread id changes only that thread's
+    // niceness; a failure leaves it as it was.
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10);
     }
 }
 
@@ -38,5 +60,36 @@ pub fn release_unused() {
     // Safety: malloc_trim only returns free pages to the system.
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+/// Hands freed memory back to the system before long, off the calling
+/// thread, at most every `EVERY`: for the window's process, after it lets go
+/// of a lot (an email's document, a mailbox's list). Without it glibc kept
+/// what an email or a long list had used, and the window stayed as large as
+/// its largest moment. Throttled so that opening one message after another
+/// costs no more than a trim every few seconds.
+pub fn release_unused_soon() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        const EVERY: Duration = Duration::from_secs(10);
+        static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+        // Milliseconds after `START` of the last trim, plus one (0: none yet).
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = START.elapsed().as_millis() as u64 + 1;
+        let last = LAST.load(Ordering::Relaxed);
+        // `now` may be from before another thread's trim: saturating, not
+        // underflowing (a panic in debug builds, a second trim in release).
+        if last != 0 && now.saturating_sub(last) < EVERY.as_millis() as u64 {
+            return;
+        }
+        if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("picacho-trim".into())
+            .spawn(release_unused);
     }
 }

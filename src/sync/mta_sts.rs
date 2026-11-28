@@ -60,32 +60,55 @@ pub(crate) fn parse(text: &str) -> Result<Policy> {
             continue;
         };
         let value = value.trim();
-        match key.trim() {
+        let key = key.trim();
+        // Only `mx` may repeat (RFC 8461 §3.2); a second of the others
+        // makes the policy ambiguous.
+        let repeated = match key {
+            "version" => version.is_some(),
+            "mode" => mode.is_some(),
+            "max_age" => max_age.is_some(),
+            _ => false,
+        };
+        ensure!(!repeated, t!("sync-mta-sts-the-policy-gives-twice", key = key));
+        match key {
             "version" => version = Some(value.to_owned()),
             "mode" => {
                 mode = Some(match value {
                     "enforce" => Mode::Enforce,
                     "testing" => Mode::Testing,
                     "none" => Mode::None,
-                    other => bail!("unknown policy mode {other:?}"),
+                    other => bail!(t!("sync-mta-sts-unknown-policy-mode", mode = format!("{:?}", other))),
                 })
             }
             "mx" => mx.push(value.to_ascii_lowercase()),
-            "max_age" => max_age = Some(value.parse::<u64>().context("max_age isn't a number")?),
+            "max_age" => max_age = Some(value.parse::<u64>().with_context(|| t!("sync-mta-sts-max-age-isnt-a-number"))?),
             _ => {}
         }
     }
-    ensure!(version.as_deref() == Some("STSv1"), "not an STSv1 policy");
-    let mode = mode.context("the policy has no mode")?;
+    ensure!(version.as_deref() == Some("STSv1"), t!("sync-mta-sts-not-an-stsv1-policy"));
+    let mode = mode.with_context(|| t!("sync-mta-sts-the-policy-has-no-mode"))?;
     ensure!(
         mode == Mode::None || !mx.is_empty(),
-        "the policy names no mail servers"
+        t!("sync-mta-sts-the-policy-names-no-mail-servers")
     );
-    Ok(Policy {
-        mode,
-        mx,
-        max_age: max_age.context("the policy has no max_age")?,
-    })
+    let max_age = max_age.with_context(|| t!("sync-mta-sts-the-policy-has-no-max-age"))?;
+    // At most a year (RFC 8461 §3.2: max_age is up to 31557600).
+    ensure!(max_age <= 31_557_600, t!("sync-mta-sts-the-policys-max-age-is-too"));
+    Ok(Policy { mode, mx, max_age })
+}
+
+impl Policy {
+    /// Whether the policy names `host` among its mail servers: exactly, or
+    /// by a `*.` pattern covering one label (RFC 8461 §4.1).
+    pub(crate) fn covers(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.mx.iter().any(|pattern| match pattern.strip_prefix("*.") {
+            Some(suffix) => host
+                .split_once('.')
+                .is_some_and(|(label, rest)| !label.is_empty() && rest == suffix),
+            None => *pattern == host,
+        })
+    }
 }
 
 /// A policy fetched for a domain, under the record id it was fetched for.
@@ -103,23 +126,40 @@ fn fetch(domain: &str) -> Result<Policy> {
     // path, port or another host into the URL.
     ensure!(
         is_domain(domain),
-        "{domain:?} isn't a domain name that can publish a policy"
+        t!("sync-mta-sts-isnt-a-domain-name-that-can", domain = format!("{:?}", domain))
     );
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    // One client for every fetch, reaching servers on the internet only:
+    // the domain is a recipient's, anyone's to choose, and its name could
+    // otherwise lead to this computer's network.
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    let client = match CLIENT.get() {
+        Some(client) => client,
+        None => {
+            let built = reqwest::blocking::Client::builder()
+                .min_tls_version(reqwest::tls::Version::TLS_1_2)
+                .timeout(Duration::from_secs(10))
+                .https_only(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::new(super::public_net::PublicOnly))
+                .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
+                .build()?;
+            CLIENT.get_or_init(|| built)
+        }
+    };
     let url = format!("https://mta-sts.{domain}/.well-known/mta-sts.txt");
-    let response = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("couldn't fetch {url}"))?;
+    let parsed = url::Url::parse(&url).with_context(|| t!("sync-mta-sts-couldnt-fetch", url = url))?;
     ensure!(
-        response.status().is_success(),
-        "{url} answered {}",
-        response.status()
+        !super::public_net::reaches_inside(&parsed),
+        t!("sync-mta-sts-couldnt-fetch", url = url)
+    );
+    let response = client
+        .get(parsed)
+        .send()
+        .with_context(|| t!("sync-mta-sts-couldnt-fetch", url = url))?;
+    // 200 only (RFC 8461 §3.3): other successes aren't a policy.
+    ensure!(
+        response.status() == reqwest::StatusCode::OK,
+        t!("sync-mta-sts-answered", url = url, status = response.status())
     );
     let kind = response
         .headers()
@@ -127,19 +167,21 @@ fn fetch(domain: &str) -> Result<Policy> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    ensure!(kind.starts_with("text/plain"), "{url} isn't plain text");
+    // `text/plain`, perhaps with parameters, not `text/plain-something`.
+    let media = kind.split(';').next().unwrap_or_default().trim();
+    ensure!(media == "text/plain", t!("sync-mta-sts-isnt-plain-text", url = url));
     let mut text = String::new();
     response
         .take(POLICY_LIMIT + 1)
         .read_to_string(&mut text)
-        .with_context(|| format!("couldn't read {url}"))?;
-    ensure!(text.len() as u64 <= POLICY_LIMIT, "{url} is too large");
+        .with_context(|| t!("sync-mta-sts-couldnt-read", url = url))?;
+    ensure!(text.len() as u64 <= POLICY_LIMIT, t!("sync-mta-sts-is-too-large", url = url));
     parse(&text)
 }
 
 /// Whether `domain` is a plain DNS name (letters, digits and hyphens, in
 /// dot-separated labels); internationalized names in their ASCII form.
-fn is_domain(domain: &str) -> bool {
+pub(crate) fn is_domain(domain: &str) -> bool {
     domain.len() <= 253
         && domain.contains('.')
         && domain.split('.').all(|label| {
@@ -168,14 +210,26 @@ pub(crate) fn policy(domain: &str) -> Result<Option<Policy>> {
             return Ok(Some(k.policy.clone()));
         }
     }
-    let policy = fetch(domain)?;
+    let policy = match fetch(domain) {
+        Ok(policy) => policy,
+        Err(e) => {
+            // A policy already known stays in force while a refresh fails
+            // (RFC 8461 §5.1), whatever its id says.
+            let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(k) = kept.as_ref().and_then(|m| m.get(domain)) {
+                return Ok(Some(k.policy.clone()));
+            }
+            return Err(e);
+        }
+    };
     let age = Duration::from_secs(policy.max_age).min(LONGEST_KEPT);
     let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
     let kept = kept.get_or_insert_with(HashMap::new);
-    // Expired policies go, so the cache holds only the domains of recent
-    // mail rather than every domain ever written to.
+    // Long-expired policies go, so the cache holds only the domains of
+    // recent mail rather than every domain ever written to; recently
+    // expired ones are kept for when a refresh fails.
     let now = Instant::now();
-    kept.retain(|_, k| k.until > now);
+    kept.retain(|_, k| k.until + LONGEST_KEPT > now);
     kept.insert(
         domain.to_owned(),
         Kept {
@@ -193,11 +247,20 @@ pub(crate) fn protection(domain: &str) -> Protection {
     // Internationalized names are looked up in their ASCII (punycode) form.
     let domain = match url::Host::parse(&domain) {
         Ok(url::Host::Domain(ascii)) if is_domain(&ascii) => ascii,
-        _ => return Protection::Unknown(format!("{domain:?} isn't a domain name")),
+        _ => return Protection::Unknown(t!("sync-mta-sts-isnt-a-domain-name", domain = format!("{:?}", domain))),
     };
     let mut doubt = None;
     match policy(&domain) {
-        Ok(Some(p)) if p.mode != Mode::None => return Protection::MtaSts,
+        // The policy vouches only for the servers it names (RFC 8461
+        // §4.1): mail goes to the domain's MX hosts, each of which must
+        // match one of its `mx` patterns.
+        Ok(Some(p)) if p.mode != Mode::None => match crate::sync::auth::mx_hosts(&domain) {
+            Ok(hosts) if !hosts.is_empty() && hosts.iter().all(|h| p.covers(h)) => {
+                return Protection::MtaSts;
+            }
+            Ok(_) => {}
+            Err(e) => doubt = Some(format!("{e:#}")),
+        },
         Ok(_) => {}
         Err(e) => doubt = Some(format!("{e:#}")),
     }
@@ -290,6 +353,10 @@ mod tests {
         assert!(parse("version: STSv1\nmode: enforce\nmax_age: 1").is_err());
         assert!(parse("version: STSv1\nmode: strict\nmx: a\nmax_age: 1").is_err());
         assert!(parse("version: STSv1\nmode: enforce\nmx: a").is_err());
+        assert!(parse("version: STSv1\nmode: enforce\nmode: none\nmx: a\nmax_age: 1").is_err());
+        assert!(parse("version: STSv1\nmode: enforce\nmx: a\nmax_age: 99999999").is_err());
+        assert!(p.covers("mail.example.com") && p.covers("mx1.example.net"));
+        assert!(!p.covers("a.b.example.net") && !p.covers("example.net") && !p.covers("evil.com"));
         Ok(())
     }
 

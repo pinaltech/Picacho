@@ -4,8 +4,9 @@ use anyhow::{Context, Result, ensure};
 use std::path::Path;
 
 /// Scores one sparse feature vector of (index, value): the probability the
-/// model gives the positive class.
-pub trait Scorer {
+/// model gives the positive class. Shared with the threads inference runs
+/// on, away from the window's.
+pub trait Scorer: Send + Sync {
     fn score(&self, x: &[(usize, f32)]) -> Result<f32>;
 }
 
@@ -26,25 +27,25 @@ pub struct NativeModel {
 impl NativeModel {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes =
-            std::fs::read(path).with_context(|| format!("Couldn't read {}", path.display()))?;
+            std::fs::read(path).with_context(|| t!("manage-local-ai-runtime-couldnt-read", path = path.display()))?;
         Self::parse(&bytes)
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() >= 20 && &bytes[..8] == b"PICAOTP1",
-            "Not a Picacho model"
+            t!("manage-local-ai-runtime-not-a-picacho-model")
         );
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
         let (dim, hidden) = (u32_at(8), u32_at(12));
         ensure!(
             dim.is_power_of_two() && dim <= 1 << 20 && (1..=256).contains(&hidden),
-            "The model's dimensions are out of range"
+            t!("manage-local-ai-runtime-the-models-dimensions-are-out-of")
         );
         let floats = dim * hidden + 2 * hidden + 2;
         ensure!(
             bytes.len() == 16 + floats * 4,
-            "The model file is incomplete"
+            t!("manage-local-ai-runtime-the-model-file-is-incomplete")
         );
         let mut values = bytes[16..]
             .as_chunks::<4>()
@@ -64,7 +65,7 @@ impl NativeModel {
                 .chain(&bias)
                 .chain(&output)
                 .all(|v| v.is_finite()),
-            "The model has invalid weights"
+            t!("manage-local-ai-runtime-the-model-has-invalid-weights")
         );
         Ok(Self {
             dim,
@@ -118,14 +119,14 @@ pub struct NativeTagger {
 impl NativeTagger {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes =
-            std::fs::read(path).with_context(|| format!("Couldn't read {}", path.display()))?;
+            std::fs::read(path).with_context(|| t!("manage-local-ai-runtime-couldnt-read", path = path.display()))?;
         Self::parse(&bytes)
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() >= 20 && &bytes[..8] == b"PICAWHN1",
-            "Not a Picacho tagger model"
+            t!("manage-local-ai-runtime-not-a-picacho-tagger-model")
         );
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
         let (dim, hidden, classes) = (u32_at(8), u32_at(12), u32_at(16));
@@ -134,12 +135,12 @@ impl NativeTagger {
                 && dim <= 1 << 20
                 && (1..=256).contains(&hidden)
                 && (2..=1024).contains(&classes),
-            "The model's dimensions are out of range"
+            t!("manage-local-ai-runtime-the-models-dimensions-are-out-of")
         );
         let floats = dim + hidden + classes * hidden + classes;
         ensure!(
             bytes.len() == 20 + dim * hidden + floats * 4,
-            "The model file is incomplete"
+            t!("manage-local-ai-runtime-the-model-file-is-incomplete")
         );
         let f32s = |from: usize, n: usize| -> Vec<f32> {
             bytes[from..from + n * 4]
@@ -169,7 +170,7 @@ impl NativeTagger {
                 .chain(&output)
                 .chain(&output_bias)
                 .all(|v| v.is_finite()),
-            "The model has invalid weights"
+            t!("manage-local-ai-runtime-the-model-has-invalid-weights")
         );
         Ok(Self {
             dim,
@@ -181,6 +182,11 @@ impl NativeTagger {
             output,
             output_bias,
         })
+    }
+
+    /// How many labels the model tells apart.
+    pub fn classes(&self) -> usize {
+        self.classes
     }
 
     /// The probability of each label for one sparse feature vector of

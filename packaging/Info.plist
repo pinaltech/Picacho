@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Picacho</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <!-- The languages Picacho has (locales/), so macOS offers them in its
+       per-app language setting. A test (src/i18n/tests.rs) keeps this list
+       the same as Picacho's; packaging/macos/<language>.lproj has the
+       words below in each. -->
+  <key>CFBundleLocalizations</key><array><string>en</string></array>
   <key>CFBundleDisplayName</key><string>Picacho</string>
   <key>CFBundleIdentifier</key><string>tech.pinal.picacho</string>
   <key>CFBundleExecutable</key><string>picacho</string>
@@ -17,7 +23,18 @@
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>CFBundleURLTypes</key><array><dict>
     <key>CFBundleURLName</key><string>tech.pinal.picacho.sign-in</string>
-    <key>CFBundleURLSchemes</key><array><string>picacho</string></array>
+    <key>CFBundleURLSchemes</key><array><string>picacho</string><string>tech.pinal.picacho</string></array>
+  </dict><dict>
+    <!-- Picacho as the default email app (Mail's Settings → Default email reader). -->
+    <key>CFBundleURLName</key><string>tech.pinal.picacho.mailto</string>
+    <key>CFBundleURLSchemes</key><array><string>mailto</string></array>
+  </dict></array>
+  <key>CFBundleDocumentTypes</key><array><dict>
+    <key>CFBundleTypeName</key><string>Email Message</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>LSItemContentTypes</key><array><string>com.apple.mail.email</string><string>public.email-message</string><string>com.microsoft.outlook.msg</string></array>
+    <key>CFBundleTypeExtensions</key><array><string>eml</string><string>msg</string></array>
   </dict></array>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

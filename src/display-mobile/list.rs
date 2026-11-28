@@ -13,8 +13,15 @@ use super::*;
 
 /// Each row's height: three lines of text at phone sizes.
 pub(super) const ROW: f32 = 98.;
-/// How far a row swipes (or the list pulls) before letting go acts.
+/// How far the list pulls before letting go refreshes, and the least a
+/// row swipes before letting go acts.
 const COMMIT: f32 = 88.;
+/// How much of the row's width a swipe must cross to act: a short
+/// sideways brush on the way to scrolling archived mail too easily.
+const SWIPE_SHARE: f32 = 0.4;
+/// How much more sideways than up or down a pan must start to swipe a row
+/// rather than scroll the list.
+const SWIPE_SLANT: f32 = 1.5;
 /// After a swipe ends, the fling's own momentum must not start another.
 const SWIPE_REST: Duration = Duration::from_millis(450);
 /// The pull-to-refresh box's height.
@@ -50,11 +57,11 @@ enum SwipeAct {
 impl SwipeAct {
     fn label(self, unread: bool) -> &'static str {
         match self {
-            Self::ToggleRead if unread => "Read",
-            Self::ToggleRead => "Unread",
-            Self::Archive => "Archive",
-            Self::Trash => "Trash",
-            Self::DeleteForever | Self::DeleteDraft => "Delete",
+            Self::ToggleRead if unread => t!("mobile-list-read"),
+            Self::ToggleRead => t!("mobile-list-unread"),
+            Self::Archive => t!("mobile-list-archive"),
+            Self::Trash => t!("mobile-list-trash"),
+            Self::DeleteForever | Self::DeleteDraft => t!("mobile-list-delete"),
         }
     }
     fn icon(self, unread: bool) -> &'static str {
@@ -101,7 +108,7 @@ impl MailApp {
             vec![
                 self.touch_text(
                     "mobile-select-all",
-                    if all { "None" } else { "All" },
+                    if all { t!("mobile-list-none") } else { t!("mobile-list-all") },
                     false,
                     act(Action::SelectAll),
                     cx,
@@ -109,7 +116,7 @@ impl MailApp {
                 .into_any_element(),
                 self.touch_text(
                     "mobile-select-done",
-                    "Done",
+                    t!("mobile-list-done"),
                     true,
                     act(Action::StopSelecting),
                     cx,
@@ -122,7 +129,7 @@ impl MailApp {
             vec![
                 self.touch_text(
                     "mobile-select",
-                    "Select",
+                    t!("mobile-list-select"),
                     false,
                     act(Action::ToggleSelectMode),
                     cx,
@@ -132,8 +139,8 @@ impl MailApp {
         };
         let title = if self.selecting {
             match self.selection.len() {
-                0 => "Select Messages".to_owned(),
-                n => format!("{} Selected", fmt_count(n)),
+                0 => t!("mobile-list-select-messages").to_owned(),
+                n => t!("mobile-list-selected", shown = fmt_count(n), count = n),
             }
         } else {
             self.mailbox_label()
@@ -175,7 +182,12 @@ impl MailApp {
             .bg(rgb(c.bg))
             .child(self.nav_bar("mobile-list-bar", insets, back, title, subtitle, trailing))
             .when(!self.selecting, |d| {
-                d.child(self.mobile_filter_chips(insets, cx))
+                d.children(self.mobile_category_chips(insets, cx))
+                    .children(
+                        self.lens_bar(cx)
+                            .map(|bar| div().px(px(insets.left + GUTTER)).child(bar)),
+                    )
+                    .child(self.mobile_filter_chips(insets, cx))
             })
             .when(self.search_open, |d| {
                 d.child(
@@ -220,13 +232,9 @@ impl MailApp {
                         .text_color(rgb(c.muted))
                         .child(spinner(12., c.muted))
                         .child(if progress.total == 0 {
-                            "Listing mail…".to_owned()
+                            t!("mobile-list-listing-mail").to_owned()
                         } else {
-                            format!(
-                                "Listing mail · {} of {}",
-                                fmt_count(progress.cataloged),
-                                fmt_count(progress.total)
-                            )
+                            t!("mobile-list-listing-mail-of", listed = fmt_count(progress.cataloged), total = fmt_count(progress.total))
                         }),
                 )
             })
@@ -241,7 +249,7 @@ impl MailApp {
                     vec![self.bar_icon(
                         "mobile-settings",
                         "settings",
-                        "Settings",
+                        t!("mobile-list-settings"),
                         Rc::new(
                             |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                                 this.mobile_open_settings(w, cx)
@@ -287,16 +295,16 @@ impl MailApp {
             .flex()
             .items_center()
             .gap_2()
-            .child(chip("mobile-filter-unread", Filter::Unread, "Unread"))
-            .child(chip("mobile-filter-starred", Filter::Starred, "Starred"))
+            .child(chip("mobile-filter-unread", Filter::Unread, t!("mobile-list-unread")))
+            .child(chip("mobile-filter-starred", Filter::Starred, t!("mobile-list-starred")))
             .child(chip(
                 "mobile-filter-attachments",
                 Filter::Attachments,
-                "Attachments",
+                t!("mobile-list-attachments"),
             ))
             .child(self.chip(
                 "mobile-filter-oldest",
-                "Oldest First",
+                t!("mobile-list-oldest-first"),
                 self.oldest_first,
                 act(Action::OldestFirst(!self.oldest_first)),
                 cx,
@@ -311,6 +319,71 @@ impl MailApp {
             .when(max - offset > 0.5, |d| {
                 d.child(edge_fade("mobile-filters-fade-trailing", false, c.bg))
             })
+    }
+
+    /// An inbox's category tabs as chips above the filters, while nothing
+    /// is searched for, All Mail last; the open one is filled. Scrolls
+    /// sideways when they don't fit, an edge with chips past it fading out,
+    /// as the filters' do.
+    fn mobile_category_chips(&self, insets: Insets, cx: &Context<Self>) -> Option<AnyElement> {
+        if !self.shows_categories() || !Self::value(&self.search, cx).trim().is_empty() {
+            return None;
+        }
+        let c = self.colors();
+        let scroll = &self.mobile.categories_scroll;
+        let (offset, max) = (
+            -f32::from(scroll.offset().x),
+            f32::from(scroll.max_offset().x),
+        );
+        let chips = div()
+            .id("mobile-categories")
+            .debug_selector(|| "mobile-categories".into())
+            .role(Role::TabList)
+            .aria_label(t!("categories-tabs"))
+            .track_scroll(scroll)
+            .overflow_x_scroll()
+            .pl(px(insets.left + GUTTER))
+            .pr(px(insets.right + GUTTER))
+            .flex()
+            .items_center()
+            .gap_2()
+            .children(self.sorting.tabs().into_iter().map(|tab| {
+                use super::categories::{CatAction, Tab};
+                let unread = self.sorting.unread_in(tab);
+                let spoken = if unread > 0 {
+                    let shown = fmt_count(unread);
+                    let count = t!("categories-unread", shown = shown, count = unread);
+                    format!("{}, {count}", tab.label())
+                } else {
+                    tab.label().to_owned()
+                };
+                self.chip(
+                    format!("mobile-category-{}", tab.key()),
+                    tab.label(),
+                    self.sorting.tab == tab,
+                    act(Action::Categories(match tab {
+                        Tab::Is(category) => CatAction::Tab(category),
+                        Tab::All => CatAction::AllMail,
+                    })),
+                    cx,
+                )
+                .role(Role::Tab)
+                .aria_label(spoken)
+                .aria_selected(self.sorting.tab == tab)
+            }));
+        Some(
+            div()
+                .relative()
+                .flex_shrink_0()
+                .child(chips)
+                .when(offset > 0.5, |d| {
+                    d.child(edge_fade("mobile-categories-fade-leading", true, c.bg))
+                })
+                .when(max - offset > 0.5, |d| {
+                    d.child(edge_fade("mobile-categories-fade-trailing", false, c.bg))
+                })
+                .into_any_element(),
+        )
     }
 
     /// A message's row, sized for a fingertip, sliding under a swipe.
@@ -352,7 +425,7 @@ impl MailApp {
                 .when(checked, |d| d.child(icon_el("check", 15., c.on_accent)))
                 .into_any_element()
         } else {
-            avatar(&m.initials(), 40., index, c).into_any_element()
+            sender_picture(&m.initials(), self.brand_marks.get(&m.id), 40., index, c)
         };
         let weight = if unread {
             FontWeight::SEMIBOLD
@@ -417,6 +490,7 @@ impl MailApp {
                                     .font_weight(weight)
                                     .child(sender),
                             )
+                            .children(self.vip_mark(m, 14.))
                             .when(m.starred, |d| d.child(icon_el("star-filled", 14., STAR)))
                             .child(
                                 div()
@@ -440,10 +514,15 @@ impl MailApp {
                                     .font_weight(weight)
                                     .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
+                            .children(self.row_category(m, 12.))
                             .when(m.answered, |d| d.child(icon_el("answered", 14., c.muted)))
                             .when(m.forwarded, |d| d.child(icon_el("forwarded", 14., c.muted)))
                             .when(self.snoozed_until(m).is_some(), |d| {
                                 d.child(icon_el("snooze", 14., c.accent))
+                            })
+                            .when_some(self.follow_up_of(m), |d, f| {
+                                let overdue = f.overdue(chrono::Utc::now().timestamp());
+                                d.child(icon_el("waiting", 14., if overdue { c.danger } else { c.accent }))
                             })
                             .when(m.has_attachments(), |d| {
                                 d.child(icon_el("paperclip", 14., c.muted))
@@ -464,7 +543,7 @@ impl MailApp {
                 SwipeAct::Archive => 0x2f9e6e,
                 _ => 0xd64545,
             };
-            let reached = offset.abs() >= COMMIT;
+            let reached = offset.abs() >= self.mobile.swipe_reach;
             div()
                 .absolute()
                 .inset_0()
@@ -561,17 +640,18 @@ impl MailApp {
                 cx.stop_propagation();
                 let (_, offset) = self.mobile.swipe.take().unwrap_or_default();
                 self.mobile.swipe_ended = Some(std::time::Instant::now());
-                if offset.abs() >= COMMIT {
+                if offset.abs() >= self.mobile.swipe_reach {
                     self.mobile_swiped(id, offset > 0., w, cx);
                 }
                 cx.notify();
             }
             TouchPhase::Started | TouchPhase::Moved if swiping => {
                 cx.stop_propagation();
+                let reach = self.mobile.swipe_reach;
                 if let Some((_, offset)) = &mut self.mobile.swipe {
-                    let before = offset.abs() >= COMMIT;
+                    let before = offset.abs() >= reach;
                     *offset += dx;
-                    if before != (offset.abs() >= COMMIT) {
+                    if before != (offset.abs() >= reach) {
                         platform::haptic(platform::Haptic::Selection);
                     }
                 }
@@ -580,6 +660,7 @@ impl MailApp {
             // A pan starting on this row: undecided until it moves.
             TouchPhase::Started if self.mobile.swipe.is_none() => {
                 self.mobile.pan = Some(id.to_owned());
+                self.mobile.swipe_reach = Self::swipe_reach(w);
                 self.mobile_decide_swipe(id, dx, dy, cx);
             }
             // Only the finger's own pan, decided on its first movement,
@@ -604,7 +685,7 @@ impl MailApp {
             .mobile
             .swipe_ended
             .is_none_or(|t| t.elapsed() > SWIPE_REST);
-        if self.selecting || !rested || dx.abs() <= dy.abs() {
+        if self.selecting || !rested || dx.abs() <= dy.abs() * SWIPE_SLANT {
             return;
         }
         let Some(m) = self.messages.iter().find(|m| m.id == id) else {
@@ -618,6 +699,14 @@ impl MailApp {
         cx.stop_propagation();
         self.mobile.swipe = Some((id.to_owned(), dx));
         cx.notify();
+    }
+
+    /// How far a row must be swiped to act: a good part of its width (the
+    /// list's, beside the reader on a wide screen), never less than `COMMIT`.
+    fn swipe_reach(w: &Window) -> f32 {
+        let width = f32::from(w.viewport_size().width);
+        let row = if Self::mobile_split(w) { width.min(420.) } else { width };
+        (row * SWIPE_SHARE).max(COMMIT)
     }
 
     /// What a swipe on message `id` does when let go past the threshold.
@@ -721,7 +810,7 @@ impl MailApp {
                     self.watch_refresh(cx);
                     cx.notify();
                 } else if pull > 0. {
-                    self.hide_pull_box(pull_box_top(pull));
+                    self.hide_pull_box(pull_box_top(pull), cx);
                     cx.notify();
                 }
             }
@@ -729,11 +818,24 @@ impl MailApp {
         }
     }
 
-    /// Sends the pull box back up from `from`.
-    fn hide_pull_box(&mut self, from: f32) {
+    /// Sends the pull box back up from `from`. Once it is out of sight it
+    /// goes (it stayed, drawn above the list on every frame, until the next
+    /// pull).
+    fn hide_pull_box(&mut self, from: f32, cx: &mut Context<Self>) {
         self.mobile.pull_settle = None;
         self.mobile.pull_anim += 1;
-        self.mobile.pull_hide = Some((from, self.mobile.pull_anim));
+        let key = self.mobile.pull_anim;
+        self.mobile.pull_hide = Some((from, key));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PULL_HIDE + Duration::from_millis(50)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.mobile.pull_hide.is_some_and(|(_, k)| k == key) {
+                    this.mobile.pull_hide = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Mail is being checked for the open mailbox, by a sync or a retried
@@ -760,7 +862,7 @@ impl MailApp {
                         || (waited >= REFRESH_MIN && !this.mobile_refreshing());
                     if done {
                         this.mobile.refreshing = None;
-                        this.hide_pull_box(PULL_REST);
+                        this.hide_pull_box(PULL_REST, cx);
                         cx.notify();
                     }
                     done
@@ -806,9 +908,9 @@ impl MailApp {
                         .flex_shrink_0()
                         .child(ring(progress, c.border, c.accent).size_full()),
                 )
-                .child("Pull down to refresh")
+                .child(t!("mobile-list-pull-down-to-refresh"))
         };
-        let busy = || layer().child(spinner(14., c.accent)).child("Refreshing…");
+        let busy = || layer().child(spinner(14., c.accent)).child(t!("mobile-list-refreshing"));
         let settle = self.mobile.pull_settle.filter(|_| refreshing);
         let card = div()
             .relative()
@@ -900,7 +1002,7 @@ impl MailApp {
                     .flex_shrink_0()
                     .text_size(px(16.))
                     .text_color(rgb(c.muted))
-                    .child("Search"),
+                    .child(t!("mobile-list-search")),
             )
             .child(div().flex_1())
             .child(
@@ -930,7 +1032,7 @@ impl MailApp {
         let button = if typing {
             self.touch_text(
                 "mobile-search-done",
-                "Done",
+                t!("mobile-list-done"),
                 true,
                 Rc::new(
                     |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
@@ -942,7 +1044,7 @@ impl MailApp {
         } else {
             self.touch_text(
                 "mobile-search-cancel",
-                "Cancel",
+                t!("mobile-list-cancel"),
                 false,
                 act(Action::CloseSearch),
                 cx,
@@ -993,40 +1095,40 @@ impl MailApp {
                     "mobile-bulk-read",
                     if all_read { "mail" } else { "mail-open" },
                     if all_read {
-                        "Mark as unread"
+                        t!("mobile-list-mark-as-unread")
                     } else {
-                        "Mark as read"
+                        t!("mobile-list-mark-as-read")
                     },
                     act(Action::ApplySelection(Change::Read(!all_read))),
                 ),
                 tool(
                     "mobile-bulk-star",
                     if all_starred { "star-filled" } else { "star" },
-                    if all_starred { "Unstar" } else { "Star" },
+                    if all_starred { t!("mobile-list-unstar") } else { t!("mobile-list-star") },
                     act(Action::ApplySelection(Change::Star(!all_starred))),
                 ),
                 tool(
                     "mobile-bulk-move",
                     "folder",
-                    "Move to folder",
+                    t!("mobile-list-move-to-folder"),
                     act(Action::MoveMenu(MoveTarget::Selection)),
                 ),
                 tool(
                     "mobile-bulk-archive",
                     "archive",
-                    "Archive",
+                    t!("mobile-list-archive"),
                     act(Action::ApplySelection(Change::Move(Folder::Archive))),
                 ),
                 tool(
                     "mobile-bulk-trash",
                     "trash",
-                    "Move to trash",
+                    t!("mobile-list-move-to-trash"),
                     act(Action::ApplySelection(Change::Move(Folder::Trash))),
                 ),
                 tool(
                     "mobile-bulk-more",
                     "ellipsis",
-                    "More",
+                    t!("mobile-list-more"),
                     Rc::new(
                         move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                             if let Some(id) = &first {

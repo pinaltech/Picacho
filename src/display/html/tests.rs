@@ -200,6 +200,7 @@ fn unsafe_resource_schemes_and_credentials_are_refused() {
             Default::default(),
             Arc::new(AtomicBool::new(false)),
             cancelled.clone(),
+            Arc::default(),
         );
     struct Capture(std::sync::mpsc::Sender<blitz_traits::net::Bytes>);
     impl blitz_traits::net::NetHandler for Capture {
@@ -397,7 +398,7 @@ fn images_sent_with_the_message_show_by_content_id_even_with_remote_content_bloc
 }
 
 /// A development aid, not a check: renders the HTML file `SNAP_HTML` at
-/// `SNAP_WIDTH` (700) pixels to `SNAP_DIR/usps-{light,dark}-{width}.png`,
+/// `SNAP_WIDTH` (700) pixels to `SNAP_DIR/usps-{light,dark,inverted}-{width}.png`,
 /// with a stand-in picture for each image sent with the message (`cid:`).
 /// `cargo test render_to_png -- --ignored`.
 #[test]
@@ -418,7 +419,7 @@ fn render_to_png() {
         inline.insert(&id, png.into_inner());
     }
     let inline = std::sync::Arc::new(inline);
-    for (tone, name) in [(Tone::Light, "light"), (Tone::NativeDark, "dark")] {
+    for (tone, name) in [(Tone::Light, "light"), (Tone::NativeDark, "dark"), (Tone::InvertedDark, "inverted")] {
         let mut email = EmailDocument::with_parts(&html, inline.clone(), true, tone);
         email.layout(width);
         // The images arrive on the document's thread.
@@ -475,6 +476,41 @@ fn tables_restacked_for_narrow_screens_keep_their_rows() {
     let (dx, dy, dw, dh) = element_box(&email, "d");
     assert!(dw > 100. && dh >= 40., "the block cell is laid out: {dw}x{dh}");
     assert_eq!(color_at(&mut email, dx + dw / 2., dy + dh / 2.), [255, 0, 255]);
+}
+
+#[test]
+fn columns_restacked_as_blocks_in_a_div_table_stack_for_narrow_screens() {
+    // Klaviyo's templates lay columns out as `display: table-cell` divs in a
+    // `display: table` div, and below 480 pixels make them `display: block`.
+    // Blocks directly in a table each get an anonymous row and cell in CSS;
+    // they vanished, and the email showed only what was outside them.
+    let html = "<style>@media only screen and (max-width: 480px) {\
+         div.row div.col { display: block !important; width: 100% !important } }</style>\
+         <body style='margin:0'>\
+         <div class='row' style='display:table;table-layout:fixed;width:100%'>\
+         <div class='col' id='a' style='display:table-cell;width:50%;background:#ff0000'>\
+         <div style='height:60px'>One</div></div>\
+         <div class='col' id='b' style='display:table-cell;width:50%;background:#0000ff'>\
+         <div style='height:60px'>Two</div></div>\
+         </div><div id='after' style='height:20px'>After</div></body>";
+    let mut email = EmailDocument::new(html, true);
+    // Wide: side by side.
+    email.layout(600);
+    let (ax, ay, _, _) = element_box(&email, "a");
+    let (bx, by, _, _) = element_box(&email, "b");
+    assert!(bx > ax && (by - ay).abs() < 1., "side by side: a {ax},{ay} b {bx},{by}");
+    // Narrow: stacked, full width, and the content after them below both.
+    email.layout(380);
+    let (_, ay, aw, ah) = element_box(&email, "a");
+    let (bx, by, bw, bh) = element_box(&email, "b");
+    let (_, after, _, _) = element_box(&email, "after");
+    assert!(aw > 370. && bw > 370., "full width: {aw} and {bw}");
+    assert!(ah >= 60. && bh >= 60., "laid out: {ah} and {bh}");
+    assert!(by >= ay + ah - 1., "stacked: a at {ay}+{ah}, b at {by}");
+    assert!(after >= by + bh - 1., "after both: {after}");
+    // Each paints its own background (not a row's, on the other).
+    assert_eq!(color_at(&mut email, 10., ay + ah / 2.), [255, 0, 0]);
+    assert_eq!(color_at(&mut email, bx + 10., by + bh / 2.), [0, 0, 255]);
 }
 
 #[test]
@@ -707,12 +743,18 @@ fn selection_follows_the_pointer_in_inline_blocks_and_centered_cells() {
 #[test]
 fn a_long_press_selects_the_word_and_dragging_extends_it_both_ways() {
     let mut email = EmailDocument::new(
-        "<body style='margin:0'><p id='p' style='margin:0; font: 20px/30px monospace'>alpha beta gamma</p></body>",
+        "<body style='margin:0'><p id='p' style='margin:0; font: 20px/30px monospace'>\
+         <span id='s' style='display:inline-block'>alpha beta gamma</span></p></body>",
         true,
     );
     email.layout(600);
     let (_, y, _, _) = element_box(&email, "p");
-    let char_width = 12.;
+    // The system's monospace font decides the advance (12px for 20px
+    // DejaVu Sans Mono or Menlo; others differ): measured, from the
+    // 16 characters' width.
+    let (_, _, text_width, _) = element_box(&email, "s");
+    let char_width = text_width / 16.;
+    assert!(char_width > 5., "the text is laid out: {text_width}");
     // Just inside the character's leading or trailing half.
     let at = |i: f32| i * char_width + char_width / 2.;
     let after = |i: f32| i * char_width + char_width * 0.8;
@@ -727,4 +769,88 @@ fn a_long_press_selects_the_word_and_dragging_extends_it_both_ways() {
     // Below the text there is nothing to select.
     assert!(email.select_word_at(at(2.), y + 200.).is_none());
     assert_eq!(email.doc.get_selected_text(), None);
+}
+
+#[test]
+fn dark_reading_keeps_text_readable() {
+    use super::document::{Role, dark_color, readable_on};
+    // Mid-grey text on the dark page: lifted to 4.5:1.
+    let page = 0.3;
+    let grey = dark_color([0.45, 0.45, 0.45, 1.], Role::Text);
+    let lifted = readable_on(grey, page);
+    let lum = |c: [f32; 4]| {
+        let l = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        0.2126 * l(c[0]) + 0.7152 * l(c[1]) + 0.0722 * l(c[2])
+    };
+    // The page at OKLab 0.3 is about 0.027 luminance.
+    assert!((lum(lifted) + 0.05) / (0.027 + 0.05) >= 4.4, "{lifted:?}");
+    // Already readable: unchanged.
+    let white = [1., 1., 1., 1.];
+    assert_eq!(readable_on(white, page), white);
+}
+
+#[test]
+fn screen_readers_get_the_emails_paragraphs_and_its_links() {
+    let mut email = EmailDocument::new(
+        "<style>.x{color:red}</style><body><h1>Order shipped</h1>\
+         <p>Your <b>parcel</b> is on its way. <img src='cid:a' alt='Truck'></p>\
+         <div style='display:none'>preheader text</div>\
+         <p aria-hidden='true'>spacer</p>\
+         <p><a href='https://example.com/track'>Track  it</a> or <a href='mailto:help@example.com'></a></p>",
+        true,
+    );
+    email.layout(600);
+    let (text, links) = email.accessible_text();
+    let paragraphs: Vec<&str> = super::view::accessible_paragraphs(&text).collect();
+    assert_eq!(
+        paragraphs,
+        [
+            "Order shipped",
+            "Your parcel is on its way. [Truck]",
+            "Track it or"
+        ],
+        "{text:?}"
+    );
+    assert_eq!(
+        links,
+        [
+            (
+                "Track it".to_owned(),
+                "https://example.com/track".to_owned()
+            ),
+            // A link with no text is named by its address.
+            (
+                "mailto:help@example.com".to_owned(),
+                "mailto:help@example.com".to_owned()
+            ),
+        ]
+    );
+}
+
+/// An email's `<svg>` can't have usvg read a file (or, on Windows, a UNC
+/// path over SMB) by naming it in an `<image>`: the name is taken away
+/// before the first layout. A picture inside the email stays.
+#[test]
+fn svg_images_naming_files_are_not_loaded() {
+    let path = std::env::temp_dir().join(format!("picacho-svg-{}.png", std::process::id()));
+    let mut png = Vec::new();
+    image::RgbaImage::new(2, 2)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(&path, &png).unwrap();
+    use base64::Engine as _;
+    let inline = base64::engine::general_purpose::STANDARD.encode(&png);
+    let html = format!(
+        r#"<p>x</p><svg width="10" height="10"><image id="file" href="{}" width="2" height="2"/><image id="unc" xlink:href="\\host\share\x.png"/><image id="inside" href="data:image/png;base64,{inline}"/></svg>"#,
+        path.display()
+    );
+    let mut email = EmailDocument::new(&html, true);
+    let _ = std::fs::remove_file(&path);
+    for (id, kept) in [("file", false), ("unc", false), ("inside", true)] {
+        let node = email.doc.query_selector(&format!("#{id}")).unwrap().unwrap();
+        let element = email.doc.get_node(node).unwrap().element_data().unwrap();
+        let has_href = element.attrs().iter().any(|a| &*a.name.local == "href");
+        assert_eq!(has_href, kept, "{id}");
+    }
+    email.layout(400);
 }

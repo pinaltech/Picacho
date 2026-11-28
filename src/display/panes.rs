@@ -54,13 +54,14 @@ impl MailApp {
     }
     /// The sidebar toggle, beside Compose (or above it in the rail).
     pub(super) fn sidebar_toggle(&self, collapsed: bool, cx: &Context<Self>) -> Stateful<Div> {
+        let tip = shortcuts::tip(
+            if collapsed { t!("panes-show-sidebar") } else { t!("panes-hide-sidebar") },
+            "toggle-sidebar",
+            cx,
+        );
         self.button(
             "toggle-sidebar",
-            if collapsed {
-                "@Show sidebar · ⌃⌘S"
-            } else {
-                "@Hide sidebar · ⌃⌘S"
-            },
+            &tip,
             if collapsed {
                 "panel-left-open"
             } else {
@@ -98,6 +99,8 @@ impl MailApp {
         let rail = || layer(self.sidebar_rail(cx).into_any_element(), SIDEBAR_RAIL, true);
         let sidebar = div()
             .id("sidebar")
+            .role(Role::Navigation)
+            .aria_label(t!("panes-mailboxes"))
             .debug_selector(|| "sidebar".into())
             .relative()
             .flex_shrink_0()
@@ -177,19 +180,19 @@ impl MailApp {
             return vec![];
         };
         let provider = if a.provider == Provider::Gmail && a.oauth {
-            "Load from Google"
+            t!("panes-load-from-google")
         } else {
-            "Load from Gravatar"
+            t!("panes-load-from-gravatar")
         };
         let mut entries = vec![
             entry(provider, "cloud", Action::ProviderAvatar(id.into())),
             entry(
-                "Choose from Presets…",
+                t!("panes-choose-from-presets"),
                 "grid",
                 Action::AvatarPresets(id.into()),
             ),
             entry(
-                "Upload Your Own…",
+                t!("panes-upload-your-own"),
                 "upload",
                 Action::ChooseAvatar(id.into()),
             ),
@@ -197,7 +200,7 @@ impl MailApp {
         if self.avatars.contains_key(id) {
             entries.push(Entry::Separator);
             entries.push(danger(
-                "Remove Picture",
+                t!("panes-remove-picture"),
                 "trash",
                 Action::RemoveAvatar(id.into()),
             ));
@@ -209,16 +212,16 @@ impl MailApp {
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
-        self.notice("Looking for your picture…", false, cx);
+        self.notice(t!("panes-looking-for-your-picture"), false, cx);
         self.task(
             cx,
             move |b| b.provider_avatar(&a),
             move |this, result, cx| match result {
                 Ok(Some(path)) => {
                     this.avatars.insert(id, path);
-                    this.notice("Picture updated", false, cx);
+                    this.notice(t!("panes-picture-updated"), false, cx);
                 }
-                Ok(None) => this.notice("No picture was found for this address.", true, cx),
+                Ok(None) => this.notice(t!("panes-no-picture-was-found-for-this"), true, cx),
                 Err(e) => this.notice(format!("{e:#}"), true, cx),
             },
         );
@@ -302,7 +305,7 @@ impl MailApp {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose a picture".into()),
+            prompt: Some(t!("panes-choose-a-picture").into()),
         });
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
@@ -316,8 +319,14 @@ impl MailApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // The size first: a file chosen by mistake (a disk image)
+                    // isn't read into memory whole only to be refused.
+                    anyhow::ensure!(
+                        std::fs::metadata(&path)?.len() <= 20 << 20,
+                        t!("panes-choose-a-picture-under-20-mb")
+                    );
                     let bytes = std::fs::read(&path)?;
-                    anyhow::ensure!(bytes.len() <= 20 << 20, "Choose a picture under 20 MB.");
+                    anyhow::ensure!(bytes.len() <= 20 << 20, t!("panes-choose-a-picture-under-20-mb"));
                     backend.set_avatar(&key, &bytes, "custom")
                 })
                 .await;
@@ -629,7 +638,8 @@ impl MailApp {
     /// blurred swatch of the message's own colors.
     pub(super) fn ribbon(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors();
-        let mail = self.selected_mail();
+        // Not a copy: drawn every frame, and the open message has its body.
+        let mail = self.selected_ref();
         let action = |id: &'static str, tip: &str, icon: &str, action: Action| {
             let b = self.button(id, tip, icon, action, false, cx).size(px(36.));
             if mail.is_some() { b } else { b.opacity(0.35) }
@@ -647,7 +657,7 @@ impl MailApp {
             .pt_3()
             .child(self.reader_toggle(true, cx).size(px(36.)).rounded(px(10.)))
             .child(div().h(px(1.)).w(px(28.)).my_1().bg(rgb(c.border)));
-        if let Some(m) = &mail {
+        if let Some(m) = mail {
             column = column
                 .child(action(
                     "ribbon-reply",
@@ -657,7 +667,7 @@ impl MailApp {
                 ))
                 .child(action(
                     "ribbon-reply-all",
-                    "@Reply all",
+                    t!("panes-reply-all"),
                     "reply-all",
                     Action::Reply(true),
                 ))
@@ -682,24 +692,24 @@ impl MailApp {
                 )
                 .child(action(
                     "ribbon-read",
-                    "@Mark read / unread",
+                    t!("panes-mark-read-unread"),
                     "mail",
                     Action::Read(m.id.clone()),
                 ))
                 .child(action(
                     "ribbon-archive",
-                    "@Archive message",
+                    t!("panes-archive-message"),
                     "archive",
                     Action::Move(Folder::Archive),
                 ))
                 .child(action(
                     "ribbon-trash",
-                    "@Move to trash",
+                    t!("panes-move-to-trash"),
                     "trash",
                     Action::Move(Folder::Trash),
                 ));
         }
-        column.child(self.preview(mail.as_ref(), cx))
+        column.child(self.preview(mail, cx))
     }
     /// The open message in miniature, filling the collapsed reader below its
     /// actions: the HTML email itself scaled to the ribbon's width, or a
@@ -740,12 +750,23 @@ impl MailApp {
         let tile = tile
             .cursor_pointer()
             .hover(move |s| s.border_color(rgb(c.accent)))
-            .tooltip(|w, cx| Tooltip::new("Open the message here").build(w, cx))
+            .tooltip(|w, cx| Tooltip::new(t!("panes-open-the-message-here")).build(w, cx))
             .child(measure);
         if options.html
             && let Some(html) = &m.html
         {
-            let html = self.hide_codes_html(m, html);
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (&m.id, html.len(), self.hidden_codes(m).as_slice()).hash(&mut h);
+                h.finish()
+            };
+            let cached = self.thumbnail_html.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, h)| h.clone());
+            let html = cached.unwrap_or_else(|| {
+                let made = Rc::new(self.hide_codes_html(m, html).into_owned());
+                *self.thumbnail_html.borrow_mut() = Some((key, made.clone()));
+                made
+            });
             self.html_view.update(cx, |view, cx| {
                 view.set_content(&html, &m.inline, options.block_remote, dark, self.clean_links, cx)
             });
@@ -829,9 +850,9 @@ impl MailApp {
         self.button(
             "toggle-reader",
             if collapsed {
-                "@Show message"
+                t!("panes-show-message")
             } else {
-                "@Collapse message"
+                t!("panes-collapse-message")
             },
             if collapsed {
                 "panel-right-open"
